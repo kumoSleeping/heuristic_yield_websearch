@@ -7,3 +7,12 @@ dist/
 build/
 .venv/
 node_modules/
+__rubbish/
+env.entari/
+
+
+entari.yml
+entari.schema.json
+.python-version
+.env.local
+.entari_cli.toml
