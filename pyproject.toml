@@ -1,0 +1,24 @@
+[project]
+name = "heuristic-yield-websearch"
+version = "0.1.0"
+description = "Heuristic Yield Websearch - LLM-powered web search assistant"
+requires-python = ">=3.12"
+dependencies = [
+    "litellm",
+    "pyyaml",
+    "rich",
+    "prompt-toolkit",
+    "loguru",
+    "Pillow",
+    "markdown",
+    "httpx",
+    "DrissionPage",
+    "duckduckgo-search",
+]
+
+[project.scripts]
+hyw = "core.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

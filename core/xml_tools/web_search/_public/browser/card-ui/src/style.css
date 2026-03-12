@@ -1,0 +1,29 @@
+@import "tailwindcss";
+@plugin "daisyui";
+@plugin "@tailwindcss/typography";
+
+/* Custom styles */
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+}
+
+/* Premium reading color scheme - applies to all prose elements */
+.prose {
+  color: var(--text-body, #3a3a3c) !important;
+}
+
+.prose h1, .prose h2, .prose h3, .prose h4, .prose h5, .prose h6 {
+  color: var(--text-primary, #2c2c2e) !important;
+}
+
+.prose p, .prose li, .prose td, .prose th {
+  color: var(--text-body, #3a3a3c) !important;
+}
+
+.prose strong, .prose b {
+  color: var(--text-primary, #2c2c2e) !important;
+}
+
+.prose code {
+  color: var(--text-body, #3a3a3c) !important;
+}

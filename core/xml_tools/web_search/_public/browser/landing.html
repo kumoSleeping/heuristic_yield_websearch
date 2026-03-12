@@ -1,0 +1,172 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+
+<head>
+    <meta charset="UTF-8">
+    <title>entari-plugin-hyw Browser</title>
+    <style>
+        :root {
+            --theme-color: #ef4444;
+            --text-primary: #2c2c2e;
+            --text-body: #3a3a3c;
+            --text-muted: #86868b;
+            --bg-border: #f2f2f2;
+        }
+
+        body {
+            background-color: var(--bg-border);
+            color: var(--text-primary);
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            margin: 0;
+            padding: 0;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            height: 100vh;
+            overflow: hidden;
+        }
+
+        #main-container {
+            width: 560px;
+            background: white;
+            padding: 40px;
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06);
+            position: relative;
+            transform: scale(1.1);
+            /* Slightly larger for visibility */
+        }
+
+        .corner-badge {
+            position: absolute;
+            top: -10px;
+            left: -10px;
+            height: 28px;
+            padding: 0 12px;
+            background-color: var(--theme-color);
+            color: white;
+            display: flex;
+            align-items: center;
+            font-size: 12px;
+            font-weight: 800;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            box-shadow: 0 2px 4px 0 rgba(0, 0, 0, 0.15);
+            z-index: 10;
+        }
+
+        h1 {
+            font-size: 32px;
+            font-weight: 900;
+            text-transform: uppercase;
+            letter-spacing: -1px;
+            margin: 0 0 24px 0;
+            line-height: 1.1;
+        }
+
+        .brand-text {
+            color: var(--theme-color);
+        }
+
+        .section-title {
+            font-size: 17px;
+            font-bold: 700;
+            text-transform: uppercase;
+            letter-spacing: -0.5px;
+            margin-bottom: 12px;
+            color: var(--text-primary);
+        }
+
+        .content-box {
+            padding-top: 24px;
+            border-top: 1px solid #eee;
+            margin-top: 32px;
+        }
+
+        .summary {
+            font-size: 15px;
+            line-height: 1.6;
+            color: var(--text-body);
+            text-align: justify;
+        }
+
+        .summary-en {
+            margin-top: 16px;
+            color: var(--text-muted);
+            font-size: 13px;
+            font-style: italic;
+            line-height: 1.5;
+        }
+
+        b {
+            color: var(--theme-color);
+            font-weight: 700;
+        }
+
+        /* Subtle loading animation to show it's "live" */
+        .progress-bar {
+            height: 3px;
+            background: #f3f3f3;
+            width: 100%;
+            margin-top: 32px;
+            position: relative;
+            overflow: hidden;
+        }
+
+        .progress-fill {
+            position: absolute;
+            height: 100%;
+            background: var(--theme-color);
+            width: 30%;
+            left: -30%;
+            animation: moveProgress 2s infinite ease-in-out;
+        }
+
+        @keyframes moveProgress {
+            0% {
+                left: -30%;
+                width: 20%;
+            }
+
+            50% {
+                width: 50%;
+            }
+
+            100% {
+                left: 100%;
+                width: 20%;
+            }
+        }
+    </style>
+</head>
+
+<body>
+    <div id="main-container">
+        <!-- Corner Badge Style -->
+        <div class="corner-badge">
+            Status: Ready
+        </div>
+
+        <h1>entari-plugin-<span class="brand-text">hyw</span></h1>
+
+        <div class="content-box">
+            <div class="section-title">Browser Service</div>
+            <div class="summary">
+                这是一个受 <b>entari-plugin-hyw</b> 插件控制的自动化浏览器实例。<br>
+                它负责网络搜索、内容爬取以及卡片 UI 的实时渲染。<br>
+                请勿关闭此窗口，以确保插件功能正常运行。
+            </div>
+
+            <div class="summary-en">
+                This is an automated browser instance controlled by the <b>entari-plugin-hyw</b> plugin.
+                It handles web searches, content crawling, and real-time Card UI rendering.
+                Please do not close this window to ensure the plugin functions correctly.
+            </div>
+        </div>
+
+        <div class="progress-bar">
+            <div class="progress-fill"></div>
+        </div>
+    </div>
+</body>
+
+</html>
