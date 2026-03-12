@@ -7,14 +7,20 @@ hyw/cli.py - Rich-styled CLI for hyw (Heuristic Yield Web_search)
 """
 from __future__ import annotations
 
+import atexit
 import argparse
 import os
+from pathlib import Path
 import re
+import shlex
+import shutil
 import subprocess
 import sys
 import threading
 import time
 import unicodedata
+from urllib.parse import unquote, urlparse
+from dataclasses import dataclass
 
 from rich import box
 from rich.console import Console
@@ -24,12 +30,25 @@ from rich.panel import Panel
 from rich.text import Text
 from rich.theme import Theme
 
-from .main import Stats, load_config, run, run_stream, startup_tools, shutdown_tools, CONFIG_PATH, DEFAULT_NAME
+from .main import (
+    Stats,
+    build_model_config,
+    load_config,
+    get_model_profiles,
+    run,
+    run_stream,
+    startup_tools,
+    shutdown_tools,
+    CONFIG_PATH,
+    DEFAULT_NAME,
+)
 
 try:
     from prompt_toolkit import PromptSession
     from prompt_toolkit.filters import Condition
     from prompt_toolkit.key_binding import KeyBindings
+    from prompt_toolkit.keys import Keys
+    from prompt_toolkit.layout.processors import BeforeInput, ConditionalProcessor
     from prompt_toolkit.styles import Style as PTStyle
 
     _PT_AVAILABLE = True
@@ -37,7 +56,11 @@ except Exception:
     PromptSession = None  # type: ignore[assignment,misc]
     Condition = None  # type: ignore[assignment,misc]
     KeyBindings = None  # type: ignore[assignment,misc]
+    Keys = None  # type: ignore[assignment,misc]
+    BeforeInput = None  # type: ignore[assignment,misc]
+    ConditionalProcessor = None  # type: ignore[assignment,misc]
     PTStyle = None  # type: ignore[assignment,misc]
+    _PT_AVAILABLE = False
 
 # ── Color constants ───────────────────────────────────────────
 TEXT_MUTED = "rgb(194,145,92)"
@@ -47,12 +70,19 @@ ACCENT = "rgb(255,108,60)"
 INPUT_ACCENT = "#D4AF37"
 INPUT_TEXT = "#E8BD8A"
 INPUT_HINT = "#D4AF37"
+INPUT_PLACEHOLDER = "#A08462"
 
 _QUIT = {"/exit", "/quit", "exit", "quit", "q"}
+_PASTE_COMMANDS = {"/paste", "/paste-image", "/clip", "/clipboard"}
 _DUMB = os.environ.get("TERM", "").lower() in {"", "dumb", "unknown"}
 _FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
 _MD_IMAGE_RE = re.compile(r"!\[([^\]]*)\]\(([^)\n]+)\)")
 _PROMPT_PREFIX = "➜  "
+_IMAGE_TOKEN_RE = re.compile(r"\[Image #\d+\]")
+_IMAGE_EXTENSIONS = {
+    ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tiff", ".tif",
+    ".heic", ".heif", ".avif", ".ico", ".icns",
+}
 
 INTRO_PROMPT_ANSI = "\x1b[38;2;255;108;60m"
 INTRO_INPUT_ANSI = "\x1b[38;2;232;189;138m"
@@ -61,6 +91,20 @@ INTRO_HINT_ANSI = "\x1b[38;2;160;132;98m"
 _IO_LOCK = threading.Lock()
 _INPUT_RENDERED = threading.Event()
 _STATUS_MAX_CELLS = 24
+
+
+@dataclass
+class _PromptInput:
+    text: str
+    image_paths: list[str]
+    cleanup_paths: list[str]
+
+
+@dataclass
+class _PastedImage:
+    token: str
+    path: str
+    owned: bool = False
 
 
 # ── Gradient title ────────────────────────────────────────────
@@ -177,15 +221,345 @@ def _tail_by_cells(text: str, max_cells: int) -> str:
     return "".join(reversed(out))
 
 
+def _cache_dir() -> Path:
+    root = CONFIG_PATH.parent
+    path = root / "cache"
+    legacy_dirs = [root / "缓存", root / "clipboard"]
+    for legacy in legacy_dirs:
+        if legacy.exists() and not path.exists():
+            try:
+                legacy.rename(path)
+                break
+            except Exception:
+                path.mkdir(parents=True, exist_ok=True)
+                for item in legacy.iterdir():
+                    try:
+                        shutil.move(str(item), str(path / item.name))
+                    except Exception:
+                        pass
+        else:
+            path.mkdir(parents=True, exist_ok=True)
+        if legacy.exists() and legacy.is_dir() and legacy != path:
+            try:
+                legacy.rmdir()
+            except Exception:
+                pass
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _cleanup_cache_dir() -> None:
+    cache = _cache_dir()
+    for item in cache.iterdir():
+        try:
+            if item.is_dir():
+                shutil.rmtree(item)
+            else:
+                item.unlink()
+        except Exception:
+            pass
+
+
+atexit.register(_cleanup_cache_dir)
+
+
+def _clipboard_dir() -> Path:
+    path = _cache_dir()
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _read_clipboard_text() -> str:
+    if sys.platform != "darwin":
+        return ""
+    try:
+        proc = subprocess.run(["pbpaste"], capture_output=True, text=True, check=False)
+    except Exception:
+        return ""
+    text = str(proc.stdout or "").replace("\r\n", "\n").replace("\r", "\n")
+    return re.sub(r"\s*\n\s*", " ", text).strip()
+
+
+def _normalize_pasted_path(token: str) -> Path | None:
+    raw = str(token or "").strip()
+    if not raw:
+        return None
+    if raw.startswith("file://"):
+        parsed = urlparse(raw)
+        raw = unquote(parsed.path or "")
+    path = Path(raw).expanduser()
+    if not path.is_file():
+        return None
+    if path.suffix.lower() not in _IMAGE_EXTENSIONS:
+        return None
+    return path
+
+
+def _extract_image_paths_from_text(text: str) -> list[str]:
+    raw = str(text or "").strip()
+    if not raw:
+        return []
+    try:
+        tokens = shlex.split(raw, posix=True)
+    except Exception:
+        tokens = [raw.replace("\\ ", " ")]
+    if not tokens:
+        return []
+    paths: list[str] = []
+    for token in tokens:
+        path = _normalize_pasted_path(token)
+        if path is None:
+            return []
+        paths.append(str(path))
+    return paths
+
+
+def _read_clipboard_image() -> str | None:
+    target = _clipboard_dir() / f"paste_{int(time.time() * 1000)}.png"
+    try:
+        from PIL import Image, ImageGrab
+    except Exception:
+        return None
+    try:
+        grabbed = ImageGrab.grabclipboard()
+    except Exception:
+        return None
+    if isinstance(grabbed, (list, tuple)):
+        for item in grabbed:
+            src = Path(str(item or "")).expanduser()
+            if not src.is_file():
+                continue
+            try:
+                with Image.open(src) as image:
+                    image.save(target, format="PNG")
+                return str(target)
+            except Exception:
+                continue
+        return None
+    if grabbed is None or not hasattr(grabbed, "save"):
+        return None
+    try:
+        grabbed.save(target, format="PNG")
+    except Exception:
+        return None
+    if target.exists():
+        return str(target)
+    return None
+
+
+def _insert_buffer_text(buffer, text: str, *, pad: bool = False) -> None:
+    value = str(text or "")
+    if not value:
+        return
+    if pad:
+        before = buffer.document.current_line_before_cursor
+        after = buffer.document.current_line_after_cursor
+        if before and not before[-1].isspace():
+            value = " " + value
+        if not value.endswith(" ") and (not after or not after[:1].isspace()):
+            value = value + " "
+    buffer.insert_text(value)
+
+
+def _discard_pasted_image(item: _PastedImage) -> None:
+    if not item.owned:
+        return
+    try:
+        Path(item.path).unlink()
+    except Exception:
+        pass
+
+
+def _next_image_number(pasted_images: list[_PastedImage]) -> int:
+    max_index = 0
+    for item in pasted_images:
+        match = _IMAGE_TOKEN_RE.fullmatch(item.token)
+        if not match:
+            continue
+        try:
+            index = int(item.token[len("[Image #"):-1])
+        except Exception:
+            continue
+        max_index = max(max_index, index)
+    return max_index + 1
+
+
+def _find_image_token_span(text: str, cursor: int, *, backward: bool) -> tuple[int, int] | None:
+    if backward:
+        if cursor <= 0:
+            return None
+        probe = cursor - 1
+        while probe >= 0 and text[probe].isspace():
+            probe -= 1
+        if probe < 0:
+            return None
+    else:
+        if cursor >= len(text):
+            return None
+        probe = cursor
+        while probe < len(text) and text[probe].isspace():
+            probe += 1
+        if probe >= len(text):
+            return None
+
+    for match in _IMAGE_TOKEN_RE.finditer(text):
+        start, end = match.span()
+        if start <= probe < end:
+            return start, end
+    return None
+
+
+def _expanded_image_delete_span(text: str, start: int, end: int) -> tuple[int, int]:
+    delete_start, delete_end = start, end
+    has_left_space = delete_start > 0 and text[delete_start - 1].isspace()
+    has_right_space = delete_end < len(text) and text[delete_end].isspace()
+    if has_left_space and has_right_space:
+        delete_start -= 1
+    elif has_right_space:
+        delete_end += 1
+    elif has_left_space:
+        delete_start -= 1
+    return delete_start, delete_end
+
+
+def _delete_image_token(buffer, pasted_images: list[_PastedImage], *, backward: bool) -> bool:
+    text = str(buffer.text or "")
+    cursor = int(buffer.cursor_position or 0)
+    span = _find_image_token_span(text, cursor, backward=backward)
+    if span is None:
+        return False
+    token_start, token_end = span
+    token_text = text[token_start:token_end]
+    delete_start, delete_end = _expanded_image_delete_span(text, token_start, token_end)
+    new_text = text[:delete_start] + text[delete_end:]
+    buffer.text = new_text
+    buffer.cursor_position = min(delete_start, len(new_text))
+
+    remaining: list[_PastedImage] = []
+    removed = False
+    for item in pasted_images:
+        if not removed and item.token == token_text:
+            _discard_pasted_image(item)
+            removed = True
+            continue
+        remaining.append(item)
+    pasted_images[:] = remaining
+    return True
+
+
+def _paste_clipboard_into_buffer(buffer, pasted_images: list[_PastedImage]) -> bool:
+    image_path = _read_clipboard_image()
+    if image_path:
+        _insert_image_tokens(buffer, [image_path], pasted_images, owned=True)
+        return True
+    clipboard_text = _read_clipboard_text()
+    if clipboard_text:
+        image_paths = _extract_image_paths_from_text(clipboard_text)
+        if image_paths:
+            _insert_image_tokens(buffer, image_paths, pasted_images)
+            return True
+        _insert_buffer_text(buffer, clipboard_text)
+        return True
+    return False
+
+
+def _insert_image_tokens(
+    buffer,
+    image_paths: list[str],
+    pasted_images: list[_PastedImage],
+    *,
+    owned: bool = False,
+) -> None:
+    tokens: list[str] = []
+    for image_path in image_paths:
+        token = f"[Image #{_next_image_number(pasted_images)}]"
+        pasted_images.append(_PastedImage(token=token, path=image_path, owned=owned))
+        tokens.append(token)
+    _insert_buffer_text(buffer, " ".join(tokens), pad=True)
+
+
+def _normalize_prompt_input(raw_text: str, pasted_images: list[_PastedImage]) -> _PromptInput:
+    text = str(raw_text or "").strip()
+    image_paths, cleanup_paths = _finalize_pasted_images(text, pasted_images)
+    if image_paths:
+        return _PromptInput(text=text, image_paths=image_paths, cleanup_paths=cleanup_paths)
+    direct_paths = _extract_image_paths_from_text(text)
+    if direct_paths:
+        tokens = [f"[Image #{idx}]" for idx in range(1, len(direct_paths) + 1)]
+        return _PromptInput(text=" ".join(tokens), image_paths=direct_paths, cleanup_paths=[])
+    return _PromptInput(text=text, image_paths=[], cleanup_paths=[])
+
+
+def _finalize_pasted_images(raw_text: str, pasted_images: list[_PastedImage]) -> tuple[list[str], list[str]]:
+    active: list[str] = []
+    cleanup: list[str] = []
+    text = str(raw_text or "")
+    for item in pasted_images:
+        if item.token in text:
+            active.append(item.path)
+            if item.owned:
+                cleanup.append(item.path)
+            continue
+        _discard_pasted_image(item)
+    return active, cleanup
+
+
+def _cleanup_image_paths(paths: list[str]) -> None:
+    for path_str in paths:
+        try:
+            Path(path_str).unlink()
+        except Exception:
+            pass
+
+
+def _pull_clipboard_prompt_input() -> _PromptInput:
+    image_path = _read_clipboard_image()
+    if image_path:
+        return _PromptInput(text="[Image #1]", image_paths=[image_path], cleanup_paths=[image_path])
+    text = _read_clipboard_text()
+    image_paths = _extract_image_paths_from_text(text)
+    if image_paths:
+        tokens = [f"[Image #{idx}]" for idx in range(1, len(image_paths) + 1)]
+        return _PromptInput(text=" ".join(tokens), image_paths=image_paths, cleanup_paths=[])
+    return _PromptInput(text=text, image_paths=[], cleanup_paths=[])
+
+
 # ── Tool call formatting ─────────────────────────────────────
 def _fmt_args(name: str, args: dict) -> str:
     if name in ("web_search", "web_search_wiki"):
         q = str(args.get("query") or "").strip()
         df = str(args.get("df") or "").strip()
         if q and df:
-            return f"{q} | [{df}]"
+            return f"{q}, [{df}]"
         return q
     return str(args)[:160]
+
+
+def _tool_line(name: str, args: dict) -> Text:
+    formatted = _fmt_args(name, args)
+    count = args.get("_count")
+    ok = args.get("_ok")
+    elapsed_s = args.get("_elapsed_s")
+
+    line = Text()
+    line.append("  > ", style=f"bold {ACCENT}")
+    line.append_text(_gradient_title(name))
+    if formatted:
+        line.append(f"({formatted})", style=TEXT_MUTED)
+    if ok is False:
+        line.append(" !", style=TEXT_MUTED)
+    elif count not in (None, ""):
+        line.append(" ", style=TEXT_MUTED)
+        line.append(str(count), style=f"bold {ACCENT}")
+        line.append(" ✓", style=TEXT_MUTED)
+    elif ok is not None:
+        line.append(" ✓", style=TEXT_MUTED)
+    if elapsed_s not in (None, ""):
+        try:
+            line.append(f" {float(elapsed_s):.1f}s", style=TEXT_MUTED)
+        except Exception:
+            pass
+    return line
 
 
 # ── Clean answer ──────────────────────────────────────────────
@@ -236,110 +610,196 @@ def _gradient_label(text: str) -> list[tuple[str, str]]:
     return parts
 
 
+def _prompt_status(mode_state: dict | None = None) -> str:
+    state = mode_state or {}
+    ready = state.get("tools_ready")
+    failed = state.get("tools_failed")
+    if ready:
+        return "✓"
+    if failed:
+        return "!"
+    return "…"
+
+
+def _prompt_placeholder(mode_state: dict | None = None) -> list[tuple[str, str]]:
+    model = str((mode_state or {}).get("model") or "").strip()
+    if not model:
+        return []
+    return [("", model)]
+
+
+def _prompt_parts(mode_state: dict | None = None) -> list[tuple[str, str]]:
+    state = mode_state or {}
+    multi = state.get("multi_turn", True)
+    status_color = f"bold fg:#{255:02x}{108:02x}{60:02x}"
+    parts: list[tuple[str, str]] = [("class:prompt", _PROMPT_PREFIX)]
+    parts.extend(_gradient_name(str(state.get("name") or "")))
+    if not multi:
+        parts.append(("", " ("))
+        parts.append(("class:mode", "New Session"))
+        parts.append(("", ")"))
+    parts.append(("", " "))
+    parts.append((status_color, f"{_prompt_status(state)} "))
+    return parts
+
+
+def _apply_model_state(mode_state: dict, index: int) -> None:
+    models = mode_state.get("models") or []
+    if not isinstance(models, list) or not models:
+        mode_state["model_index"] = 0
+        mode_state["model_count"] = 0
+        mode_state["model"] = ""
+        mode_state["model_id"] = ""
+        return
+
+    idx = int(index or 0) % len(models)
+    current = models[idx] if isinstance(models[idx], dict) else {}
+    label = str(current.get("model") or current.get("name") or "").strip()
+    mode_state["model_index"] = idx
+    mode_state["model_count"] = len(models)
+    mode_state["model"] = label
+    mode_state["model_id"] = str(current.get("model") or "").strip()
+
+
+def _cycle_model(mode_state: dict, delta: int) -> None:
+    models = mode_state.get("models") or []
+    if not isinstance(models, list) or len(models) <= 1:
+        return
+    current = int(mode_state.get("model_index") or 0)
+    _apply_model_state(mode_state, current + delta)
+
+
 # ── prompt_toolkit input ──────────────────────────────────────
-def _ask(session, *, mode_state: dict | None = None) -> str:
-    """Read user input. mode_state allows left/right arrow to toggle multi_turn."""
+def _ask(session, *, mode_state: dict | None = None) -> _PromptInput:
+    """Read user input. Empty-buffer arrows control model/session shortcuts."""
+    pasted_images: list[_PastedImage] = []
+
     if session is not None and _PT_AVAILABLE and PTStyle is not None and mode_state is not None:
         kb = KeyBindings()
 
         @kb.add("left", filter=Condition(lambda: not session.app.current_buffer.text))
+        def _prev_model(event):
+            _cycle_model(mode_state, -1)
+            event.app.invalidate()
+
         @kb.add("right", filter=Condition(lambda: not session.app.current_buffer.text))
-        def _toggle(event):
+        def _next_model(event):
+            _cycle_model(mode_state, 1)
+            event.app.invalidate()
+
+        @kb.add("up", filter=Condition(lambda: not session.app.current_buffer.text))
+        @kb.add("down", filter=Condition(lambda: not session.app.current_buffer.text))
+        def _toggle_session(event):
             mode_state["multi_turn"] = not mode_state["multi_turn"]
             event.app.invalidate()
+
+        @kb.add("c-v", eager=True)
+        def _paste(event):
+            _paste_clipboard_into_buffer(event.current_buffer, pasted_images)
+
+        @kb.add("escape", "v", eager=True)
+        def _paste_alt(event):
+            _paste_clipboard_into_buffer(event.current_buffer, pasted_images)
+
+        @kb.add("backspace", eager=True)
+        def _delete_prev(event):
+            if _delete_image_token(event.current_buffer, pasted_images, backward=True):
+                return
+            event.current_buffer.delete_before_cursor(count=1)
+
+        @kb.add("delete", eager=True)
+        def _delete_next(event):
+            if _delete_image_token(event.current_buffer, pasted_images, backward=False):
+                return
+            event.current_buffer.delete(count=1)
+
+        @kb.add(Keys.BracketedPaste, eager=True)
+        def _paste_bracketed(event):
+            pasted_text = str(event.data or "")
+            image_paths = _extract_image_paths_from_text(pasted_text)
+            if image_paths:
+                _insert_image_tokens(event.current_buffer, image_paths, pasted_images, owned=False)
+                return
+            _insert_buffer_text(event.current_buffer, pasted_text)
 
         def _get_rprompt():
             return []
 
-        # Spinner invalidation thread — keeps prompt animated while loading
-        _spinner_stop = threading.Event()
-
-        def _spinner_loop():
-            while not _spinner_stop.wait(0.09):
-                if mode_state.get("tools_ready"):
-                    # One final invalidate to show ✓, then stop
-                    try:
-                        session.app.invalidate()
-                    except Exception:
-                        pass
-                    break
-                try:
-                    session.app.invalidate()
-                except Exception:
-                    pass
-
-        if not mode_state.get("tools_ready"):
-            threading.Thread(target=_spinner_loop, daemon=True).start()
-
         def _get_prompt():
-            arrow = _PROMPT_PREFIX
-            model = mode_state.get("model", "")
-            multi = mode_state.get("multi_turn", True)
-            ready = mode_state.get("tools_ready")
-            status_color = f"bold fg:#{255:02x}{108:02x}{60:02x}"
-            if ready:
-                status = "✓"
-            else:
-                status = _FRAMES[int(time.time() * 12) % len(_FRAMES)]
-            mode_label = "Multi Turn" if multi else "New Session"
-            parts: list[tuple[str, str]] = [("class:prompt", arrow)]
-            parts.extend(_gradient_name(mode_state.get("name", "")))
-            parts.append(("class:brand", f"({model}) "))
-            parts.append(("", "("))
-            parts.extend(_gradient_label(mode_label))
-            parts.append(("", ") "))
-            parts.append((status_color, f"{status} "))
-            return parts
+            return _prompt_parts(mode_state)
+
+        def _get_placeholder():
+            return _prompt_placeholder(mode_state)
+
+        input_processors = []
+        if BeforeInput is not None and ConditionalProcessor is not None:
+            input_processors.append(
+                ConditionalProcessor(
+                    BeforeInput(_get_placeholder, style="class:placeholder"),
+                    filter=Condition(
+                        lambda: (
+                            not session.app.current_buffer.text
+                            and bool(str((mode_state or {}).get("model") or "").strip())
+                        )
+                    ),
+                )
+            )
 
         input_style = PTStyle.from_dict(
             {
                 "": INPUT_TEXT,
                 "prompt": f"bold {INPUT_ACCENT}",
-                "brand": "#c2915c",
+                "mode": "bold",
                 "status": INPUT_HINT,
-                "placeholder": f"dim {INPUT_HINT}",
+                "placeholder": f"fg:{INPUT_PLACEHOLDER}",
+                "placeholder_hint": f"fg:{INPUT_PLACEHOLDER}",
             }
         )
         try:
-            text = session.prompt(
+            raw_text = session.prompt(
                 _get_prompt,
                 rprompt=_get_rprompt,
                 multiline=False,
                 style=input_style,
-                placeholder=[("class:placeholder", "")],
+                input_processors=input_processors,
                 default="",
                 enable_open_in_editor=False,
                 key_bindings=kb,
             )
         finally:
-            _spinner_stop.set()
-        return str(text or "").strip()
+            pass
+        return _normalize_prompt_input(str(raw_text or ""), pasted_images)
 
     if session is not None and _PT_AVAILABLE and PTStyle is not None:
-        model = (mode_state or {}).get("model", "")
-        status_color = f"bold fg:#{255:02x}{108:02x}{60:02x}"
-        prompt_parts: list[tuple[str, str]] = [("class:prompt", _PROMPT_PREFIX)]
-        prompt_parts.extend(_gradient_name(mode_state.get("name", "")))
-        prompt_parts.append(("class:brand", f"({model}) "))
-        prompt_parts.append((status_color, "✓ "))
         input_style = PTStyle.from_dict(
             {
                 "": INPUT_TEXT,
                 "prompt": f"bold {INPUT_ACCENT}",
-                "brand": "#c2915c",
-                "placeholder": f"dim {INPUT_HINT}",
+                "mode": "bold",
+                "placeholder": f"fg:{INPUT_PLACEHOLDER}",
+                "placeholder_hint": f"fg:{INPUT_PLACEHOLDER}",
             }
         )
-        text = session.prompt(
-            prompt_parts,
+        raw_text = session.prompt(
+            _prompt_parts(mode_state),
             multiline=False,
             style=input_style,
-            placeholder=[("class:placeholder", "")],
+            input_processors=[
+                ConditionalProcessor(
+                    BeforeInput(lambda: _prompt_placeholder(mode_state), style="class:placeholder"),
+                    filter=Condition(
+                        lambda: (
+                            not session.app.current_buffer.text
+                            and bool(str((mode_state or {}).get("model") or "").strip())
+                        )
+                    ),
+                )
+            ] if BeforeInput is not None and ConditionalProcessor is not None else None,
             default="",
             enable_open_in_editor=False,
         )
-        return str(text or "").strip()
-    return input(_PROMPT_PREFIX).strip()
+        return _normalize_prompt_input(str(raw_text or ""), pasted_images)
+    return _PromptInput(text=input(_PROMPT_PREFIX).strip(), image_paths=[], cleanup_paths=[])
 
 
 # ── Spinner (lightweight, for runtime status) ─────────────────
@@ -490,8 +950,6 @@ def _welcome_setup(console: Console) -> None:
 # ── Stats subtitle ────────────────────────────────────────────
 def _stats_subtitle(stats: Stats, *, multi_turn: bool = True, elapsed: float | None = None) -> Text:
     out = Text()
-    mode_label = "Multi Turn" if multi_turn else "New Session"
-    out.append(f"{mode_label}  ", style=TEXT_MUTED)
     if elapsed is not None:
         if elapsed >= 60:
             out.append(f"{elapsed / 60:.1f}m ", style=f"bold {ACCENT}")
@@ -517,7 +975,18 @@ def _stats_subtitle(stats: Stats, *, multi_turn: bool = True, elapsed: float | N
 def _open_config(console: Console) -> None:
     CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
     if not CONFIG_PATH.exists():
-        CONFIG_PATH.write_text("# hyw config\nlanguage: zh-CN\n", encoding="utf-8")
+        CONFIG_PATH.write_text(
+            "# hyw config\n"
+            "active_model: openai/gpt-4o-mini\n"
+            "models:\n"
+            "  - model: openai/gpt-4o-mini\n"
+            "\n"
+            "language: zh-CN\n"
+            "max_rounds: 6\n"
+            "headless: true\n"
+            "system_prompt: \"\"\n",
+            encoding="utf-8",
+        )
     editor = os.environ.get("EDITOR") or os.environ.get("VISUAL") or "vi"
     try:
         subprocess.run([editor, str(CONFIG_PATH)], check=False)
@@ -533,6 +1002,7 @@ def _run_streaming(
     stats: Stats,
     console: Console,
     spinner: _Spinner,
+    images: list[str] | None = None,
     context: str | None = None,
     multi_turn: bool = True,
 ) -> str:
@@ -554,7 +1024,11 @@ def _run_streaming(
             spinner.stop()
             console.print()
             live = Live(
-                _make_panel(Text("..."), title=title),
+                _make_panel(
+                    Text("..."),
+                    title=title,
+                    subtitle=_stats_subtitle(stats, multi_turn=multi_turn, elapsed=time.monotonic() - t_start),
+                ),
                 console=console,
                 refresh_per_second=8,
                 transient=True,
@@ -566,6 +1040,7 @@ def _run_streaming(
             live.update(_make_panel(
                 Markdown(_clean_answer("".join(chunks))),
                 title=title,
+                subtitle=_stats_subtitle(stats, multi_turn=multi_turn, elapsed=now - t_start),
             ))
             last_update[0] = now
 
@@ -581,6 +1056,7 @@ def _run_streaming(
                 _make_panel(
                     Markdown(clean),
                     title=title,
+                    subtitle=_stats_subtitle(stats, multi_turn=multi_turn, elapsed=time.monotonic() - t_start),
                 )
             )
         chunks.clear()
@@ -588,13 +1064,7 @@ def _run_streaming(
 
     def _on_tool(name: str, args: dict) -> None:
         spinner.stop()
-        formatted = _fmt_args(name, args)
-        line = Text()
-        line.append("  > ", style=f"bold {ACCENT}")
-        line.append(name, style=TEXT_MUTED)
-        if formatted:
-            line.append(f"({formatted})", style=TEXT_MUTED)
-        console.print(line)
+        console.print(_tool_line(name, args))
 
     try:
         answer = run_stream(
@@ -605,6 +1075,7 @@ def _run_streaming(
             on_tool=_on_tool,
             on_status=_on_status,
             on_rewind=_on_rewind,
+            images=images,
             context=context,
         )
     except KeyboardInterrupt:
@@ -612,7 +1083,7 @@ def _run_streaming(
         if live:
             live.stop()
         console.print(f"\n  [{TEXT_MUTED}]已中断[/{TEXT_MUTED}]")
-        return ""
+        raise
     except Exception as e:
         spinner.stop()
         if live:
@@ -649,7 +1120,7 @@ def main(argv: list[str] | None = None):
     args = parser.parse_args(argv)
 
     config = load_config()
-    model = config.get("model") or "openai/gpt-4o-mini"
+    models = get_model_profiles(config)
     headless = config.get("headless") not in (False, "false", "0", 0)
 
     console = Console(theme=_build_markdown_theme())
@@ -660,12 +1131,15 @@ def main(argv: list[str] | None = None):
     # ── Single-shot mode ──
     if args.question:
         try:
-            startup_tools(headless=headless)
+            startup_tools(headless=headless, config=config)
         except Exception:
             pass
-        answer = run(args.question, config=config, stats=session_stats,
-                     on_tool=lambda n, a: console.print(Text.assemble(
-                         ("  > ", f"bold {ACCENT}"), (f"{n}({_fmt_args(n, a)})", TEXT_MUTED))))
+        answer = run(
+            args.question,
+            config=config,
+            stats=session_stats,
+            on_tool=lambda n, a: console.print(_tool_line(n, a)),
+        )
         answer = _clean_answer(answer)
         console.print(
             _make_panel(
@@ -674,21 +1148,20 @@ def main(argv: list[str] | None = None):
                 subtitle=_stats_subtitle(session_stats),
             )
         )
-        shutdown_tools()
+        shutdown_tools(config)
+        _cleanup_cache_dir()
         return
 
     # ── Interactive mode ──
-    mode_state = {"multi_turn": True, "model": model, "tools_ready": False}
-
-    # Background warmup — 完成后 prompt 自动从 ✗ 变 ✓
-    def _warmup():
-        try:
-            startup_tools(headless=headless)
-            mode_state["tools_ready"] = True
-        except Exception:
-            pass
-
-    threading.Thread(target=_warmup, name="hyw-warmup", daemon=True).start()
+    mode_state = {
+        "multi_turn": True,
+        "models": models,
+        "model_index": config.get("active_model_index") or 0,
+        "name": config.get("name") or DEFAULT_NAME,
+        "tools_ready": True,
+        "tools_failed": False,
+    }
+    _apply_model_state(mode_state, int(mode_state["model_index"]))
 
     spinner = _Spinner()
     last_context: str | None = None
@@ -696,24 +1169,50 @@ def main(argv: list[str] | None = None):
 
     try:
         while True:
+            image_paths: list[str] = []
+            cleanup_paths: list[str] = []
             try:
-                question = _ask(session, mode_state=mode_state)
+                prompt_input = _ask(session, mode_state=mode_state)
+                question = prompt_input.text
+                image_paths = prompt_input.image_paths
+                cleanup_paths = prompt_input.cleanup_paths
             except KeyboardInterrupt:
                 console.print()
-                continue
+                break
             except EOFError:
                 console.print()
                 break
 
-            if not question:
+            if not question and not image_paths:
                 continue
-            if question.lower() in _QUIT:
+            if not image_paths and question.lower() in _QUIT:
                 break
-            if question.lower() == "/stats":
+            if not image_paths and question.lower() in _PASTE_COMMANDS:
+                prompt_input = _pull_clipboard_prompt_input()
+                question = prompt_input.text
+                image_paths = prompt_input.image_paths
+                cleanup_paths = prompt_input.cleanup_paths
+                if not question and not image_paths:
+                    console.print(f"  [{TEXT_MUTED}]剪贴板里没有可粘贴的文本或图片[/{TEXT_MUTED}]")
+                    continue
+            if not image_paths and question.lower() == "/stats":
                 console.print(f"  [{TEXT_MUTED}]{session_stats.summary()}[/{TEXT_MUTED}]")
                 continue
-            if question.lower() == "/config":
+            if not image_paths and question.lower() == "/config":
                 _open_config(console)
+                config = load_config()
+                mode_state["models"] = get_model_profiles(config)
+                _apply_model_state(mode_state, int(config.get("active_model_index") or 0))
+                headless = config.get("headless") not in (False, "false", "0", 0)
+                console.print(f"  [{TEXT_MUTED}]配置已重新加载[/{TEXT_MUTED}]")
+                continue
+            if not image_paths and question.lower() == "/model":
+                label = str(mode_state.get("model") or "").strip() or "未配置"
+                model_id = str(mode_state.get("model_id") or "").strip()
+                if model_id and model_id != label:
+                    console.print(f"  [{TEXT_MUTED}]{label} -> {model_id}[/{TEXT_MUTED}]")
+                else:
+                    console.print(f"  [{TEXT_MUTED}]{label}[/{TEXT_MUTED}]")
                 continue
 
             multi = mode_state["multi_turn"]
@@ -723,22 +1222,31 @@ def main(argv: list[str] | None = None):
 
             ctx = last_context if multi else None
 
-            answer = _run_streaming(
-                question,
-                config=config,
-                stats=session_stats,
-                console=console,
-                spinner=spinner,
-                context=ctx,
-                multi_turn=multi,
-            )
+            try:
+                request_config = build_model_config(config, model_index=int(mode_state.get("model_index") or 0))
+                answer = _run_streaming(
+                    question,
+                    config=request_config,
+                    stats=session_stats,
+                    console=console,
+                    spinner=spinner,
+                    images=image_paths,
+                    context=ctx,
+                    multi_turn=multi,
+                )
+            except KeyboardInterrupt:
+                console.print()
+                break
+            finally:
+                _cleanup_image_paths(cleanup_paths)
 
             # Build context for next round
             if answer:
                 last_context = f"User: {question}\nAnswer: {answer}"
             last_was_multi = multi
     finally:
-        shutdown_tools()
+        shutdown_tools(config)
+        _cleanup_cache_dir()
 
 
 if __name__ == "__main__":

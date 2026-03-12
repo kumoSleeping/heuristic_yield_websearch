@@ -1,4 +1,4 @@
-"""hyw - 允许 python -m core"""
-from .cli import main
+"""Allow `python -m core` to reuse the CLI launcher."""
+from hyw._launcher import main
 
 main()

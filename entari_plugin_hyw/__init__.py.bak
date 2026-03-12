@@ -1,0 +1,5 @@
+from __future__ import annotations
+
+from core.entari_plugin_hyw import __plugin__, __version__
+
+__all__ = ["__plugin__", "__version__"]

@@ -1,5 +1,5 @@
 """
-hyw/entari.py - entari 插件 (保留原项目绝大部分功能)
+core/entari_plugin_hyw.py - entari 插件 (保留原项目绝大部分功能)
 
 功能:
 - .q 命令触发问答
@@ -45,7 +45,15 @@ from .main import Stats, load_config, run, startup_tools, shutdown_tools, cfg_ge
 
 try:
     from importlib.metadata import version as get_version
-    __version__ = get_version("entari-plugin-hyw-ai")
+
+    for _dist_name in ("hyw", "entari-plugin-hyw-ai"):
+        try:
+            __version__ = get_version(_dist_name)
+            break
+        except Exception:
+            continue
+    else:
+        __version__ = "6.0.0"
 except Exception:
     __version__ = "6.0.0"
 
@@ -113,6 +121,8 @@ class PluginConfig(BasicConfModel):
     api_key: str | None = None
     api_base: str | None = None
     model: str | None = None
+    active_model: str | None = None
+    models: Any | None = None
     system_prompt: str | None = None
     language: str | None = None
     language_style: str | None = None
@@ -174,6 +184,8 @@ def _build_core_overrides() -> Dict[str, Any]:
         "api_key": _pick("api_key"),
         "api_base": _pick("api_base", "base_url"),
         "model": _pick("model", "model_name"),
+        "active_model": _pick("active_model"),
+        "models": _normalize_conf_value(getattr(conf, "models", None)),
         "system_prompt": _pick("system_prompt"),
         "language": _pick("language"),
         "language_style": _pick("language_style"),

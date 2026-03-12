@@ -2,15 +2,17 @@
 hyw/main.py - 极简 LLM 对话循环 + XML 标签工具调用 + 统计 + 调用日志
 
 依赖: litellm, hyw/web_search (自带)
-配置: ~/.hyw/config.yml 纯穿透读取, 不做校验
+配置: ~/.hyw/config.yml, 兼容单模型与多模型写法
 
 工具调用方式: 模型在文本中输出 <search>/<wiki> XML 标签, 解析后执行工具, 注入结果再让模型继续.
 """
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
+import mimetypes
 import re
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -36,13 +38,147 @@ LOG_DIR = Path.home() / ".hyw" / "logs"
 
 
 # ── 配置: 纯穿透 ─────────────────────────────────────────────
+def _clean_cfg_text(value: Any) -> str:
+    return str(value).strip() if value is not None else ""
+
+
+def _model_defaults(config: dict[str, Any]) -> dict[str, str]:
+    saved = config.get("_model_defaults")
+    if isinstance(saved, dict):
+        defaults = {
+            "model": _clean_cfg_text(saved.get("model")),
+            "api_key": _clean_cfg_text(saved.get("api_key")),
+            "api_base": _clean_cfg_text(saved.get("api_base") or saved.get("base_url")),
+            "reasoning_effort": _clean_cfg_text(saved.get("reasoning_effort")),
+        }
+    else:
+        defaults = {
+            "model": _clean_cfg_text(config.get("model") or config.get("model_name")),
+            "api_key": _clean_cfg_text(config.get("api_key")),
+            "api_base": _clean_cfg_text(config.get("api_base") or config.get("base_url")),
+            "reasoning_effort": _clean_cfg_text(config.get("reasoning_effort")),
+        }
+    if not defaults["model"]:
+        defaults["model"] = DEFAULT_MODEL
+    return defaults
+
+
+def _normalize_model_profile(
+    entry: Any,
+    *,
+    defaults: dict[str, str],
+    name_hint: str = "",
+) -> dict[str, Any] | None:
+    if isinstance(entry, str):
+        entry = {"model": entry}
+    if not isinstance(entry, dict):
+        return None
+
+    model = _clean_cfg_text(entry.get("model") or entry.get("model_name") or defaults.get("model"))
+    if not model:
+        model = DEFAULT_MODEL
+
+    profile: dict[str, Any] = {"model": model}
+    alias = _clean_cfg_text(entry.get("name") or entry.get("label") or name_hint)
+    if alias:
+        profile["name"] = alias
+
+    api_key = _clean_cfg_text(entry.get("api_key") or defaults.get("api_key"))
+    api_base = _clean_cfg_text(entry.get("api_base") or entry.get("base_url") or defaults.get("api_base"))
+    reasoning_effort = _clean_cfg_text(entry.get("reasoning_effort") or defaults.get("reasoning_effort"))
+
+    if api_key:
+        profile["api_key"] = api_key
+    if api_base:
+        profile["api_base"] = api_base
+    if reasoning_effort:
+        profile["reasoning_effort"] = reasoning_effort
+    return profile
+
+
+def _normalize_models(config: dict[str, Any]) -> list[dict[str, Any]]:
+    defaults = _model_defaults(config)
+    raw_models = config.get("models")
+    profiles: list[dict[str, Any]] = []
+
+    if isinstance(raw_models, list):
+        for entry in raw_models:
+            profile = _normalize_model_profile(entry, defaults=defaults)
+            if profile:
+                profiles.append(profile)
+    elif isinstance(raw_models, dict):
+        for name, entry in raw_models.items():
+            profile = _normalize_model_profile(entry, defaults=defaults, name_hint=_clean_cfg_text(name))
+            if profile:
+                profiles.append(profile)
+
+    if not profiles:
+        fallback = _normalize_model_profile(config, defaults=defaults)
+        if fallback:
+            profiles.append(fallback)
+
+    return profiles or [{"model": DEFAULT_MODEL}]
+
+
+def _pick_active_model_index(config: dict[str, Any], profiles: list[dict[str, Any]] | None = None) -> int:
+    items = profiles or _normalize_models(config)
+    if not items:
+        return 0
+
+    raw_index = config.get("active_model_index")
+    if isinstance(raw_index, str) and raw_index.strip().isdigit():
+        raw_index = int(raw_index.strip())
+    if isinstance(raw_index, int):
+        return max(0, min(raw_index, len(items) - 1))
+
+    active = _clean_cfg_text(config.get("active_model"))
+    if active:
+        lowered = active.lower()
+        for idx, profile in enumerate(items):
+            model = _clean_cfg_text(profile.get("model")).lower()
+            name = _clean_cfg_text(profile.get("name")).lower()
+            if lowered in {model, name}:
+                return idx
+    return 0
+
+
+def build_model_config(config: dict[str, Any] | None = None, model_index: int | None = None) -> dict[str, Any]:
+    raw = dict(config or {})
+    profiles = _normalize_models(raw)
+    index = _pick_active_model_index(raw, profiles) if model_index is None else int(model_index or 0)
+    if profiles:
+        index %= len(profiles)
+    else:
+        index = 0
+
+    active = profiles[index]
+    cfg = dict(raw)
+    cfg["models"] = profiles
+    cfg["_model_defaults"] = _model_defaults(raw)
+    cfg["active_model_index"] = index
+    cfg["active_model"] = active.get("model") or active.get("name") or DEFAULT_MODEL
+    cfg["model"] = active.get("model") or DEFAULT_MODEL
+
+    for key in ("api_key", "api_base", "reasoning_effort"):
+        if key in active:
+            cfg[key] = active[key]
+        else:
+            cfg.pop(key, None)
+    return cfg
+
+
+def get_model_profiles(config: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+    cfg = build_model_config(config)
+    return [dict(profile) for profile in cfg.get("models") or []]
+
+
 def load_config() -> dict[str, Any]:
-    """原样读 yaml, 不做校验/默认值填充."""
+    """读取 yaml，并归一化为向后兼容的多模型配置."""
     try:
         raw = yaml.safe_load(CONFIG_PATH.read_text("utf-8")) if CONFIG_PATH.exists() else {}
     except Exception:
         raw = {}
-    return raw if isinstance(raw, dict) else {}
+    return build_model_config(raw if isinstance(raw, dict) else {})
 
 
 def cfg_get(config: dict[str, Any], path: str, default: Any = None) -> Any:
@@ -163,7 +299,7 @@ def log_model_call(
         lines.append("### Input")
         for m in messages:
             role = m.get("role", "?")
-            content = str(m.get("content") or "")
+            content = _format_log_message_content(m.get("content"))
             if len(content) > 500:
                 content = content[:500] + "..."
             lines.append(f"**[{role}]**")
@@ -187,17 +323,11 @@ def log_model_call(
 
 
 # ── 工具: web_search (hyw 内置) ──────────────────────────
-_suite_lock = threading.RLock()
-_suite = None
 
 
-def _get_suite(headless: bool = True):
-    global _suite
-    with _suite_lock:
-        if _suite is None:
-            from .xml_tools.web_search.server import WebToolSuite
-            _suite = WebToolSuite(headless=headless)
-        return _suite
+def get_web_search_backend(config: dict[str, Any] | None = None) -> str:
+    del config
+    return "websearch"
 
 
 def _run_async(coro):
@@ -219,22 +349,27 @@ def _run_async(coro):
     return result.get("v")
 
 
-def startup_tools(headless: bool = True):
-    """预热浏览器截图服务."""
-    from .xml_tools.web_search.runtime import on_startup
+def startup_tools(headless: bool = True, config: dict[str, Any] | None = None):
+    """Warm up the built-in websearch service."""
+    del config
+    from .web_search import on_startup
+
     on_startup(headless=headless)
 
 
-def shutdown_tools():
-    from .xml_tools.web_search.runtime import on_shutdown
+def shutdown_tools(config: dict[str, Any] | None = None):
+    del config
+    from .web_search import on_shutdown
+
     on_shutdown()
 
 
 def _web_search(query: str, df: str = "", **_) -> dict[str, Any]:
     """调用 WebToolSuite 执行搜索."""
-    suite = _get_suite()
+    from .web_search import web_search
+
     try:
-        payload = _run_async(suite.web_search(
+        payload = _run_async(web_search(
             query=query, mode="text",
             time_range=df or "",
             max_results=5,
@@ -259,6 +394,22 @@ def execute_tool(name: str, args: dict[str, Any]) -> str:
     else:
         r = {"ok": False, "error": f"unknown tool: {name}"}
     return json.dumps(r, ensure_ascii=False, indent=2)
+
+
+def _tool_callback_args(args: dict[str, Any], result_text: str, *, elapsed_s: float | None = None) -> dict[str, Any]:
+    merged = dict(args)
+    try:
+        payload = json.loads(result_text)
+    except Exception:
+        payload = {}
+    if isinstance(payload, dict):
+        if "count" in payload:
+            merged["_count"] = payload.get("count")
+        if "ok" in payload:
+            merged["_ok"] = payload.get("ok")
+    if elapsed_s is not None:
+        merged["_elapsed_s"] = max(0.0, float(elapsed_s))
+    return merged
 
 
 # ── XML 标签工具调用解析 ─────────────────────────────────────
@@ -320,6 +471,7 @@ Current time: {time}, 这是一个很重要的信息, 请务必在回答中考�
 > 硬性规则1: 用户的原话为: {user_message}, 在构建、切分搜索词的时候禁止改变用户原文中任何一个词, 包括 语意扩充、翻译、擅自添加领域... 防止滚雪球效应发送, 从最开始就偏离了用户意图.
 > 硬性规则2: 每次搜索需要保证搜索词交错: 减少多次搜索指向相同结果
 > 硬性规则3: 不搜索低质量内容、敏感词、忽略用户消息图片中的角色
+> 技巧1: 对于专业性知识推荐搜索的时候额外追加一条搜索 带有相关专业网站的, 例如查询工具类: github、动漫类: 萌娘百科、我的世界: mcwiki/mcmod...以此类推
 由于模型被设定为: 对怀疑的内容分享欲望较低, 在第一轮工具给出合并结果后, 如果信息不足, 可以自主继续切分更细的搜索词进行第二轮工具调用, 以提升召回率.
 
 工具调用过程回复: 
@@ -342,8 +494,6 @@ eg:
 <search df="2026-02-24..2026-03-12">xxx 最新情报</search>
 <search>xxx 剧情简介</search>
 
-## 工作流程注意
-通常情况下一轮的搜索结果往往不足以支持模型做出准确的回答, 根据工具返回结果, 继续分析是否继续工具调用, 直到你认为信息充分了才给出最终回答.
 """
 
 TOOL_RESULTS_GUIDE = """\
@@ -363,6 +513,87 @@ def _build_system_prompt(cfg: dict, user_message: str = "") -> str:
     )
 
 
+def _format_model_error_message(exc: Exception) -> str:
+    err = str(exc or "").strip()
+    for frag in ("APIError:", "Exception -"):
+        if frag in err:
+            err = err[err.index(frag) + len(frag):].strip()
+            break
+    if len(err) > 200:
+        err = err[:200]
+
+    lowered = err.lower()
+    missing_key = (
+        "api_key" in lowered
+        or "openai_api_key" in lowered
+        or "api key" in lowered
+    )
+    if missing_key:
+        config_path = str(CONFIG_PATH.expanduser())
+        return (
+            f"[模型调用失败] {err}\n"
+            f"可通过设置环境变量 `OPENAI_API_KEY`，或在配置文件 `{config_path}` 中填写 `api_key:`。"
+        )
+    return f"[模型调用失败] {err}"
+
+
+def _format_log_message_content(content: Any) -> str:
+    if isinstance(content, list):
+        parts: list[str] = []
+        image_index = 0
+        for item in content:
+            if not isinstance(item, dict):
+                parts.append(str(item))
+                continue
+            item_type = str(item.get("type") or "").strip().lower()
+            if item_type == "text":
+                text = str(item.get("text") or "").strip()
+                if text:
+                    parts.append(text)
+                continue
+            if item_type == "image_url":
+                image_index += 1
+                parts.append(f"[Image #{image_index}]")
+                continue
+            parts.append(str(item))
+        return "\n".join(parts).strip()
+    return str(content or "")
+
+
+def _default_image_prompt(image_count: int) -> str:
+    if image_count <= 0:
+        return ""
+    if image_count == 1:
+        return "请根据图片内容进行分析并回答。"
+    return "请结合这些图片内容进行分析并回答。"
+
+
+def _effective_prompt_text(question: str, image_count: int = 0) -> str:
+    text = str(question or "").strip()
+    if not text:
+        return _default_image_prompt(image_count)
+    normalized = re.sub(r"\[Image #\d+\]", "", text)
+    if normalized.strip():
+        return text
+    return _default_image_prompt(image_count) or text
+
+
+def _build_multimodal_content(question: str, image_paths: list[str] | None = None) -> str | list[dict[str, Any]]:
+    paths = [str(path).strip() for path in (image_paths or []) if str(path).strip()]
+    text = _effective_prompt_text(question, len(paths))
+    if not paths:
+        return text
+
+    content: list[dict[str, Any]] = [{"type": "text", "text": text}]
+    for path_str in paths:
+        path = Path(path_str).expanduser()
+        raw = path.read_bytes()
+        mime_type = str(mimetypes.guess_type(path.name)[0] or "image/png").strip() or "image/png"
+        data_url = f"data:{mime_type};base64,{base64.b64encode(raw).decode()}"
+        content.append({"type": "image_url", "image_url": {"url": data_url}})
+    return content
+
+
 # ── LLM 调用 ─────────────────────────────────────────────────
 def _to_dict(obj: Any) -> Any:
     for attr in ("model_dump", "dict", "to_dict"):
@@ -374,11 +605,12 @@ def _to_dict(obj: Any) -> Any:
 
 
 def llm_call(messages, *, config, stats=None, trace_label="Model", log_id=None):
-    model = str(config.get("model") or DEFAULT_MODEL).strip()
+    cfg = build_model_config(config)
+    model = str(cfg.get("model") or DEFAULT_MODEL).strip()
     kw: dict[str, Any] = {"model": model, "messages": messages, "temperature": 0.2, "drop_params": True}
-    if config.get("api_base"): kw["api_base"] = config["api_base"]
-    if config.get("api_key"): kw["api_key"] = config["api_key"]
-    re_ = str(config.get("reasoning_effort") or "").strip().lower()
+    if cfg.get("api_base"): kw["api_base"] = cfg["api_base"]
+    if cfg.get("api_key"): kw["api_key"] = cfg["api_key"]
+    re_ = str(cfg.get("reasoning_effort") or "").strip().lower()
     if re_ in ("minimal", "low", "medium", "high"):
         kw["reasoning_effort"] = re_
 
@@ -389,7 +621,7 @@ def llm_call(messages, *, config, stats=None, trace_label="Model", log_id=None):
         duration_ms = (time.perf_counter() - t0) * 1000
         log_model_call(
             label=trace_label, model=model, messages=messages,
-            output="", error=str(e)[:300], duration_ms=duration_ms, config=config,
+            output="", error=str(e)[:300], duration_ms=duration_ms, config=cfg,
             log_id=log_id,
         )
         raise
@@ -417,7 +649,7 @@ def llm_call(messages, *, config, stats=None, trace_label="Model", log_id=None):
     log_model_call(
         label=trace_label, model=model, messages=messages,
         output=output_text,
-        usage=usage, cost=cost, duration_ms=duration_ms, config=config,
+        usage=usage, cost=cost, duration_ms=duration_ms, config=cfg,
         log_id=log_id,
     )
 
@@ -439,37 +671,34 @@ def run(
     config: dict[str, Any] | None = None,
     stats: Stats | None = None,
     on_tool: Any | None = None,
+    images: list[str] | None = None,
     context: str | None = None,
 ) -> str:
     """单次问答: 多轮 XML 标签工具调用循环, 返回最终文本.
 
     context — 上一轮 AI 总结, 用于多轮对话上下文传递.
     """
-    if not question.strip():
+    image_paths = [str(path).strip() for path in (images or []) if str(path).strip()]
+    if not question.strip() and not image_paths:
         return ""
-    cfg = config or load_config()
+    cfg = build_model_config(config or load_config())
     st = stats or Stats()
     max_rounds = max(1, int(cfg.get("max_rounds") or 6))
-    lid = _make_log_id(question)
+    prompt_text = _effective_prompt_text(question, len(image_paths)) or "images"
+    lid = _make_log_id(prompt_text)
+    started_at = time.perf_counter()
 
-    msgs: list[dict] = [{"role": "system", "content": _build_system_prompt(cfg, question)}]
+    msgs: list[dict] = [{"role": "system", "content": _build_system_prompt(cfg, prompt_text)}]
     if context:
         msgs.append({"role": "assistant", "content": context})
-    msgs.append({"role": "user", "content": question})
+    msgs.append({"role": "user", "content": _build_multimodal_content(question, image_paths)})
     last = ""
 
     for round_i in range(max_rounds):
         try:
             resp = llm_call(msgs, config=cfg, stats=st, trace_label=f"round {round_i + 1}", log_id=lid)
         except Exception as e:
-            err = str(e or "").strip()
-            for frag in ("APIError:", "Exception -"):
-                if frag in err:
-                    err = err[err.index(frag) + len(frag):].strip()
-                    break
-            if len(err) > 200:
-                err = err[:200]
-            return f"[模型调用失败] {err}"
+            return _format_model_error_message(e)
 
         choices = getattr(resp, "choices", None) or []
         msg = choices[0].message if choices else None
@@ -488,17 +717,26 @@ def run(
         msgs.append({"role": "assistant", "content": text})
 
         # 执行工具，构建结果 (并发)
-        for c in calls:
-            if callable(on_tool):
-                try: on_tool(c["name"], c["args"])
-                except Exception: pass
         with ThreadPoolExecutor(max_workers=len(calls)) as pool:
             futures = {pool.submit(execute_tool, c["name"], c["args"]): c for c in calls}
             results_map: dict[int, str] = {}
             for fut in as_completed(futures):
                 c = futures[fut]
                 idx = calls.index(c)
-                results_map[idx] = fut.result()
+                result_text = fut.result()
+                results_map[idx] = result_text
+                if callable(on_tool):
+                    try:
+                        on_tool(
+                            c["name"],
+                            _tool_callback_args(
+                                c["args"],
+                                result_text,
+                                elapsed_s=time.perf_counter() - started_at,
+                            ),
+                        )
+                    except Exception:
+                        pass
         parts = [
             f'<result name="{calls[i]["name"]}" query="{calls[i]["args"]["query"]}">\n{results_map[i]}\n</result>'
             for i in range(len(calls))
@@ -519,6 +757,7 @@ def run_stream(
     on_tool: Any | None = None,
     on_status: Any | None = None,
     on_rewind: Any | None = None,
+    images: list[str] | None = None,
     context: str | None = None,
 ) -> str:
     """流式对话循环, 通过回调驱动 CLI 显示.
@@ -531,19 +770,22 @@ def run_stream(
 
     Returns 最终清理后的回答文本.
     """
-    if not question.strip():
+    image_paths = [str(path).strip() for path in (images or []) if str(path).strip()]
+    if not question.strip() and not image_paths:
         return ""
-    cfg = config or load_config()
+    cfg = build_model_config(config or load_config())
     st = stats or Stats()
     max_rounds = max(1, int(cfg.get("max_rounds") or 6))
-    lid = _make_log_id(question)
+    prompt_text = _effective_prompt_text(question, len(image_paths)) or "images"
+    lid = _make_log_id(prompt_text)
+    started_at = time.perf_counter()
 
     msgs: list[dict] = [
-        {"role": "system", "content": _build_system_prompt(cfg, question)},
+        {"role": "system", "content": _build_system_prompt(cfg, prompt_text)},
     ]
     if context:
         msgs.append({"role": "assistant", "content": context})
-    msgs.append({"role": "user", "content": question})
+    msgs.append({"role": "user", "content": _build_multimodal_content(question, image_paths)})
 
     for round_i in range(max_rounds):
         if callable(on_status):
@@ -573,14 +815,7 @@ def run_stream(
                 output="", error=str(e)[:300], duration_ms=duration_ms, config=cfg,
                 log_id=lid,
             )
-            err = str(e or "").strip()
-            for frag in ("APIError:", "Exception -"):
-                if frag in err:
-                    err = err[err.index(frag) + len(frag):].strip()
-                    break
-            if len(err) > 200:
-                err = err[:200]
-            return f"[模型调用失败] {err}"
+            return _format_model_error_message(e)
 
         # ── 实时流式: 边收 chunk 边推给 CLI ──
         content_parts: list[str] = []
@@ -646,12 +881,6 @@ def run_stream(
 
         msgs.append({"role": "assistant", "content": full_text})
 
-        for tc in calls:
-            if callable(on_tool):
-                try:
-                    on_tool(tc["name"], tc["args"])
-                except Exception:
-                    pass
         if callable(on_status):
             on_status("搜索中...")
         with ThreadPoolExecutor(max_workers=len(calls)) as pool:
@@ -660,7 +889,20 @@ def run_stream(
             for fut in as_completed(futures):
                 tc = futures[fut]
                 idx = calls.index(tc)
-                results_map[idx] = fut.result()
+                result_text = fut.result()
+                results_map[idx] = result_text
+                if callable(on_tool):
+                    try:
+                        on_tool(
+                            tc["name"],
+                            _tool_callback_args(
+                                tc["args"],
+                                result_text,
+                                elapsed_s=time.perf_counter() - started_at,
+                            ),
+                        )
+                    except Exception:
+                        pass
         parts = [
             f'<result name="{calls[i]["name"]}" query="{calls[i]["args"]["query"]}">\n{results_map[i]}\n</result>'
             for i in range(len(calls))
