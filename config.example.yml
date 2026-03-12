@@ -1,0 +1,23 @@
+# Copy this file to ~/.hyw/config.yml and fill in your real keys.
+
+# Shared defaults for providers/models that use the same endpoint.
+api_key: sk-or-xxx
+api_base: https://openrouter.ai/api/v1
+
+# Default model for startup and single-shot mode.
+active_model: openrouter/google/gemini-3.1-flash-lite-preview
+
+models:
+  - model: openrouter/google/gemini-3.1-flash-lite-preview
+  - model: openrouter/google/gemini-3-flash-preview
+  - model: cerebras/gpt-oss-120b
+    api_key: csk-xxx
+    api_base: https://api.cerebras.ai/v1
+  - model: cerebras/llama3.1-8b
+    api_key: csk-xxx
+    api_base: https://api.cerebras.ai/v1
+
+language: zh-CN
+headless: false
+max_rounds: 6
+system_prompt: ""

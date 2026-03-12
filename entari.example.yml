@@ -1,0 +1,22 @@
+# $schema: entari.schema.json
+basic:
+  ignore_self_message: true
+  log:
+    level: info
+  prefix:
+    - /
+  external_dirs:
+    - .
+  schema: true
+
+plugins:
+  .record_message: {}
+  .commands:
+    use_config_prefix: false
+  entari_plugin_hyw:
+    question_command: ".q"
+  ::inspect: {}
+  entari_plugin_server:
+    direct_adapter: true
+    adapters:
+      - $path: "@console"

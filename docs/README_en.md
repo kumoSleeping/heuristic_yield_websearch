@@ -58,6 +58,7 @@ The `hyw` command is available after installing the `cli` extra.
 ## Configuration
 
 Config file: `~/.hyw/config.yml`. Use `/config` in interactive mode to edit directly.
+An example based on the multi-model layout lives at `config.example.yml`.
 In interactive mode, `← / →` switches models, and `↑ / ↓` toggles multi-turn vs new session.
 Legacy single-model fields (`model` / `api_key` / `api_base`) still work.
 
