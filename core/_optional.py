@@ -5,8 +5,8 @@ from importlib.util import find_spec
 
 def cli_install_hint() -> str:
     return (
-        "Install CLI support with `pip install 'hyw[cli]'` "
-        "or, from a source checkout, run `uv run --extra cli hyw`."
+        "Install the default package with `pip install hyw` "
+        "or, from a source checkout, run `uv run hyw`."
     )
 
 

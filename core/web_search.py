@@ -1,31 +1,25 @@
 from __future__ import annotations
 
-import asyncio
 import inspect
 import threading
 from typing import Any, Callable, Dict, List, Optional
 
 from loguru import logger
 
-from .render import RenderCallable, RenderResult, render_markdown_base64, render_markdown_result
+from .config import resolve_tool_handlers
+from .render import RenderCallable, RenderResult, render_markdown_result
+from .render_non_browser import ensure_non_browser_render_ready
+from .search_ddgs import ddgs_search
+from .search_jina_ai import jina_ai_page_extract, jina_ai_search
 
 _VALID_SEARCH_MODES = {"text"}
-_VALID_TIME_RANGE_CODES = {"a", "d", "w", "m", "y"}
 _suite_lock = threading.RLock()
 _suite: "WebToolSuite | None" = None
+_suite_signature: tuple[Any, ...] | None = None
 
 
 def _normalize_query(query: str) -> str:
     return str(query or "").replace('"', " ").replace("“", " ").replace("”", " ").strip()
-
-
-def _normalize_time_range(time_range: str) -> Optional[str]:
-    raw = str(time_range or "").strip().lower()
-    if not raw or raw == "a":
-        return None
-    if raw in _VALID_TIME_RANGE_CODES:
-        return raw
-    return None
 
 
 def _normalize_mode(mode: str) -> str:
@@ -35,61 +29,114 @@ def _normalize_mode(mode: str) -> str:
     return raw
 
 
-def _normalize_region(kl: Optional[str]) -> str:
-    raw = str(kl or "").strip().lower()
-    return raw or "wt-wt"
+def _normalize_reader_source_url(url: str) -> str:
+    text = str(url or "").strip()
+    if not text:
+        raise ValueError("url is empty")
+    if not text.startswith(("http://", "https://")):
+        text = "https://" + text
+    return text
 
 
-def _load_ddgs_class() -> Any:
-    try:
-        from ddgs import DDGS
-
-        return DDGS
-    except Exception as ddgs_exc:
-        try:
-            from duckduckgo_search import DDGS
-
-            return DDGS
-        except Exception:
-            raise RuntimeError(
-                "ddgs is not installed; install `ddgs` (preferred) or keep "
-                "`duckduckgo-search` during the transition."
-            ) from ddgs_exc
-
-
-def _normalize_text_row(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+def _normalize_search_row(row: Dict[str, Any], provider: str) -> Optional[Dict[str, Any]]:
     url = str(
         row.get("href")
         or row.get("url")
         or row.get("link")
         or row.get("source")
+        or row.get("document_url")
         or ""
     ).strip()
+    if url.startswith("//"):
+        url = "https:" + url
     if not url.startswith(("http://", "https://")):
         return None
 
-    title = str(row.get("title") or row.get("name") or "").strip() or "No Title"
+    title = str(
+        row.get("title")
+        or row.get("name")
+        or row.get("headline")
+        or row.get("text")
+        or ""
+    ).strip() or "No Title"
     snippet = str(
         row.get("body")
         or row.get("snippet")
         or row.get("description")
         or row.get("content")
+        or row.get("text")
         or ""
-    ).strip()[:500]
+    ).strip()
+    if snippet.startswith(title):
+        snippet = snippet[len(title):].strip(" -:\n")
 
     return {
         "title": title,
         "url": url,
-        "snippet": snippet,
+        "snippet": snippet[:500],
+        "provider": provider,
     }
 
 
+def _extract_handler_meta(payload: Any) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        return {}
+    meta = payload.get("_meta")
+    return dict(meta) if isinstance(meta, dict) else {}
+
+
+def _extract_search_rows(payload: Any) -> list[dict[str, Any]]:
+    if isinstance(payload, list):
+        return [item for item in payload if isinstance(item, dict)]
+    if not isinstance(payload, dict):
+        return []
+    for key in ("results", "items", "data"):
+        value = payload.get(key)
+        if isinstance(value, list):
+            return [item for item in value if isinstance(item, dict)]
+    return []
+
+
 class WebToolSuite:
-    def __init__(self, headless: bool = False, render_markdown: Optional[RenderCallable] = None):
+    def __init__(
+        self,
+        headless: bool = False,
+        render_markdown: Optional[RenderCallable] = None,
+        config: dict[str, Any] | None = None,
+    ):
         self._headless = bool(headless)
-        self._render_markdown = render_markdown or render_markdown_base64
+        self._render_markdown = render_markdown
+        self._config = dict(config or {})
+        self._search_handlers = resolve_tool_handlers(self._config, "search")
+        self._extract_handlers = resolve_tool_handlers(self._config, "page_extract")
+        self._render_handlers = resolve_tool_handlers(self._config, "render")
         self._search_index_counter = 0
-        logger.info("WebToolSuite(websearch): initialized")
+        logger.info(
+            "WebToolSuite: initialized search={} extract={} render={}",
+            [handler.provider for handler in self._search_handlers],
+            [handler.provider for handler in self._extract_handlers],
+            [handler.provider for handler in self._render_handlers],
+        )
+
+    def warm_up(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {}
+        needs_render_prewarm = any(
+            str(handler.target).startswith("core.render_non_browser:")
+            for handler in self._render_handlers
+        )
+        if not needs_render_prewarm:
+            return payload
+
+        logger.info("WebToolSuite: prewarming render provider...")
+        info = ensure_non_browser_render_ready(prewarm=True)
+        payload["render"] = info
+        logger.info(
+            "WebToolSuite: render prewarm done (platform={}, prewarmed={}, paths={})",
+            info.get("platform"),
+            info.get("prewarmed"),
+            info.get("paths"),
+        )
+        return payload
 
     def _next_search_index(self) -> int:
         self._search_index_counter += 1
@@ -107,51 +154,63 @@ class WebToolSuite:
         except Exception:
             pass
 
+    async def _call_handler(self, handler: Any, **kwargs: Any) -> Any:
+        result = handler.callable(**kwargs)
+        if inspect.isawaitable(result):
+            return await result
+        return result
+
     async def _search_text(
         self,
         query: str,
         kl: Optional[str],
-        time_range: Optional[str],
         max_results: int,
-    ) -> List[Dict[str, Any]]:
-        def _run() -> List[Dict[str, Any]]:
-            DDGS = _load_ddgs_class()
-            kwargs = {
-                "region": _normalize_region(kl),
-                "safesearch": "moderate",
-                "timelimit": time_range,
-                "max_results": max(1, int(max_results)),
-                "page": 1,
-                "backend": "duckduckgo",
-            }
+    ) -> tuple[List[Dict[str, Any]], dict[str, Any]]:
+        errors: list[str] = []
+        for handler in self._search_handlers:
             try:
-                return list(DDGS().text(query, **kwargs) or [])
-            except TypeError:
-                kwargs.pop("backend", None)
-                return list(DDGS().text(query, **kwargs) or [])
+                raw = await self._call_handler(
+                    handler,
+                    query=query,
+                    kl=kl,
+                    max_results=max_results,
+                    headless=self._headless,
+                    config=self._config,
+                )
+            except Exception as exc:
+                errors.append(f"{handler.provider}: {exc}")
+                continue
 
-        raw_rows = await asyncio.to_thread(_run)
-        results: List[Dict[str, Any]] = []
-        seen: set[str] = set()
-        for row in raw_rows:
-            if not isinstance(row, dict):
+            rows = _extract_search_rows(raw)
+            if not rows:
+                errors.append(f"{handler.provider}: invalid result type")
                 continue
-            normalized = _normalize_text_row(row)
-            if not normalized:
-                continue
-            url = str(normalized.get("url") or "").strip()
-            if not url or url in seen:
-                continue
-            seen.add(url)
-            results.append(normalized)
-            if len(results) >= max(1, int(max_results)):
-                break
 
-        logger.info("WebToolSuite(websearch): mapped {} result(s) for '{}'", len(results), query)
-        return results
+            meta = _extract_handler_meta(raw)
+            results: List[Dict[str, Any]] = []
+            seen: set[str] = set()
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                normalized = _normalize_search_row(row, handler.provider)
+                if not normalized:
+                    continue
+                url = normalized["url"]
+                if url in seen:
+                    continue
+                seen.add(url)
+                results.append(normalized)
+                if len(results) >= max(1, int(max_results)):
+                    break
+            if results:
+                logger.info("WebToolSuite(search): {} -> {} result(s)", handler.provider, len(results))
+                return results, meta
+            errors.append(f"{handler.provider}: empty result")
+
+        raise RuntimeError("; ".join(errors) if errors else "no search provider is configured")
 
     def set_render_markdown(self, render_markdown: Optional[RenderCallable]) -> None:
-        self._render_markdown = render_markdown or render_markdown_base64
+        self._render_markdown = render_markdown
 
     async def render_markdown(
         self,
@@ -161,12 +220,21 @@ class WebToolSuite:
         **kwargs: Any,
     ) -> Optional[str]:
         if self._render_markdown is None:
-            raise RuntimeError("render_markdown is not configured")
+            payload = await render_markdown_result(
+                markdown_text=markdown_text,
+                title=title,
+                theme_color=theme_color,
+                config=self._config,
+                headless=self._headless,
+            )
+            return str(payload.get("base64") or "").strip()
 
         result = self._render_markdown(
             markdown_text=markdown_text,
             title=title,
             theme_color=theme_color,
+            headless=self._headless,
+            config=self._config,
             **kwargs,
         )
         if inspect.isawaitable(result):
@@ -180,11 +248,13 @@ class WebToolSuite:
         theme_color: str = "#ef4444",
         **_: Any,
     ) -> Dict[str, Any]:
-        if self._render_markdown is render_markdown_base64:
+        if self._render_markdown is None:
             payload = await render_markdown_result(
                 markdown_text=markdown_text,
                 title=title,
                 theme_color=theme_color,
+                config=self._config,
+                headless=self._headless,
             )
         else:
             raw = await self.render_markdown(
@@ -192,18 +262,15 @@ class WebToolSuite:
                 title=title,
                 theme_color=theme_color,
             )
-            if isinstance(raw, dict):
-                payload = raw
-            else:
-                payload = {
-                    "ok": bool(raw),
-                    "renderer": "custom",
-                    "mime_type": "image/jpeg",
-                    "base64": str(raw or "").strip(),
-                }
+            payload = raw if isinstance(raw, dict) else {
+                "ok": bool(raw),
+                "renderer": "custom",
+                "mime_type": "image/png",
+                "base64": str(raw or "").strip(),
+            }
 
         base64_data = str(payload.get("base64") or "").strip()
-        mime_type = str(payload.get("mime_type") or "image/jpeg").strip() or "image/jpeg"
+        mime_type = str(payload.get("mime_type") or "image/png").strip() or "image/png"
         if not base64_data:
             return {
                 "ok": False,
@@ -214,11 +281,89 @@ class WebToolSuite:
         return {
             "ok": True,
             "message": "render success",
-            "renderer": str(payload.get("renderer") or "non-browser").strip() or "non-browser",
+            "renderer": str(payload.get("renderer") or "unknown"),
             "image": {
                 "mime_type": mime_type,
                 "base64": base64_data,
             },
+        }
+
+    async def page_extract(
+        self,
+        url: str,
+        max_chars: int = 8000,
+        progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+    ) -> Dict[str, Any]:
+        source_url = _normalize_reader_source_url(url)
+        self._notify_progress(
+            progress_callback,
+            {
+                "phase": "page_extract",
+                "status": "start",
+                "url": source_url,
+            },
+        )
+
+        errors: list[str] = []
+        for handler in self._extract_handlers:
+            try:
+                payload = await self._call_handler(
+                    handler,
+                    url=source_url,
+                    max_chars=max_chars,
+                    headless=self._headless,
+                    config=self._config,
+                )
+            except Exception as exc:
+                errors.append(f"{handler.provider}: {exc}")
+                continue
+
+            if not isinstance(payload, dict):
+                errors.append(f"{handler.provider}: invalid result type")
+                continue
+            content = str(payload.get("content") or "").strip()
+            if not content:
+                errors.append(f"{handler.provider}: empty content")
+                continue
+
+            result = {
+                "ok": True,
+                "provider": handler.provider,
+                "title": str(payload.get("title") or "").strip(),
+                "url": str(payload.get("url") or source_url).strip() or source_url,
+                "content": content[: max(1, int(max_chars))],
+                "html": str(payload.get("html") or ""),
+                "_meta": _extract_handler_meta(payload),
+            }
+            self._notify_progress(
+                progress_callback,
+                {
+                    "phase": "page_extract",
+                    "status": "done",
+                    "url": result["url"],
+                    "provider": handler.provider,
+                },
+            )
+            return result
+
+        error_text = "; ".join(errors) if errors else "no page extract provider is configured"
+        self._notify_progress(
+            progress_callback,
+            {
+                "phase": "page_extract",
+                "status": "failed",
+                "url": source_url,
+                "error": error_text,
+            },
+        )
+        return {
+            "ok": False,
+            "provider": "",
+            "title": "",
+            "url": source_url,
+            "content": "",
+            "html": "",
+            "error": error_text,
         }
 
     async def web_search(
@@ -226,7 +371,6 @@ class WebToolSuite:
         query: str,
         mode: str = "text",
         kl: str = "",
-        time_range: str = "a",
         max_results: int = 5,
         progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
     ) -> Dict[str, Any]:
@@ -236,7 +380,6 @@ class WebToolSuite:
 
         normalized_mode = _normalize_mode(mode)
         region = str(kl or "").strip() or None
-        normalized_time = _normalize_time_range(time_range)
         limit = max(1, min(int(max_results), 10))
 
         self._notify_progress(
@@ -249,7 +392,7 @@ class WebToolSuite:
             },
         )
 
-        rows = await self._search_text(normalized_query, region, normalized_time, limit)
+        rows, meta = await self._search_text(normalized_query, region, limit)
         results = [
             {
                 "index": self._next_search_index(),
@@ -257,6 +400,7 @@ class WebToolSuite:
                 "url": str(row.get("url") or "").strip(),
                 "intro": str(row.get("snippet") or "").strip(),
                 "snippet": str(row.get("snippet") or "").strip(),
+                "provider": str(row.get("provider") or "").strip(),
                 "images": [],
                 "images_local": [],
                 "image_details": [],
@@ -282,29 +426,42 @@ class WebToolSuite:
             "mode": normalized_mode,
             "filters": {
                 "kl": region,
-                "time_range": normalized_time,
             },
             "count": len(results),
             "results": results,
+            "_meta": meta,
         }
 
 
-def _get_suite(headless: bool = False) -> WebToolSuite:
-    global _suite
+def _suite_signature_for(headless: bool, config: dict[str, Any] | None) -> tuple[Any, ...]:
+    cfg = dict(config or {})
+    groups: list[tuple[str, tuple[tuple[str, str], ...]]] = []
+    for capability in ("search", "page_extract", "render"):
+        handlers = resolve_tool_handlers(cfg, capability)
+        groups.append((capability, tuple((handler.provider, handler.target) for handler in handlers)))
+    return (bool(headless), tuple(groups))
+
+
+def _get_suite(headless: bool = False, config: dict[str, Any] | None = None) -> WebToolSuite:
+    global _suite, _suite_signature
+    signature = _suite_signature_for(headless, config)
     with _suite_lock:
-        if _suite is None:
-            _suite = WebToolSuite(headless=headless)
+        if _suite is None or _suite_signature != signature:
+            _suite = WebToolSuite(headless=headless, config=config)
+            _suite_signature = signature
         return _suite
 
 
-def on_startup(headless: bool = False) -> None:
-    _get_suite(headless=headless)
+def on_startup(headless: bool = False, config: dict[str, Any] | None = None) -> dict[str, Any]:
+    suite = _get_suite(headless=headless, config=config)
+    return suite.warm_up()
 
 
 def on_shutdown() -> None:
-    global _suite
+    global _suite, _suite_signature
     with _suite_lock:
         _suite = None
+        _suite_signature = None
 
 
 async def wait_until_ready(timeout: float | None = None) -> bool:
@@ -316,17 +473,32 @@ async def web_search(
     query: str,
     mode: str = "text",
     kl: str = "",
-    time_range: str = "a",
     max_results: int = 5,
     progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+    config: dict[str, Any] | None = None,
+    headless: bool = False,
 ) -> Dict[str, Any]:
-    suite = _get_suite()
+    suite = _get_suite(headless=headless, config=config)
     return await suite.web_search(
         query=query,
         mode=mode,
         kl=kl,
-        time_range=time_range,
         max_results=max_results,
+        progress_callback=progress_callback,
+    )
+
+
+async def page_extract(
+    url: str,
+    max_chars: int = 8000,
+    progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+    config: dict[str, Any] | None = None,
+    headless: bool = False,
+) -> Dict[str, Any]:
+    suite = _get_suite(headless=headless, config=config)
+    return await suite.page_extract(
+        url=url,
+        max_chars=max_chars,
         progress_callback=progress_callback,
     )
 
@@ -335,10 +507,12 @@ __all__ = [
     "RenderCallable",
     "RenderResult",
     "WebToolSuite",
+    "ddgs_search",
+    "jina_ai_page_extract",
+    "jina_ai_search",
     "on_shutdown",
     "on_startup",
-    "render_markdown_base64",
-    "render_markdown_result",
+    "page_extract",
     "wait_until_ready",
     "web_search",
 ]

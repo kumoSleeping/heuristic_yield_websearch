@@ -4,7 +4,7 @@ entari_plugin_hyw/__init__.py - entari 插件 (保留原项目绝大部分功能
 功能:
 - .q 命令触发问答
 - 引用消息 + 图片处理
-- 配置覆盖 (entari 插件配置 → config.yml)
+- 读取 ~/.hyw/config.yml
 - 搜索进度/里程碑推送
 - Markdown 图片提取
 - 完整的事件捕获与展示
@@ -12,12 +12,12 @@ entari_plugin_hyw/__init__.py - entari 插件 (保留原项目绝大部分功能
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import re
 import threading
 from dataclasses import dataclass
 from datetime import datetime
-from pathlib import Path
 from typing import Any, Dict, List
 
 import yaml
@@ -41,7 +41,9 @@ from arclet.entari import (
 from arclet.entari.event.command import CommandReceive
 from arclet.entari.event.lifespan import Cleanup, Startup
 
-from core.main import Stats, load_config, run, startup_tools, shutdown_tools, cfg_get, CONFIG_PATH
+from core.config import load_config
+from core.main import Stats, run_stream, shutdown_tools, startup_tools
+from core.render import render_markdown_result
 
 try:
     from importlib.metadata import version as get_version
@@ -60,7 +62,6 @@ except Exception:
 
 _IMG_TAG_RE = re.compile(r"<img[^>]+>", flags=re.IGNORECASE)
 _MD_IMAGE_RE = re.compile(r"!\[[^\]]*]\(([^)]+)\)", flags=re.IGNORECASE)
-_SEARCH_TIME_RANGE = {"a": "全时段", "d": "近1日", "w": "近1周", "m": "近1月", "y": "近1年"}
 
 
 # ── 工具函数 ──────────────────────────────────────────────────
@@ -93,11 +94,6 @@ def _format_web_search_query(arguments: Any) -> str:
         query = " || ".join(str(item or "").strip() for item in query_list if str(item or "").strip())
     else:
         query = str(data.get("query") or data.get("user_message") or data.get("description") or "").strip()
-    if not query:
-        return ""
-    time_key = str(data.get("time_range") or "").strip().lower()
-    if time_key and time_key != "a":
-        return f"{query} | [{_SEARCH_TIME_RANGE.get(time_key, time_key)}]"
     return query
 
 
@@ -117,37 +113,8 @@ class PluginConfig(BasicConfModel):
     question_command: str = ".q"
     quote: bool = False
 
-    # 配置穿透字段
-    api_key: str | None = None
-    api_base: str | None = None
-    model: str | None = None
-    active_model: str | None = None
-    models: Any | None = None
-    system_prompt: str | None = None
-    language: str | None = None
-    language_style: str | None = None
-    abilitys_headless: bool | None = None
-    max_rounds: int | None = None
-
-    # 旧字段兼容
-    headless: bool = False
-    theme_color: str = "#ef4444"
-    activate_global_config: bool = True
-    base_url: str | None = None
-    model_name: str | None = None
-    temperature: float | None = None
-
 
 conf = plugin_config(PluginConfig)
-
-
-def _normalize_conf_value(value: Any) -> Any | None:
-    if value is None:
-        return None
-    if isinstance(value, str):
-        trimmed = value.strip()
-        return trimmed if trimmed else None
-    return value
 
 
 def _sanitize_filename(value: str) -> str:
@@ -169,77 +136,139 @@ def _extract_markdown_images(answer: str) -> tuple[list[str], str]:
     return image_sources, cleaned
 
 
-def _build_core_overrides() -> Dict[str, Any]:
-    overrides: Dict[str, Any] = {}
-
-    def _pick(primary_field: str, legacy_field: str | None = None) -> Any | None:
-        primary_value = _normalize_conf_value(getattr(conf, primary_field, None))
-        if primary_value is not None:
-            return primary_value
-        if legacy_field:
-            return _normalize_conf_value(getattr(conf, legacy_field, None))
-        return None
-
-    key_map = {
-        "api_key": _pick("api_key"),
-        "api_base": _pick("api_base", "base_url"),
-        "model": _pick("model", "model_name"),
-        "active_model": _pick("active_model"),
-        "models": _normalize_conf_value(getattr(conf, "models", None)),
-        "system_prompt": _pick("system_prompt"),
-        "language": _pick("language"),
-        "language_style": _pick("language_style"),
-        "headless": _pick("abilitys_headless", "headless"),
-        "max_rounds": _pick("max_rounds"),
-    }
-
-    for key, value in key_map.items():
-        if value is not None:
-            overrides[key] = value
-
-    return overrides
-
-
-def _warn_ignored_legacy_fields() -> None:
-    ignored = {
-        "temperature": _normalize_conf_value(conf.temperature),
-    }
-    used = sorted([k for k, v in ignored.items() if v is not None])
-    if used:
-        logger.warning("以下 entari 旧配置字段已忽略: {}", ", ".join(used))
-    if conf.headless:
-        logger.warning("配置项 abilitys_headless/headless 已映射为 headless。")
-    if str(conf.theme_color or "").strip() not in {"", "#ef4444"}:
-        logger.warning("配置项 theme_color 已忽略。")
-
-
-def _apply_overrides_to_core_config() -> None:
-    overrides = _build_core_overrides()
-    if conf.headless:
-        if "headless" not in overrides:
-            overrides["headless"] = True
-
-    if not overrides:
-        return
-
-    if not conf.activate_global_config:
-        logger.warning("activate_global_config=false, 忽略覆盖字段。")
-        return
-
-    try:
-        raw = yaml.safe_load(CONFIG_PATH.read_text(encoding="utf-8")) if CONFIG_PATH.exists() else {}
-    except Exception:
-        raw = {}
-
-    merged = raw if isinstance(raw, dict) else {}
-    merged.update(overrides)
-
-    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-    CONFIG_PATH.write_text(
-        yaml.safe_dump(merged, allow_unicode=True, sort_keys=False),
-        encoding="utf-8",
+def _clean_answer(text: str) -> str:
+    cleaned = re.sub(
+        r"<summary>\s*(.*?)\s*</summary>",
+        lambda m: "\n".join(
+            f"> {line}"
+            for line in [row.strip() for row in m.group(1).splitlines()]
+            if line
+        ),
+        str(text or ""),
+        flags=re.IGNORECASE | re.DOTALL,
     )
-    logger.info("Activated entari overrides into {}: {}", CONFIG_PATH, ", ".join(sorted(overrides.keys())))
+
+    def _image_to_link(match: re.Match[str]) -> str:
+        alt = str(match.group(1) or "").strip()
+        raw_target = str(match.group(2) or "").strip()
+        if not raw_target:
+            return match.group(0)
+        label = alt or "图片"
+        if raw_target.lower().startswith("data:image"):
+            return f"{label}: [inline image omitted]"
+        return f"{label}: [{raw_target}]({raw_target})"
+
+    cleaned = _MD_IMAGE_RE.sub(_image_to_link, cleaned)
+    cleaned = re.sub(r"</?(?:search|wiki|page|tool_results|result)\b[^>]*>", "", cleaned)
+    return cleaned.strip()
+
+
+def _format_tool_argument(name: str, arguments: Any) -> str:
+    payload = _as_dict(arguments)
+    if name in ("web_search", "web_search_wiki"):
+        return _format_web_search_query(payload)
+    if name == "page_extract":
+        return str(payload.get("url") or "").strip()
+    return json.dumps(payload, ensure_ascii=False) if payload else ""
+
+
+def _format_tool_trace_line(name: str, arguments: Any) -> str:
+    payload = _as_dict(arguments)
+    argument = _format_tool_argument(name, payload)
+    line = f"> {name}"
+    if argument:
+        line += f"({argument})"
+
+    extras: list[str] = []
+    count = payload.get("_count")
+    ok = payload.get("_ok")
+    jina_tokens = payload.get("_jina_tokens")
+    elapsed_s = payload.get("_elapsed_s")
+    if ok is False:
+        extras.append("!")
+    elif count not in (None, ""):
+        extras.append(f"{count} ✓")
+    elif ok is True:
+        extras.append("✓")
+    if jina_tokens not in (None, ""):
+        extras.append(f"jina {jina_tokens}tok")
+    if elapsed_s not in (None, ""):
+        try:
+            extras.append(f"{float(elapsed_s):.1f}s")
+        except Exception:
+            pass
+
+    if extras:
+        line += " " + " ".join(extras)
+    return line.strip()
+
+
+def _render_result_to_src(payload: dict[str, Any]) -> str:
+    base64_data = str(payload.get("base64") or "").strip()
+    if not base64_data:
+        return ""
+    mime_type = str(payload.get("mime_type") or "image/png").strip() or "image/png"
+    return f"data:{mime_type};base64,{base64_data}"
+
+
+def _build_notice_chain(text: str, quote_id: str | None = None) -> MessageChain:
+    chain = MessageChain(Text(text))
+    if quote_id:
+        chain = MessageChain(Quote(quote_id)) + chain
+    return chain
+
+
+def _tool_text_line(name: str, args: dict[str, Any]) -> str:
+    display_name = str(args.get("_display_name") or name).strip() or str(name or "").strip()
+    argument = _format_tool_argument(name, args)
+    line = f"> {display_name}"
+    if argument:
+        line += f"({argument})"
+    return line
+
+
+def _planned_tool_block(tools: list[tuple[str, dict[str, Any]]] | None) -> str:
+    if not tools:
+        return ""
+    rows: list[str] = []
+    for name, args in tools:
+        line = _tool_text_line(name, args)
+        if line:
+            rows.append(line)
+    return "\n".join(rows).strip()
+
+
+async def _build_answer_chain(
+    answer_text: str,
+    *,
+    config: dict[str, Any],
+    quote_id: str | None = None,
+) -> tuple[MessageChain, MessageChain, bool]:
+    image_sources, cleaned_text = _extract_markdown_images(answer_text)
+    render_text = _clean_answer(cleaned_text if image_sources else answer_text)
+
+    fallback_chain = _build_notice_chain("渲染出错", quote_id)
+
+    primary_chain = fallback_chain
+    rendered_ok = False
+    if render_text:
+        try:
+            payload = await render_markdown_result(
+                render_text,
+                title="HYW",
+                config=config,
+                headless=bool(config.get("headless") not in (False, "false", "0", 0)),
+            )
+            rendered_src = _render_result_to_src(payload if isinstance(payload, dict) else {})
+            if rendered_src:
+                primary_chain = MessageChain(Image(src=rendered_src))
+                rendered_ok = True
+        except Exception as exc:
+            logger.warning("Markdown render failed in entari plugin: {}", exc)
+    if quote_id and rendered_ok:
+        primary_chain = MessageChain(Quote(quote_id)) + primary_chain
+
+    return primary_chain, fallback_chain, rendered_ok
 
 
 # ── 图片处理 (复用原有逻辑) ──────────────────────────────────
@@ -310,74 +339,71 @@ async def handle_question(session: Session[MessageCreatedEvent], result: Arparma
 
     images, _ = await process_images(mc, None)
     question = user_input or "请根据图片内容进行分析并回答。"
+    quote_id = session.event.message.id if conf.quote else None
+    loop = asyncio.get_running_loop()
+    sent_round_messages: set[str] = set()
+    sent_round_lock = threading.Lock()
 
-    # 搜索/进度跟踪
-    sent_progress: set[str] = set()
-    progress_lines: list[str] = []
-    progress_lock = threading.Lock()
-    search_queries: list[str] = []
-    search_seen: set[str] = set()
-    search_lock = threading.Lock()
+    def _build_round_chain(text: str) -> MessageChain:
+        chain = MessageChain(Text(text))
+        if quote_id:
+            chain = MessageChain(Quote(quote_id)) + chain
+        return chain
 
-    def _push_progress(text: str) -> None:
-        msg = str(text or "").strip()
-        if not msg:
+    def _on_rewind(thinking: str, tools: list[tuple[str, dict[str, Any]]] | None = None) -> None:
+        clean = _clean_answer(thinking)
+        planned_block = _planned_tool_block(tools)
+        if planned_block:
+            clean = f"{clean}\n{planned_block}".strip() if clean else planned_block
+        if not clean:
             return
-        with progress_lock:
-            if msg in sent_progress:
+        with sent_round_lock:
+            if clean in sent_round_messages:
                 return
-            sent_progress.add(msg)
-            progress_lines.append(msg)
-
-    def _on_tool(name: str, args: dict):
-        if name == "web_search":
-            line = _format_web_search_query(args)
-            if line:
-                with search_lock:
-                    if line not in search_seen:
-                        search_seen.add(line)
-                        search_queries.append(line)
+            sent_round_messages.add(clean)
+        try:
+            future = asyncio.run_coroutine_threadsafe(
+                session.send(_build_round_chain(clean)),
+                loop,
+            )
+            future.result()
+        except Exception as exc:
+            logger.warning("Round message send failed in entari plugin: {}", exc)
 
     config = load_config()
     stats = Stats()
 
     try:
         final_content = await asyncio.to_thread(
-            run, question, config=config, stats=stats, on_tool=_on_tool,
+            run_stream,
+            question,
+            config=config,
+            stats=stats,
+            on_rewind=_on_rewind,
+            images=images,
         )
-        with search_lock:
-            search_hint = _format_search_progress_lines(list(search_queries))
-        if search_hint:
-            _push_progress(search_hint)
-
-        with progress_lock:
-            combined_progress = "\n\n".join(progress_lines).strip()
-        if combined_progress:
-            await session.send(MessageChain(Text(combined_progress)))
 
         answer_text = str(final_content or "").strip()
         if not answer_text:
-            await session.send("未生成有效回答。")
             return
 
-        chain = MessageChain()
-        image_sources, cleaned_text = _extract_markdown_images(answer_text)
-        if image_sources:
-            if cleaned_text:
-                chain.append(Text(cleaned_text))
-            for image_src in image_sources[:6]:
-                chain.append(Image(src=image_src))
-        else:
-            chain.append(Text(answer_text))
-
-        if conf.quote:
-            chain = MessageChain(Quote(session.event.message.id)) + chain
-
-        await session.send(chain)
+        primary_chain, fallback_chain, rendered_ok = await _build_answer_chain(
+            answer_text,
+            config=config,
+            quote_id=quote_id,
+        )
+        try:
+            await session.send(primary_chain)
+        except Exception as exc:
+            if rendered_ok:
+                logger.warning("Rendered message send failed in entari plugin: {}", exc)
+                await session.send(fallback_chain)
+            else:
+                raise
 
     except Exception as exc:
         logger.exception("Error in hyw execution: {}", exc)
-        await session.send(f"执行出错: {exc}")
+        return
 
 
 # ── 生命周期 ──────────────────────────────────────────────────
@@ -385,13 +411,6 @@ async def handle_question(session: Session[MessageCreatedEvent], result: Arparma
 @listen(Startup)
 async def on_startup():
     logger.info("HYW plugin startup: loading configuration...")
-
-    _warn_ignored_legacy_fields()
-
-    try:
-        _apply_overrides_to_core_config()
-    except Exception as exc:
-        logger.warning("Failed to apply entari overrides: {}", exc)
 
     try:
         cfg = load_config()
@@ -404,8 +423,16 @@ async def on_startup():
         headless = cfg.get("headless") not in (False, "false", "0", 0)
         try:
             logger.info("tools startup (headless={})", headless)
-            startup_tools(headless=headless)
+            startup_info = startup_tools(headless=headless, config=cfg) or {}
             logger.info("tools startup done")
+            render_info = startup_info.get("render") if isinstance(startup_info, dict) else None
+            if isinstance(render_info, dict):
+                logger.success(
+                    "render prewarm done. platform={}, prewarmed={}, paths={}",
+                    render_info.get("platform"),
+                    render_info.get("prewarmed"),
+                    render_info.get("paths"),
+                )
         except Exception as exc:
             logger.warning("tools startup skipped: {}", exc)
     except Exception as exc:

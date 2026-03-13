@@ -1,6 +1,6 @@
 [project]
 name = "hyw"
-version = "0.1.0"
+version = "0.0.1"
 description = "Heuristic Yield Websearch - LLM-powered web search assistant"
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -9,63 +9,22 @@ dependencies = [
     "litellm",
     "pyyaml",
     "loguru",
+    "rich",
+    "prompt-toolkit",
+    "ddgs",
+    "httpx",
+    "markdown",
+    "Pygments",
+    "matplotlib",
+    "weasyprint",
+    "PyMuPDF",
+    "Pillow",
 ]
 
 [project.optional-dependencies]
-websearch = [
-    "ddgs",
-    "markdown",
-    "Pygments",
-    "matplotlib",
-    "weasyprint",
-    "PyMuPDF",
-    "Pillow",
-]
-ddgs = [
-    "ddgs",
-    "markdown",
-    "Pygments",
-    "matplotlib",
-    "weasyprint",
-    "PyMuPDF",
-    "Pillow",
-]
-cli = [
-    "rich",
-    "prompt-toolkit",
-    "ddgs",
-    "Pygments",
-    "matplotlib",
-    "weasyprint",
-    "PyMuPDF",
-    "Pillow",
-    "markdown",
-]
 entari = [
     "arclet-alconna",
     "arclet-entari",
-    "ddgs",
-    "Pygments",
-    "matplotlib",
-    "weasyprint",
-    "PyMuPDF",
-    "Pillow",
-    "markdown",
-    "httpx",
-]
-all = [
-    "rich",
-    "prompt-toolkit",
-    "arclet-alconna",
-    "arclet-entari",
-    "ddgs",
-    "Pygments",
-    "matplotlib",
-    "weasyprint",
-    "PyMuPDF",
-    "Pillow",
-    "markdown",
-    "httpx",
 ]
 
 [dependency-groups]

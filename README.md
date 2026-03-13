@@ -27,7 +27,8 @@ HYW lets the model decide **what to search, how many rounds, and how to cross-va
 - **Multi-round autonomous search** — The model breaks down questions, crafts search queries, and validates results across up to 6 iterations
 - **XML tag tool calling** — No function calling dependency; works with any LLM provider
 - **Streaming output** — Think and display in real-time; search progress visible as it happens
-- **Built-in websearch service** — DuckDuckGo-based search, zero config, no API key required
+- **Pluggable tool backends** — Search / page extract / render are selected by capability, not hard-coded per module
+- **Built-in websearch service** — Ships with `ddgs`, Jina AI search/page extraction, and non-browser Markdown render
 - **Rich terminal UI** — Gradient titles, Markdown rendering, live spinners
 - **Multi-turn conversation** — Context auto-carried; toggle mode with arrow keys
 - **Any model via LiteLLM** — OpenAI / Anthropic / Google / OpenRouter / local models
@@ -37,14 +38,11 @@ HYW lets the model decide **what to search, how many rounds, and how to cross-va
 ## Quickstart
 
 ```bash
-# CLI (recommended)
-pip install "hyw[cli]"
+# Default install: CLI + ddgs + Jina AI + non-browser render
+pip install hyw
 
-# CLI + entari plugin support
-pip install "hyw[cli,entari]"
-
-# Built-in websearch service only
-pip install "hyw[websearch]"
+# Add entari plugin support
+pip install "hyw[entari]"
 
 # Interactive mode
 hyw
@@ -53,7 +51,7 @@ hyw
 hyw -q "What's the latest in tech news?"
 ```
 
-The `hyw` command is available after installing the `cli` extra.
+The `hyw` command is available in the default install.
 
 ## Configuration
 
@@ -79,8 +77,26 @@ models:
 
 # Preferences
 language: zh-CN
-max_rounds: 6          # max search iterations
-headless: true         # headless browser mode
+max_rounds: 6
+headless: true
+
+tools:
+  index:
+    ddgs:
+      search: core.search_ddgs:ddgs_search
+    jina_ai:
+      search: core.search_jina_ai:jina_ai_search
+      page_extract: core.search_jina_ai:jina_ai_page_extract
+    render:
+      render: core.render_non_browser:render_markdown_non_browser_result
+  config:
+    jina_ai:
+      page_extract:
+        prefer_free: true
+  use:
+    search: ddgs
+    page_extract: jina_ai
+    render: render
 
 # Custom system prompt (appended)
 system_prompt: ""
@@ -122,15 +138,20 @@ User Question
 | `/config` | Open config file in editor |
 | `/stats` | Show session statistics |
 | `/exit` | Exit |
-| `←` / `→` | Toggle Multi Turn / New Session mode |
+| `←` / `→` | Switch active model |
+| `↑` / `↓` | Toggle Multi Turn / New Session mode |
 
 ## Project Structure
 
 ```
 core/
+├── config.py               # Model config + tool capability registry
 ├── main.py                 # Conversation loop, tool calls, LLM interaction
 ├── cli.py                  # Rich terminal UI, streaming output
 ├── __main__.py             # python -m core entry point
+├── search_ddgs.py          # DDGS search provider
+├── search_jina_ai.py       # Jina AI search + page extract provider
+├── render_non_browser.py   # WeasyPrint-based markdown render provider
 ├── web_search.py           # WebToolSuite + service runtime
 └── render.py               # Standalone markdown render service
 ```
@@ -138,11 +159,8 @@ core/
 ## Requirements
 
 - Python ≥ 3.12
-- Base deps: `litellm` · `pyyaml` · `loguru`
-- `websearch`: `ddgs` · `markdown` · `Pygments` · `matplotlib` · `weasyprint` · `PyMuPDF` · `Pillow`
-- `ddgs`: same as `websearch` (compat alias)
-- `cli`: `rich` · `prompt-toolkit` · `ddgs` · `Pygments` · `matplotlib` · `weasyprint` · `PyMuPDF` · `Pillow` · `markdown`
-- `entari`: `arclet-alconna` · `arclet-entari` · `ddgs` · `Pygments` · `matplotlib` · `weasyprint` · `PyMuPDF` · `Pillow` · `markdown` · `httpx`
+- Default deps: `litellm` · `pyyaml` · `loguru` · `rich` · `prompt-toolkit` · `ddgs` · `httpx` · `markdown` · `Pygments` · `matplotlib` · `weasyprint` · `PyMuPDF` · `Pillow`
+- `entari`: `arclet-alconna` · `arclet-entari`
 
 <!-- TODO: add system-level dependencies (e.g. Chrome/Chromium) if needed -->
 

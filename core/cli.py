@@ -23,24 +23,29 @@ from urllib.parse import unquote, urlparse
 from dataclasses import dataclass
 
 from rich import box
-from rich.console import Console
+from rich.console import Console, Group
 from rich.live import Live
 from rich.markdown import Markdown
 from rich.panel import Panel
+from rich.table import Table
 from rich.text import Text
 from rich.theme import Theme
 
-from .main import (
-    Stats,
-    build_model_config,
-    load_config,
-    get_model_profiles,
-    run,
-    run_stream,
-    startup_tools,
-    shutdown_tools,
+from .config import (
     CONFIG_PATH,
     DEFAULT_NAME,
+    build_model_config,
+    get_model_profiles,
+    load_config,
+)
+from .main import (
+    Stats,
+    get_runtime_prewarm_label,
+    run,
+    run_stream,
+    start_runtime_prewarm,
+    startup_tools,
+    shutdown_tools,
 )
 
 try:
@@ -77,6 +82,7 @@ _PASTE_COMMANDS = {"/paste", "/paste-image", "/clip", "/clipboard"}
 _DUMB = os.environ.get("TERM", "").lower() in {"", "dumb", "unknown"}
 _FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
 _MD_IMAGE_RE = re.compile(r"!\[([^\]]*)\]\(([^)\n]+)\)")
+_MD_TABLE_SEPARATOR_RE = re.compile(r"^\s*\|?(?:\s*:?-{3,}:?\s*\|)+(?:\s*:?-{3,}:?\s*)\|?\s*$")
 _PROMPT_PREFIX = "➜  "
 _IMAGE_TOKEN_RE = re.compile(r"\[Image #\d+\]")
 _IMAGE_EXTENSIONS = {
@@ -158,11 +164,11 @@ def _build_markdown_theme() -> Theme:
             "markdown.text": TEXT_SOFT,
             "markdown.paragraph": TEXT_SOFT,
             "markdown.h1": f"bold {ACCENT}",
-            "markdown.h2": f"bold {ACCENT}",
-            "markdown.h3": f"bold {ACCENT}",
-            "markdown.h4": f"bold {ACCENT}",
-            "markdown.h5": f"bold {ACCENT}",
-            "markdown.h6": f"bold {ACCENT}",
+            "markdown.h2": ACCENT,
+            "markdown.h3": ACCENT,
+            "markdown.h4": ACCENT,
+            "markdown.h5": ACCENT,
+            "markdown.h6": ACCENT,
             "markdown.link": ACCENT,
             "markdown.link_url": TEXT_MUTED,
             "markdown.block_quote": TEXT_MUTED,
@@ -173,13 +179,237 @@ def _build_markdown_theme() -> Theme:
             "markdown.table.header": f"bold {ACCENT}",
             "markdown.table.cell": TEXT_SOFT,
             "markdown.table.border": TEXT_MUTED,
-            "markdown.code": TEXT_SOFT,
+            "markdown.code": INPUT_HINT,
             "markdown.code_block": TEXT_SOFT,
             "markdown.hr": TEXT_MUTED,
             "markdown.em": TEXT_SOFT,
             "markdown.strong": f"bold {TEXT_SOFT}",
         }
     )
+
+
+def _render_markdown(text: str):
+    blocks = _split_markdown_blocks(text)
+    renderables: list[object] = []
+    for block in blocks:
+        kind = block[0]
+        if kind == "markdown":
+            body = str(block[1] or "")
+            if body.strip():
+                renderables.append(
+                    Markdown(
+                        body,
+                        code_theme="ansi_dark",
+                        inline_code_theme="ansi_dark",
+                    )
+                )
+        elif kind == "table":
+            headers = block[1]
+            rows = block[2]
+            if renderables:
+                renderables.append(Text(""))
+            renderables.append(_build_rich_table(headers, rows))
+            renderables.append(Text(""))
+
+    if not renderables:
+        return Text("", style=TEXT_SOFT)
+    if len(renderables) == 1:
+        return renderables[0]
+    return Group(*renderables)
+
+
+def _render_stream_preview(text: str) -> Text:
+    preview = Text(style=TEXT_SOFT)
+    preview.append(_normalize_markdown_tables(text) or "...", style=TEXT_SOFT)
+    return preview
+
+
+def _parse_md_table_row(line: str) -> list[str] | None:
+    stripped = str(line or "").strip()
+    if "|" not in stripped:
+        return None
+    if stripped.startswith("|"):
+        stripped = stripped[1:]
+    if stripped.endswith("|"):
+        stripped = stripped[:-1]
+    cells = [part.strip() for part in re.split(r"(?<!\\)\|", stripped)]
+    if len(cells) < 2:
+        return None
+    return cells
+
+
+def _table_rows_to_lines(headers: list[str], rows: list[list[str]]) -> list[str]:
+    if not headers or not rows:
+        return []
+
+    if len(headers) == 2:
+        lines: list[str] = []
+        for row in rows:
+            key = str(row[0] if row else "").strip()
+            value = str(row[1] if len(row) > 1 else "").strip()
+            if key and value:
+                lines.append(f"- {key}：{value}")
+            elif key:
+                lines.append(f"- {key}")
+            elif value:
+                lines.append(f"- {value}")
+        return lines
+
+    lines = []
+    for row in rows:
+        lead = str(row[0] if row else "").strip() or str(headers[0] or "").strip() or "项目"
+        parts: list[str] = []
+        for idx in range(1, len(headers)):
+            header = str(headers[idx] or "").strip()
+            value = str(row[idx] if idx < len(row) else "").strip()
+            if not value:
+                continue
+            if header:
+                parts.append(f"{header}：{value}")
+            else:
+                parts.append(value)
+        if parts:
+            lines.append(f"- {lead}：{'；'.join(parts)}")
+        else:
+            lines.append(f"- {lead}")
+    return lines
+
+
+def _build_rich_table(headers: list[str], rows: list[list[str]]) -> Table:
+    table = Table(
+        box=box.SIMPLE_HEAVY,
+        border_style=TEXT_MUTED,
+        header_style=f"bold {ACCENT}",
+        style=TEXT_SOFT,
+        show_edge=False,
+        show_lines=False,
+        pad_edge=False,
+        padding=(0, 1),
+        expand=True,
+    )
+
+    column_count = max(len(headers), max((len(row) for row in rows), default=0))
+    for idx in range(column_count):
+        header = str(headers[idx] if idx < len(headers) else "").strip()
+        kwargs: dict[str, object] = {"vertical": "top", "overflow": "fold"}
+        if column_count == 2 and idx == 0:
+            kwargs["no_wrap"] = True
+            kwargs["ratio"] = 1
+            kwargs["style"] = TEXT_SOFT
+        elif column_count == 2 and idx == 1:
+            kwargs["ratio"] = 4
+            kwargs["style"] = TEXT_SOFT
+        else:
+            kwargs["ratio"] = 1
+            kwargs["style"] = TEXT_SOFT
+        table.add_column(header or " ", **kwargs)
+
+    for row in rows:
+        cells = [str(row[idx]).strip() if idx < len(row) else "" for idx in range(column_count)]
+        table.add_row(*cells)
+
+    return table
+
+
+def _split_markdown_blocks(text: str) -> list[tuple]:
+    lines = str(text or "").splitlines()
+    if not lines:
+        return [("markdown", str(text or ""))]
+
+    blocks: list[tuple] = []
+    markdown_buffer: list[str] = []
+    i = 0
+    in_code_block = False
+
+    def _flush_markdown() -> None:
+        nonlocal markdown_buffer
+        if markdown_buffer:
+            blocks.append(("markdown", "\n".join(markdown_buffer)))
+            markdown_buffer = []
+
+    while i < len(lines):
+        line = lines[i]
+        stripped = line.strip()
+        if stripped.startswith("```"):
+            in_code_block = not in_code_block
+            markdown_buffer.append(line)
+            i += 1
+            continue
+
+        if in_code_block:
+            markdown_buffer.append(line)
+            i += 1
+            continue
+
+        header = _parse_md_table_row(line)
+        next_line = lines[i + 1] if i + 1 < len(lines) else ""
+        if header and _MD_TABLE_SEPARATOR_RE.match(next_line.strip()):
+            rows: list[list[str]] = []
+            j = i + 2
+            while j < len(lines):
+                row = _parse_md_table_row(lines[j])
+                if not row:
+                    break
+                rows.append(row)
+                j += 1
+
+            if rows:
+                _flush_markdown()
+                blocks.append(("table", header, rows))
+                i = j
+                continue
+
+        markdown_buffer.append(line)
+        i += 1
+
+    _flush_markdown()
+    return blocks
+
+
+def _normalize_markdown_tables(text: str) -> str:
+    lines = str(text or "").splitlines()
+    if not lines:
+        return str(text or "")
+
+    out: list[str] = []
+    i = 0
+    in_code_block = False
+
+    while i < len(lines):
+        line = lines[i]
+        stripped = line.strip()
+        if stripped.startswith("```"):
+            in_code_block = not in_code_block
+            out.append(line)
+            i += 1
+            continue
+
+        if in_code_block:
+            out.append(line)
+            i += 1
+            continue
+
+        header = _parse_md_table_row(line)
+        next_line = lines[i + 1] if i + 1 < len(lines) else ""
+        if header and _MD_TABLE_SEPARATOR_RE.match(next_line.strip()):
+            rows: list[list[str]] = []
+            j = i + 2
+            while j < len(lines):
+                row = _parse_md_table_row(lines[j])
+                if not row:
+                    break
+                rows.append(row)
+                j += 1
+
+            if rows:
+                out.extend(_table_rows_to_lines(header, rows))
+                i = j
+                continue
+
+        out.append(line)
+        i += 1
+
+    return "\n".join(out)
 
 
 # ── Suppress noisy logs ──────────────────────────────────────
@@ -527,23 +757,47 @@ def _pull_clipboard_prompt_input() -> _PromptInput:
 # ── Tool call formatting ─────────────────────────────────────
 def _fmt_args(name: str, args: dict) -> str:
     if name in ("web_search", "web_search_wiki"):
-        q = str(args.get("query") or "").strip()
-        df = str(args.get("df") or "").strip()
-        if q and df:
-            return f"{q}, [{df}]"
-        return q
+        return str(args.get("query") or "").strip()
+    if name == "page_extract":
+        return str(args.get("url") or "").strip()
     return str(args)[:160]
+
+
+def _display_tool_name(name: str, args: dict) -> str:
+    return str(args.get("_display_name") or name).strip() or str(name or "").strip()
+
+
+def _tool_text_line(name: str, args: dict) -> str:
+    display_name = _display_tool_name(name, args)
+    formatted = _fmt_args(name, args)
+    line = f"> {display_name}"
+    if formatted:
+        line += f"({formatted})"
+    return line
+
+
+def _planned_tool_block(tools: list[tuple[str, dict]] | None) -> str:
+    if not tools:
+        return ""
+    rows: list[str] = []
+    for name, args in tools:
+        line = _tool_text_line(name, args)
+        if line:
+            rows.append(line)
+    return "\n".join(rows).strip()
 
 
 def _tool_line(name: str, args: dict) -> Text:
     formatted = _fmt_args(name, args)
+    display_name = _display_tool_name(name, args)
     count = args.get("_count")
+    jina_tokens = args.get("_jina_tokens")
     ok = args.get("_ok")
     elapsed_s = args.get("_elapsed_s")
 
     line = Text()
     line.append("  > ", style=f"bold {ACCENT}")
-    line.append_text(_gradient_title(name))
+    line.append_text(_gradient_title(display_name))
     if formatted:
         line.append(f"({formatted})", style=TEXT_MUTED)
     if ok is False:
@@ -554,6 +808,9 @@ def _tool_line(name: str, args: dict) -> Text:
         line.append(" ✓", style=TEXT_MUTED)
     elif ok is not None:
         line.append(" ✓", style=TEXT_MUTED)
+    if jina_tokens not in (None, ""):
+        line.append(" ", style=TEXT_MUTED)
+        line.append(f"jina {jina_tokens}tok", style=TEXT_MUTED)
     if elapsed_s not in (None, ""):
         try:
             line.append(f" {float(elapsed_s):.1f}s", style=TEXT_MUTED)
@@ -584,7 +841,7 @@ def _clean_answer(text: str) -> str:
 
     cleaned = _MD_IMAGE_RE.sub(_image_to_link, cleaned)
     # 清理残留的 XML 工具标签
-    cleaned = re.sub(r"</?(?:search|wiki|tool_results|result)\b[^>]*>", "", cleaned)
+    cleaned = re.sub(r"</?(?:search|wiki|page|tool_results|result)\b[^>]*>", "", cleaned)
     return cleaned.strip()
 
 
@@ -612,6 +869,8 @@ def _gradient_label(text: str) -> list[tuple[str, str]]:
 
 def _prompt_status(mode_state: dict | None = None) -> str:
     state = mode_state or {}
+    if str(state.get("config_issue") or "").strip():
+        return "!"
     ready = state.get("tools_ready")
     failed = state.get("tools_failed")
     if ready:
@@ -622,7 +881,15 @@ def _prompt_status(mode_state: dict | None = None) -> str:
 
 
 def _prompt_placeholder(mode_state: dict | None = None) -> list[tuple[str, str]]:
-    model = str((mode_state or {}).get("model") or "").strip()
+    state = mode_state or {}
+    config_issue = str(state.get("config_issue") or "").strip()
+    if config_issue:
+        return [("", config_issue)]
+    model = str(state.get("model") or "").strip()
+    runtime = state.get("_runtime_label")
+    label = str(runtime() if callable(runtime) else "").strip()
+    if label and label != "✓":
+        return [("", label)]
     if not model:
         return []
     return [("", model)]
@@ -643,6 +910,115 @@ def _prompt_parts(mode_state: dict | None = None) -> list[tuple[str, str]]:
     return parts
 
 
+def _config_issue_from(config: dict[str, Any]) -> tuple[str, str]:
+    path = str(config.get("_config_path") or CONFIG_PATH.expanduser())
+    exists = bool(config.get("_config_exists"))
+    valid = bool(config.get("_config_valid"))
+    error = str(config.get("_config_error") or "").strip()
+
+    if valid:
+        return "", ""
+    if exists:
+        return (f"配置损坏: {_tail_by_cells(path, 48)}", error)
+    return (f"配置文件: {_tail_by_cells(path, 48)}", "")
+
+
+def _provider_from_api_base(api_base: str) -> str:
+    raw = str(api_base or "").strip()
+    if not raw:
+        return ""
+    try:
+        host = str(urlparse(raw).netloc or "").strip().lower()
+    except Exception:
+        host = ""
+    if not host:
+        return ""
+    if "openrouter.ai" in host:
+        return "openrouter"
+    if "cerebras.ai" in host:
+        return "cerebras"
+    if "openai.com" in host:
+        return "openai"
+    if "anthropic.com" in host:
+        return "anthropic"
+    if "groq.com" in host:
+        return "groq"
+    if "fireworks.ai" in host:
+        return "fireworks"
+    if "x.ai" in host:
+        return "xai"
+    if "together.xyz" in host:
+        return "together"
+    if "aliyuncs.com" in host or "dashscope" in host:
+        return "dashscope"
+    if "siliconflow" in host:
+        return "siliconflow"
+    if "googleapis.com" in host or "generativelanguage" in host:
+        return "google"
+    if host.startswith(("localhost", "127.0.0.1")):
+        return "local"
+    if host.startswith("[::1]"):
+        return "local"
+    first = host.split(".", 1)[0].strip()
+    return first
+
+
+def _provider_from_model_id(model_id: str) -> str:
+    text = str(model_id or "").strip()
+    if not text or "/" not in text:
+        return ""
+    first = text.split("/", 1)[0].strip().lower()
+    if first in {
+        "openrouter",
+        "cerebras",
+        "openai",
+        "anthropic",
+        "groq",
+        "fireworks",
+        "xai",
+        "together",
+        "dashscope",
+        "siliconflow",
+        "google",
+        "ollama",
+    }:
+        return first
+    return ""
+
+
+def _model_provider(profile: dict[str, Any]) -> str:
+    provider = _provider_from_api_base(str(profile.get("api_base") or ""))
+    if provider:
+        return provider
+    return _provider_from_model_id(str(profile.get("model") or ""))
+
+
+def _compact_model_id(model_id: str, provider: str) -> str:
+    text = str(model_id or "").strip()
+    provider_text = str(provider or "").strip().lower()
+    if not text or not provider_text:
+        return text
+    prefix = provider_text + "/"
+    if text.lower().startswith(prefix):
+        return text[len(prefix):]
+    return text
+
+
+def _canonical_model_label(profile: dict[str, Any]) -> str:
+    provider = _model_provider(profile)
+    model_id = str(profile.get("model") or "").strip()
+    alias = str(profile.get("name") or "").strip()
+    if model_id:
+        if provider and not model_id.lower().startswith(provider.lower() + "/"):
+            return f"{provider}/{model_id}"
+        return model_id
+    return alias
+
+
+def _display_model_label(profile: dict[str, Any]) -> str:
+    return _canonical_model_label(profile)
+
+
 def _apply_model_state(mode_state: dict, index: int) -> None:
     models = mode_state.get("models") or []
     if not isinstance(models, list) or not models:
@@ -650,15 +1026,18 @@ def _apply_model_state(mode_state: dict, index: int) -> None:
         mode_state["model_count"] = 0
         mode_state["model"] = ""
         mode_state["model_id"] = ""
+        mode_state["model_provider"] = ""
         return
 
     idx = int(index or 0) % len(models)
     current = models[idx] if isinstance(models[idx], dict) else {}
-    label = str(current.get("model") or current.get("name") or "").strip()
+    provider = _model_provider(current)
+    label = _display_model_label(current)
     mode_state["model_index"] = idx
     mode_state["model_count"] = len(models)
     mode_state["model"] = label
     mode_state["model_id"] = str(current.get("model") or "").strip()
+    mode_state["model_provider"] = provider
 
 
 def _cycle_model(mode_state: dict, delta: int) -> None:
@@ -667,6 +1046,12 @@ def _cycle_model(mode_state: dict, delta: int) -> None:
         return
     current = int(mode_state.get("model_index") or 0)
     _apply_model_state(mode_state, current + delta)
+    runtime_prewarm = mode_state.get("_runtime_prewarm")
+    if callable(runtime_prewarm):
+        try:
+            runtime_prewarm()
+        except Exception:
+            pass
 
 
 # ── prompt_toolkit input ──────────────────────────────────────
@@ -765,6 +1150,8 @@ def _ask(session, *, mode_state: dict | None = None) -> _PromptInput:
                 default="",
                 enable_open_in_editor=False,
                 key_bindings=kb,
+                pre_run=mode_state.get("_runtime_prewarm") if callable(mode_state.get("_runtime_prewarm")) else None,
+                refresh_interval=0.15,
             )
         finally:
             pass
@@ -797,8 +1184,16 @@ def _ask(session, *, mode_state: dict | None = None) -> _PromptInput:
             ] if BeforeInput is not None and ConditionalProcessor is not None else None,
             default="",
             enable_open_in_editor=False,
+            pre_run=mode_state.get("_runtime_prewarm") if callable((mode_state or {}).get("_runtime_prewarm")) else None,
+            refresh_interval=0.15,
         )
         return _normalize_prompt_input(str(raw_text or ""), pasted_images)
+    runtime_prewarm = (mode_state or {}).get("_runtime_prewarm")
+    if callable(runtime_prewarm):
+        try:
+            runtime_prewarm()
+        except Exception:
+            pass
     return _PromptInput(text=input(_PROMPT_PREFIX).strip(), image_paths=[], cleanup_paths=[])
 
 
@@ -966,6 +1361,9 @@ def _stats_subtitle(stats: Stats, *, multi_turn: bool = True, elapsed: float | N
     cost = f"${stats.cost_usd:.6f}" if stats._has_cost else "N/A"
     out.append(cost, style=TEXT_MUTED)
     out.append("  ", style=TEXT_MUTED)
+    out.append("jina ", style=f"bold {ACCENT}")
+    out.append(f"{stats.jina_tokens}tok", style=TEXT_MUTED)
+    out.append("  ", style=TEXT_MUTED)
     out.append("calls ", style=f"bold {ACCENT}")
     out.append(str(stats.calls), style=TEXT_MUTED)
     return out
@@ -974,19 +1372,6 @@ def _stats_subtitle(stats: Stats, *, multi_turn: bool = True, elapsed: float | N
 # ── Slash commands ────────────────────────────────────────────
 def _open_config(console: Console) -> None:
     CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-    if not CONFIG_PATH.exists():
-        CONFIG_PATH.write_text(
-            "# hyw config\n"
-            "active_model: openai/gpt-4o-mini\n"
-            "models:\n"
-            "  - model: openai/gpt-4o-mini\n"
-            "\n"
-            "language: zh-CN\n"
-            "max_rounds: 6\n"
-            "headless: true\n"
-            "system_prompt: \"\"\n",
-            encoding="utf-8",
-        )
     editor = os.environ.get("EDITOR") or os.environ.get("VISUAL") or "vi"
     try:
         subprocess.run([editor, str(CONFIG_PATH)], check=False)
@@ -1011,9 +1396,8 @@ def _run_streaming(
     chunks: list[str] = []
     live: Live | None = None
     last_update = [0.0]
-    title = _gradient_title("HY-Websearch")
+    title = _gradient_title("HY-WebSearch")
     t_start = time.monotonic()
-    is_final_round = [False]  # 只有最终回答轮才用 transient Live
 
     def _on_status(text: str) -> None:
         spinner.start(text)
@@ -1025,7 +1409,7 @@ def _run_streaming(
             console.print()
             live = Live(
                 _make_panel(
-                    Text("..."),
+                    _render_stream_preview("..."),
                     title=title,
                     subtitle=_stats_subtitle(stats, multi_turn=multi_turn, elapsed=time.monotonic() - t_start),
                 ),
@@ -1038,23 +1422,30 @@ def _run_streaming(
         now = time.monotonic()
         if now - last_update[0] > 0.15:
             live.update(_make_panel(
-                Markdown(_clean_answer("".join(chunks))),
+                _render_stream_preview(_clean_answer("".join(chunks))),
                 title=title,
                 subtitle=_stats_subtitle(stats, multi_turn=multi_turn, elapsed=now - t_start),
             ))
             last_update[0] = now
 
-    def _on_rewind(thinking: str) -> None:
+    def _on_rewind(thinking: str, tools: list[tuple[str, dict]] | None = None) -> None:
         nonlocal live
+        rewind_source = str(thinking or "")
+        if not rewind_source.strip():
+            rewind_source = "".join(chunks)
         if live:
+            live.transient = True
             live.stop()
             live = None
         # 将模型思考内容 (去掉 XML 标签) 作为永久输出保留
-        clean = _clean_answer(thinking) if thinking else ""
+        clean = _clean_answer(rewind_source) if rewind_source else ""
+        planned_block = _planned_tool_block(tools)
+        if planned_block:
+            clean = f"{clean}\n{planned_block}".strip() if clean else planned_block
         if clean.strip():
             console.print(
                 _make_panel(
-                    Markdown(clean),
+                    _render_stream_preview(clean),
                     title=title,
                     subtitle=_stats_subtitle(stats, multi_turn=multi_turn, elapsed=time.monotonic() - t_start),
                 )
@@ -1081,32 +1472,35 @@ def _run_streaming(
     except KeyboardInterrupt:
         spinner.stop()
         if live:
+            live.transient = True
             live.stop()
         console.print(f"\n  [{TEXT_MUTED}]已中断[/{TEXT_MUTED}]")
         raise
     except Exception as e:
         spinner.stop()
         if live:
+            live.transient = True
             live.stop()
         console.print(f"  [red]错误: {e}[/red]")
         return ""
 
     spinner.stop()
 
-    if live:
-        live.stop()
-
     elapsed = time.monotonic() - t_start
 
     # Final static render with complete stats
     text = _clean_answer(answer) if answer else "未获得有效回答。"
-    console.print(
-        _make_panel(
-            Markdown(text),
-            title=title,
-            subtitle=_stats_subtitle(stats, multi_turn=multi_turn, elapsed=elapsed),
-        )
+    final_panel = _make_panel(
+        _render_markdown(text),
+        title=title,
+        subtitle=_stats_subtitle(stats, multi_turn=multi_turn, elapsed=elapsed),
     )
+    if live:
+        live.update(final_panel, refresh=True)
+        live.transient = False
+        live.stop()
+    else:
+        console.print(final_panel)
     console.print()
     return text
 
@@ -1122,6 +1516,7 @@ def main(argv: list[str] | None = None):
     config = load_config()
     models = get_model_profiles(config)
     headless = config.get("headless") not in (False, "false", "0", 0)
+    config_issue, config_error = _config_issue_from(config)
 
     console = Console(theme=_build_markdown_theme())
     session_stats = Stats()
@@ -1143,8 +1538,8 @@ def main(argv: list[str] | None = None):
         answer = _clean_answer(answer)
         console.print(
             _make_panel(
-                Markdown(answer),
-                title=_gradient_title("HY-Websearch"),
+                _render_markdown(answer),
+                title=_gradient_title("HY-WebSearch"),
                 subtitle=_stats_subtitle(session_stats),
             )
         )
@@ -1158,14 +1553,31 @@ def main(argv: list[str] | None = None):
         "models": models,
         "model_index": config.get("active_model_index") or 0,
         "name": config.get("name") or DEFAULT_NAME,
+        "config_issue": config_issue,
+        "config_error": config_error,
         "tools_ready": True,
         "tools_failed": False,
     }
     _apply_model_state(mode_state, int(mode_state["model_index"]))
 
+    def _active_request_config() -> dict:
+        return build_model_config(config, model_index=int(mode_state.get("model_index") or 0))
+
+    if config_issue:
+        mode_state["_runtime_prewarm"] = lambda: None
+        mode_state["_runtime_label"] = lambda: ""
+    else:
+        mode_state["_runtime_prewarm"] = lambda: start_runtime_prewarm(_active_request_config())
+        mode_state["_runtime_label"] = lambda: get_runtime_prewarm_label(_active_request_config())
+
     spinner = _Spinner()
     last_context: str | None = None
     last_was_multi: bool = True
+
+    if config_issue:
+        console.print(f"  [{TEXT_MUTED}]{config_issue}[/{TEXT_MUTED}]")
+        if config_error:
+            console.print(f"  [{TEXT_MUTED}]{config_error}[/{TEXT_MUTED}]")
 
     try:
         while True:
@@ -1202,14 +1614,35 @@ def main(argv: list[str] | None = None):
                 _open_config(console)
                 config = load_config()
                 mode_state["models"] = get_model_profiles(config)
+                config_issue, config_error = _config_issue_from(config)
+                mode_state["config_issue"] = config_issue
+                mode_state["config_error"] = config_error
                 _apply_model_state(mode_state, int(config.get("active_model_index") or 0))
                 headless = config.get("headless") not in (False, "false", "0", 0)
+                if config_issue:
+                    mode_state["_runtime_prewarm"] = lambda: None
+                    mode_state["_runtime_label"] = lambda: ""
+                    console.print(f"  [{TEXT_MUTED}]{config_issue}[/{TEXT_MUTED}]")
+                    if config_error:
+                        console.print(f"  [{TEXT_MUTED}]{config_error}[/{TEXT_MUTED}]")
+                else:
+                    mode_state["_runtime_prewarm"] = lambda: start_runtime_prewarm(_active_request_config())
+                    mode_state["_runtime_label"] = lambda: get_runtime_prewarm_label(_active_request_config())
                 console.print(f"  [{TEXT_MUTED}]配置已重新加载[/{TEXT_MUTED}]")
                 continue
             if not image_paths and question.lower() == "/model":
+                config_issue = str(mode_state.get("config_issue") or "").strip()
+                config_error = str(mode_state.get("config_error") or "").strip()
+                if config_issue:
+                    console.print(f"  [{TEXT_MUTED}]{config_issue}[/{TEXT_MUTED}]")
+                    if config_error:
+                        console.print(f"  [{TEXT_MUTED}]{config_error}[/{TEXT_MUTED}]")
+                    continue
                 label = str(mode_state.get("model") or "").strip() or "未配置"
                 model_id = str(mode_state.get("model_id") or "").strip()
-                if model_id and model_id != label:
+                normalized_label = label.replace(" / ", "/").strip().lower()
+                normalized_model_id = model_id.strip().lower()
+                if model_id and normalized_model_id and normalized_label not in {normalized_model_id, _compact_model_id(model_id, str(mode_state.get("model_provider") or "")).lower(),}:
                     console.print(f"  [{TEXT_MUTED}]{label} -> {model_id}[/{TEXT_MUTED}]")
                 else:
                     console.print(f"  [{TEXT_MUTED}]{label}[/{TEXT_MUTED}]")

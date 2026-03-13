@@ -10,6 +10,12 @@ active_model: openrouter/google/gemini-3.1-flash-lite-preview
 models:
   - model: openrouter/google/gemini-3.1-flash-lite-preview
   - model: openrouter/google/gemini-3-flash-preview
+  - model: openrouter/openai/gpt-oss-120b
+    max_tokens: 65536
+    extra_body:
+      provider:
+        only:
+          - cerebras
   - model: cerebras/gpt-oss-120b
     api_key: csk-xxx
     api_base: https://api.cerebras.ai/v1
@@ -21,3 +27,38 @@ language: zh-CN
 headless: false
 max_rounds: 6
 system_prompt: ""
+
+# Tool capability index + selection.
+# You can override these import paths if you add your own providers.
+tools:
+  index:
+    ddgs:
+      search: core.search_ddgs:ddgs_search
+    jina_ai:
+      search: core.search_jina_ai:jina_ai_search
+      page_extract: core.search_jina_ai:jina_ai_page_extract
+    render:
+      render: core.render_non_browser:render_markdown_non_browser_result
+  config:
+    jina_ai:
+      search:
+        headers:
+          # Authorization: Bearer jina_xxx
+          Accept: application/json
+          X-Respond-With: no-content
+      page_extract:
+        # prefer_free defaults to true:
+        # use the free route first and only fall back to Authorization
+        # after the local counter crosses the free-rate threshold.
+        # prefer_free: true
+        headers:
+          Accept: application/json
+          # Authorization: Bearer jina_xxx
+          X-Engine: direct
+          X-Return-Format: markdown
+          X-Target-Selector: body, .class, #id
+          X-Wait-For-Selector: body, .class, #id
+  use:
+    search: ddgs
+    page_extract: jina_ai
+    render: render

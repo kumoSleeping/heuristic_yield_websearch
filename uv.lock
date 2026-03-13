@@ -885,66 +885,25 @@ name = "hyw"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "ddgs" },
+    { name = "httpx" },
     { name = "litellm" },
     { name = "loguru" },
+    { name = "markdown" },
+    { name = "matplotlib" },
+    { name = "pillow" },
+    { name = "prompt-toolkit" },
+    { name = "pygments" },
+    { name = "pymupdf" },
     { name = "pyyaml" },
+    { name = "rich" },
+    { name = "weasyprint" },
 ]
 
 [package.optional-dependencies]
-all = [
-    { name = "arclet-alconna" },
-    { name = "arclet-entari" },
-    { name = "ddgs" },
-    { name = "httpx" },
-    { name = "markdown" },
-    { name = "matplotlib" },
-    { name = "pillow" },
-    { name = "prompt-toolkit" },
-    { name = "pygments" },
-    { name = "pymupdf" },
-    { name = "rich" },
-    { name = "weasyprint" },
-]
-cli = [
-    { name = "ddgs" },
-    { name = "markdown" },
-    { name = "matplotlib" },
-    { name = "pillow" },
-    { name = "prompt-toolkit" },
-    { name = "pygments" },
-    { name = "pymupdf" },
-    { name = "rich" },
-    { name = "weasyprint" },
-]
-ddgs = [
-    { name = "ddgs" },
-    { name = "markdown" },
-    { name = "matplotlib" },
-    { name = "pillow" },
-    { name = "pygments" },
-    { name = "pymupdf" },
-    { name = "weasyprint" },
-]
 entari = [
     { name = "arclet-alconna" },
     { name = "arclet-entari" },
-    { name = "ddgs" },
-    { name = "httpx" },
-    { name = "markdown" },
-    { name = "matplotlib" },
-    { name = "pillow" },
-    { name = "pygments" },
-    { name = "pymupdf" },
-    { name = "weasyprint" },
-]
-websearch = [
-    { name = "ddgs" },
-    { name = "markdown" },
-    { name = "matplotlib" },
-    { name = "pillow" },
-    { name = "pygments" },
-    { name = "pymupdf" },
-    { name = "weasyprint" },
 ]
 
 [package.dev-dependencies]
@@ -964,56 +923,23 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "arclet-alconna", marker = "extra == 'all'" },
     { name = "arclet-alconna", marker = "extra == 'entari'" },
-    { name = "arclet-entari", marker = "extra == 'all'" },
     { name = "arclet-entari", marker = "extra == 'entari'" },
-    { name = "ddgs", marker = "extra == 'all'" },
-    { name = "ddgs", marker = "extra == 'cli'" },
-    { name = "ddgs", marker = "extra == 'ddgs'" },
-    { name = "ddgs", marker = "extra == 'entari'" },
-    { name = "ddgs", marker = "extra == 'websearch'" },
-    { name = "httpx", marker = "extra == 'all'" },
-    { name = "httpx", marker = "extra == 'entari'" },
+    { name = "ddgs" },
+    { name = "httpx" },
     { name = "litellm" },
     { name = "loguru" },
-    { name = "markdown", marker = "extra == 'all'" },
-    { name = "markdown", marker = "extra == 'cli'" },
-    { name = "markdown", marker = "extra == 'ddgs'" },
-    { name = "markdown", marker = "extra == 'entari'" },
-    { name = "markdown", marker = "extra == 'websearch'" },
-    { name = "matplotlib", marker = "extra == 'all'" },
-    { name = "matplotlib", marker = "extra == 'cli'" },
-    { name = "matplotlib", marker = "extra == 'ddgs'" },
-    { name = "matplotlib", marker = "extra == 'entari'" },
-    { name = "matplotlib", marker = "extra == 'websearch'" },
-    { name = "pillow", marker = "extra == 'all'" },
-    { name = "pillow", marker = "extra == 'cli'" },
-    { name = "pillow", marker = "extra == 'ddgs'" },
-    { name = "pillow", marker = "extra == 'entari'" },
-    { name = "pillow", marker = "extra == 'websearch'" },
-    { name = "prompt-toolkit", marker = "extra == 'all'" },
-    { name = "prompt-toolkit", marker = "extra == 'cli'" },
-    { name = "pygments", marker = "extra == 'all'" },
-    { name = "pygments", marker = "extra == 'cli'" },
-    { name = "pygments", marker = "extra == 'ddgs'" },
-    { name = "pygments", marker = "extra == 'entari'" },
-    { name = "pygments", marker = "extra == 'websearch'" },
-    { name = "pymupdf", marker = "extra == 'all'" },
-    { name = "pymupdf", marker = "extra == 'cli'" },
-    { name = "pymupdf", marker = "extra == 'ddgs'" },
-    { name = "pymupdf", marker = "extra == 'entari'" },
-    { name = "pymupdf", marker = "extra == 'websearch'" },
+    { name = "markdown" },
+    { name = "matplotlib" },
+    { name = "pillow" },
+    { name = "prompt-toolkit" },
+    { name = "pygments" },
+    { name = "pymupdf" },
     { name = "pyyaml" },
-    { name = "rich", marker = "extra == 'all'" },
-    { name = "rich", marker = "extra == 'cli'" },
-    { name = "weasyprint", marker = "extra == 'all'" },
-    { name = "weasyprint", marker = "extra == 'cli'" },
-    { name = "weasyprint", marker = "extra == 'ddgs'" },
-    { name = "weasyprint", marker = "extra == 'entari'" },
-    { name = "weasyprint", marker = "extra == 'websearch'" },
+    { name = "rich" },
+    { name = "weasyprint" },
 ]
-provides-extras = ["websearch", "ddgs", "cli", "entari", "all"]
+provides-extras = ["entari"]
 
 [package.metadata.requires-dev]
 dev = [

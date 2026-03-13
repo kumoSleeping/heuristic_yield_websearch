@@ -27,7 +27,8 @@ HYW 让模型自己决定**搜什么、搜几轮、怎么交叉验证**，然后
 - **多轮自主搜索** — 模型自行拆解问题、构造搜索词、验证结果，最多 6 轮迭代
 - **XML 标签工具调用** — 不依赖 function calling，兼容任意 LLM provider
 - **流式输出** — 边思考边显示，搜索过程实时可见
-- **内置 websearch 服务** — 基于 DuckDuckGo，零配置，无需 API key
+- **工具能力可插拔** — 按 `search / page_extract / render` 能力选择 provider，而不是写死在主流程
+- **内置 websearch 服务** — 默认提供 `ddgs`、Jina AI 搜索 / 页面提取，以及非浏览器 Markdown 渲染
 - **Rich 终端 UI** — 渐变标题、Markdown 渲染、实时 spinner
 - **多轮对话** — 上下文自动传递，左右方向键切换模式
 - **通过 LiteLLM 支持任意模型** — OpenAI / Anthropic / Google / OpenRouter / 本地模型
@@ -37,14 +38,11 @@ HYW 让模型自己决定**搜什么、搜几轮、怎么交叉验证**，然后
 ## 快速开始
 
 ```bash
-# CLI（推荐）
-pip install "hyw[cli]"
+# 默认安装：CLI + ddgs + Jina AI + 非浏览器渲染
+pip install hyw
 
-# CLI + entari 插件支持
-pip install "hyw[cli,entari]"
-
-# 仅安装内置 websearch 服务
-pip install "hyw[websearch]"
+# 增加 entari 插件支持
+pip install "hyw[entari]"
 
 # 交互模式
 hyw
@@ -53,7 +51,7 @@ hyw
 hyw -q "最近有什么科技新闻？"
 ```
 
-安装 `cli` extra 后即可从命令行直接使用 `hyw`。
+默认安装后即可从命令行直接使用 `hyw`。
 
 ## 配置
 
@@ -82,8 +80,26 @@ models:
 
 # 偏好
 language: zh-CN
-max_rounds: 6          # 最大搜索轮数
-headless: true         # 浏览器无头模式
+max_rounds: 6
+headless: true
+
+tools:
+  index:
+    ddgs:
+      search: core.search_ddgs:ddgs_search
+    jina_ai:
+      search: core.search_jina_ai:jina_ai_search
+      page_extract: core.search_jina_ai:jina_ai_page_extract
+    render:
+      render: core.render_non_browser:render_markdown_non_browser_result
+  config:
+    jina_ai:
+      page_extract:
+        prefer_free: true
+  use:
+    search: ddgs
+    page_extract: jina_ai
+    render: render
 
 # 自定义系统提示词 (追加)
 system_prompt: ""
@@ -125,15 +141,20 @@ system_prompt: ""
 | `/config` | 打开配置文件 |
 | `/stats` | 显示本次会话统计 |
 | `/exit` | 退出 |
-| `←` / `→` | 切换 Multi Turn / New Session 模式 |
+| `←` / `→` | 切换当前模型 |
+| `↑` / `↓` | 切换 Multi Turn / New Session 模式 |
 
 ## 项目结构
 
 ```
 core/
+├── config.py               # 模型配置 + 工具能力索引
 ├── main.py                 # 对话循环、工具调用、LLM 交互
 ├── cli.py                  # Rich 终端 UI、流式输出
 ├── __main__.py             # python -m core 入口
+├── search_ddgs.py          # DDGS 搜索 provider
+├── search_jina_ai.py       # Jina AI 搜索 / 页面提取 provider
+├── render_non_browser.py   # 非浏览器 Markdown 渲染 provider
 ├── web_search.py           # WebToolSuite + 服务运行时
 └── render.py               # 独立 markdown 渲染服务
 ```
@@ -141,11 +162,8 @@ core/
 ## 依赖
 
 - Python ≥ 3.12
-- 基础依赖：`litellm` · `pyyaml` · `loguru`
-- `websearch`：`ddgs` · `markdown` · `Pygments` · `matplotlib` · `weasyprint` · `PyMuPDF` · `Pillow`
-- `ddgs`：与 `websearch` 相同（兼容别名）
-- `cli`：`rich` · `prompt-toolkit` · `ddgs` · `Pygments` · `matplotlib` · `weasyprint` · `PyMuPDF` · `Pillow` · `markdown`
-- `entari`：`arclet-alconna` · `arclet-entari` · `ddgs` · `Pygments` · `matplotlib` · `weasyprint` · `PyMuPDF` · `Pillow` · `markdown` · `httpx`
+- 默认依赖：`litellm` · `pyyaml` · `loguru` · `rich` · `prompt-toolkit` · `ddgs` · `httpx` · `markdown` · `Pygments` · `matplotlib` · `weasyprint` · `PyMuPDF` · `Pillow`
+- `entari`：`arclet-alconna` · `arclet-entari`
 
 <!-- TODO: 补充系统级依赖（如 Chrome/Chromium）说明 -->
 
