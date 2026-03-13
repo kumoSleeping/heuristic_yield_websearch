@@ -35,6 +35,7 @@ from .config import (
     CONFIG_PATH,
     DEFAULT_NAME,
     build_model_config,
+    ensure_config_file,
     get_model_profiles,
     load_config,
 )
@@ -1371,7 +1372,7 @@ def _stats_subtitle(stats: Stats, *, multi_turn: bool = True, elapsed: float | N
 
 # ── Slash commands ────────────────────────────────────────────
 def _open_config(console: Console) -> None:
-    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    ensure_config_file()
     editor = os.environ.get("EDITOR") or os.environ.get("VISUAL") or "vi"
     try:
         subprocess.run([editor, str(CONFIG_PATH)], check=False)
