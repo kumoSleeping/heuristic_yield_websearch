@@ -38,11 +38,14 @@ HYW 让模型自己决定**搜什么、搜几轮、怎么交叉验证**，然后
 ## 快速开始
 
 ```bash
-# 默认安装：CLI + ddgs + Jina AI + 非浏览器渲染
+# 默认安装：CLI + ddgs + Jina AI + md2png-lite 渲染
 pip install hyw
 
 # 增加 entari 插件支持
 pip install "hyw[entari]"
+
+# 增加 entari + Noto 字体同步支持
+pip install "hyw[entari,notosans]"
 
 # 交互模式
 hyw
@@ -57,16 +60,14 @@ hyw -q "最近有什么科技新闻？"
 
 配置文件位于 `~/.hyw/config.yml`，交互模式下可用 `/config` 命令直接编辑。
 仓库根目录提供了一份可直接参考的 `config.example.yml`。
-交互模式里 `← / →` 用于切换模型，`↑ / ↓` 用于切换多轮/新会话。
+交互模式里空输入时，`←` 用于切换 stage1，`→` 用于切换 stage2，`↑ / ↓` 用于切换多轮/新会话。
 旧的单模型写法（`model` / `api_key` / `api_base`）仍然兼容。
 
 ```yaml
-# 给未覆写的模型复用一套默认 OpenRouter 配置
+# 共享 provider 默认值。
+# `models[*]` 和 `sub_agent.*` 没有单独覆写时都会继承这里。
 api_key: sk-or-xxx
 api_base: https://openrouter.ai/api/v1
-
-# 启动 / 单次问答默认使用的模型档位
-active_model: gemini-lite
 
 models:
   - name: gemini-lite
@@ -78,11 +79,24 @@ models:
     api_key: csk-xxx
     api_base: https://api.cerebras.ai/v1
 
-# 偏好
+# 当前主流程真实会读取的运行参数
 language: zh-CN
-max_rounds: 6
+# 如果上游 provider 的流式 + tool call 兼容性不好，改成 false。
+stream: true
 headless: true
+# 主循环最大轮次，默认 8。
+max_rounds: 8
+# 追加到主控制模型系统提示词末尾。
+system_prompt: ""
 
+# 历史遗留子代理覆写；主流程不再读取这些位
+sub_agent:
+  websearch:
+    model: ""
+  page:
+    model: ""
+
+# 工具能力注册表 + 默认 provider 选择
 tools:
   index:
     ddgs:
@@ -90,8 +104,8 @@ tools:
     jina_ai:
       search: core.search_jina_ai:jina_ai_search
       page_extract: core.search_jina_ai:jina_ai_page_extract
-    render:
-      render: core.render_non_browser:render_markdown_non_browser_result
+    md2png_lite:
+      render: md2png_lite.provider:render_md2png_lite_result
   config:
     jina_ai:
       page_extract:
@@ -99,13 +113,25 @@ tools:
   use:
     search: ddgs
     page_extract: jina_ai
-    render: render
+    render: md2png_lite
 
-# 自定义系统提示词 (追加)
-system_prompt: ""
+# 两阶段主流程默认直接来自 `models` 顺序：
+# `models[0]` 作为 stage1；
+# 如果有 `models[1]`，则作为 stage2；否则 stage2 回退到 `models[0]`。
 ```
 
-<!-- TODO: 补充更多配置项说明 -->
+现在可以直接这样理解这些配置：
+
+- `api_key` / `api_base`：顶层默认值，给 `models[*]` 和 `sub_agent.*` 继承。
+- `models`：两阶段主模型候选列表。默认 `models[0]` 是 stage1，`models[1]` 是 stage2。
+- `language` / `stream` / `headless` / `system_prompt`：当前主流程真实生效。
+- `max_rounds`：主循环最大轮次，默认是 `8`。
+- CLI 快捷键：空输入时按左键轮换 stage1，按右键轮换 stage2。
+- `sub_agent.*`：历史兼容位；当前两阶段主流程不再读取。
+- `tools.index`：能力到实现的注册表。
+- `tools.config`：某个 provider 的附加配置，比如 header、免费优先策略。
+- `tools.use`：每种能力默认选哪个 provider。
+- 图片策略：图片只在第一阶段直接发送给主模型；不会再经过独立视觉总结模型。
 
 ## 工作原理
 
@@ -114,21 +140,21 @@ system_prompt: ""
   │
   ▼
 ┌─────────────────────────────────┐
-│  LLM 分析问题，拆解搜索计划      │
-│  输出 <search>/<wiki> XML 标签   │
+│  主模型规划下一步动作            │
+│  输出 <sub_agent ...> XML 标签   │
 └──────────────┬──────────────────┘
                │
                ▼
 ┌─────────────────────────────────┐
-│  并发执行搜索（最多 4 个/轮）     │
-│  DuckDuckGo → 解析 → 结构化结果  │
+│  websearch 子代理生成 2-6 条搜索词│
+│  并在内部完成多次搜索            │
 └──────────────┬──────────────────┘
                │
                ▼
 ┌─────────────────────────────────┐
-│  LLM 验证结果，决定：            │
-│  ├─ 信息不足 → 构造新搜索词，继续 │
-│  └─ 信息充分 → 输出最终回答       │
+│  主模型挑选具体页面              │
+│  page 子代理负责压缩 / 找线索    │
+│  最后由主模型输出答案            │
 └─────────────────────────────────┘
 ```
 
@@ -154,16 +180,16 @@ core/
 ├── __main__.py             # python -m core 入口
 ├── search_ddgs.py          # DDGS 搜索 provider
 ├── search_jina_ai.py       # Jina AI 搜索 / 页面提取 provider
-├── render_non_browser.py   # 非浏览器 Markdown 渲染 provider
 ├── web_search.py           # WebToolSuite + 服务运行时
-└── render.py               # 独立 markdown 渲染服务
+└── render.py               # md2png-lite 渲染分发
 ```
 
 ## 依赖
 
 - Python ≥ 3.12
-- 默认依赖：`litellm` · `pyyaml` · `loguru` · `rich` · `prompt-toolkit` · `ddgs` · `httpx` · `markdown` · `Pygments` · `matplotlib` · `weasyprint` · `PyMuPDF` · `Pillow`
-- `entari`：`arclet-alconna` · `arclet-entari`
+- 默认依赖：`litellm` · `pyyaml` · `loguru` · `rich` · `prompt-toolkit` · `ddgs` · `httpx` · `md2png-lite` · `Pillow`
+- `entari`：`arclet-alconna` · `arclet-entari` · `md2png-lite`
+- `notosans`：`md2png-lite[notosans]`
 
 <!-- TODO: 补充系统级依赖（如 Chrome/Chromium）说明 -->
 

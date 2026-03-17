@@ -38,11 +38,14 @@ HYW lets the model decide **what to search, how many rounds, and how to cross-va
 ## Quickstart
 
 ```bash
-# Default install: CLI + ddgs + Jina AI + non-browser render
+# Default install: CLI + ddgs + Jina AI + md2png-lite render
 pip install hyw
 
 # Add entari plugin support
 pip install "hyw[entari]"
+
+# Add Entari + Noto font sync support
+pip install "hyw[entari,notosans]"
 
 # Interactive mode
 hyw
@@ -57,16 +60,14 @@ The `hyw` command is available in the default install.
 
 Config file: `~/.hyw/config.yml`. Use `/config` in interactive mode to edit directly.
 An example based on the multi-model layout lives at `config.example.yml`.
-In interactive mode, `← / →` switches models, and `↑ / ↓` toggles multi-turn vs new session.
+In interactive mode with an empty buffer, `Left` cycles stage1, `Right` cycles stage2, and `↑ / ↓` toggles multi-turn vs new session.
 Legacy single-model fields (`model` / `api_key` / `api_base`) still work.
 
 ```yaml
-# Shared defaults for profiles that don't override them
+# Shared provider defaults.
+# `models[*]` and `sub_agent.*` inherit these unless they override them.
 api_key: sk-or-xxx
 api_base: https://openrouter.ai/api/v1
-
-# Active profile for startup / single-shot mode
-active_model: gemini-lite
 
 models:
   - name: gemini-lite
@@ -78,11 +79,24 @@ models:
     api_key: csk-xxx
     api_base: https://api.cerebras.ai/v1
 
-# Preferences
+# Runtime options actually used by the app
 language: zh-CN
-max_rounds: 6
+# Set `false` if the upstream provider has streaming / tool-call compatibility issues.
+stream: true
 headless: true
+# Maximum main-loop rounds. Default is 8.
+max_rounds: 8
+# Custom system prompt appended to the main controller prompt.
+system_prompt: ""
 
+# Legacy child overrides. The current main flow no longer reads these slots.
+sub_agent:
+  websearch:
+    model: ""
+  page:
+    model: ""
+
+# Tool capability registry + default provider selection
 tools:
   index:
     ddgs:
@@ -90,8 +104,8 @@ tools:
     jina_ai:
       search: core.search_jina_ai:jina_ai_search
       page_extract: core.search_jina_ai:jina_ai_page_extract
-    render:
-      render: core.render_non_browser:render_markdown_non_browser_result
+    md2png_lite:
+      render: md2png_lite.provider:render_md2png_lite_result
   config:
     jina_ai:
       page_extract:
@@ -99,13 +113,25 @@ tools:
   use:
     search: ddgs
     page_extract: jina_ai
-    render: render
+    render: md2png_lite
 
-# Custom system prompt (appended)
-system_prompt: ""
+# Two-stage main-loop selection comes directly from `models` order:
+# `models[0]` is stage1 by default;
+# if `models[1]` exists it becomes stage2, otherwise stage2 falls back to `models[0]`.
 ```
 
-<!-- TODO: add more config options -->
+What each block does now:
+
+- `api_key` / `api_base`: shared defaults inherited by `models[*]` and `sub_agent.*`.
+- `models`: the two-stage model pool. By default, `models[0]` is stage1 and `models[1]` is stage2.
+- `language` / `stream` / `headless` / `system_prompt`: active runtime options used by the current flow.
+- `max_rounds`: maximum main-loop rounds; default is `8`.
+- CLI shortcuts: with an empty buffer, `Left` cycles stage1 and `Right` cycles stage2.
+- `sub_agent.*`: compatibility-only legacy slots; not used by the current two-stage main loop.
+- `tools.index`: capability-to-provider registry.
+- `tools.config`: per-provider extra options such as headers or free-route preferences.
+- `tools.use`: which provider is selected by default for each capability.
+- Image strategy: images are sent directly to the stage-1 main model; there is no separate vision-summary pass anymore.
 
 ## How It Works
 
@@ -114,21 +140,21 @@ User Question
   │
   ▼
 ┌─────────────────────────────────────┐
-│  LLM analyzes & decomposes question │
-│  Outputs <search>/<wiki> XML tags   │
+│  Main model plans the next step     │
+│  Outputs <sub_agent ...> XML tags   │
 └──────────────┬──────────────────────┘
                │
                ▼
 ┌─────────────────────────────────────┐
-│  Concurrent search (up to 4/round)  │
-│  DuckDuckGo → Parse → Structured   │
+│  websearch sub-agent builds 2-6     │
+│  queries and runs internal search   │
 └──────────────┬──────────────────────┘
                │
                ▼
 ┌─────────────────────────────────────┐
-│  LLM validates results & decides:   │
-│  ├─ Insufficient → new queries, go  │
-│  └─ Sufficient  → final answer      │
+│  Main model chooses concrete pages  │
+│  page sub-agent compresses them     │
+│  then main model returns the answer │
 └─────────────────────────────────────┘
 ```
 
@@ -154,16 +180,16 @@ core/
 ├── __main__.py             # python -m core entry point
 ├── search_ddgs.py          # DDGS search provider
 ├── search_jina_ai.py       # Jina AI search + page extract provider
-├── render_non_browser.py   # WeasyPrint-based markdown render provider
 ├── web_search.py           # WebToolSuite + service runtime
-└── render.py               # Standalone markdown render service
+└── render.py               # md2png-lite render dispatch
 ```
 
 ## Requirements
 
 - Python ≥ 3.12
-- Default deps: `litellm` · `pyyaml` · `loguru` · `rich` · `prompt-toolkit` · `ddgs` · `httpx` · `markdown` · `Pygments` · `matplotlib` · `weasyprint` · `PyMuPDF` · `Pillow`
-- `entari`: `arclet-alconna` · `arclet-entari`
+- Default deps: `litellm` · `pyyaml` · `loguru` · `rich` · `prompt-toolkit` · `ddgs` · `httpx` · `md2png-lite` · `Pillow`
+- `entari`: `arclet-alconna` · `arclet-entari` · `md2png-lite`
+- `notosans`: `md2png-lite[notosans]`
 
 <!-- TODO: add system-level dependencies (e.g. Chrome/Chromium) if needed -->
 

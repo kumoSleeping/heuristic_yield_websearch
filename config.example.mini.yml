@@ -1,0 +1,6 @@
+models:
+  - model: openrouter/google/gemini-3.1-flash-lite-preview:nitro
+    api_key: sk-or-xxx
+  - model: openrouter/stepfun/step-3.5-flash:free
+    api_key: sk-or-xxx
+language: zh-CN

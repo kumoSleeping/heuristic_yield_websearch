@@ -143,7 +143,7 @@ def _jina_headers(
     if capability == "search":
         headers.setdefault("X-Respond-With", "no-content")
     if capability == "page_extract":
-        headers.setdefault("X-Engine", "direct")
+        # headers.setdefault("X-Engine", "direct")
         if _jina_prefer_free(config, capability) and _has_auth_header(headers) and not _use_page_extract_api_key(config):
             auth_key = _get_header_key(headers, "Authorization")
             if auth_key:
@@ -177,6 +177,7 @@ async def _build_usage_meta(
     response: Any,
     raw_text: str,
     capability: str,
+    billed: bool | None = None,
 ) -> dict[str, Any]:
     tokens = _to_int(response.headers.get("x-usage-tokens"))
     source = "header" if tokens > 0 else ""
@@ -188,6 +189,10 @@ async def _build_usage_meta(
     return {
         "provider": "jina_ai",
         "capability": capability,
+        "billing": {
+            "mode": "paid" if billed else "free",
+            "cost_usd": 0.0 if billed is False else None,
+        },
         "usage": {
             "requests": 1,
             "tokens": tokens,
@@ -307,6 +312,13 @@ async def jina_ai_search(
             response=response,
             raw_text=raw_text,
             capability="search",
+            billed=_has_auth_header(
+                _jina_headers(
+                    config=config,
+                    capability="search",
+                    default_accept="application/json",
+                )
+            ),
         )
 
     rows: list[dict[str, Any]] = []
@@ -484,6 +496,7 @@ async def jina_ai_page_extract(
             response=response,
             raw_text=raw_text,
             capability="page_extract",
+            billed=_has_auth_header(headers),
         )
 
     content_type = _coerce_text(response.headers.get("content-type")).lower()

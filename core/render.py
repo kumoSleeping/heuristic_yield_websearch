@@ -4,7 +4,6 @@ import inspect
 from typing import Any, Callable, Dict
 
 from .config import resolve_tool_handlers
-from .render_non_browser import render_markdown_non_browser_result
 
 RenderCallable = Callable[..., Any]
 RenderResult = Dict[str, Any]
@@ -92,6 +91,5 @@ __all__ = [
     "RenderCallable",
     "RenderResult",
     "render_markdown_base64",
-    "render_markdown_non_browser_result",
     "render_markdown_result",
 ]

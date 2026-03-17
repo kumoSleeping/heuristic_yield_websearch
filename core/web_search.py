@@ -8,7 +8,6 @@ from loguru import logger
 
 from .config import resolve_tool_handlers
 from .render import RenderCallable, RenderResult, render_markdown_result
-from .render_non_browser import ensure_non_browser_render_ready
 from .search_ddgs import ddgs_search
 from .search_jina_ai import jina_ai_page_extract, jina_ai_search
 
@@ -97,6 +96,11 @@ def _extract_search_rows(payload: Any) -> list[dict[str, Any]]:
     return []
 
 
+def _looks_like_payment_required_error(text: str) -> bool:
+    lowered = str(text or "").strip().lower()
+    return "402" in lowered and "payment required" in lowered
+
+
 class WebToolSuite:
     def __init__(
         self,
@@ -108,6 +112,12 @@ class WebToolSuite:
         self._render_markdown = render_markdown
         self._config = dict(config or {})
         self._search_handlers = resolve_tool_handlers(self._config, "search")
+        search_providers = {handler.provider for handler in self._search_handlers}
+        self._emergency_search_handlers = (
+            []
+            if "ddgs" in search_providers
+            else resolve_tool_handlers(self._config, "search", selection="ddgs")
+        )
         self._extract_handlers = resolve_tool_handlers(self._config, "page_extract")
         self._render_handlers = resolve_tool_handlers(self._config, "render")
         self._search_index_counter = 0
@@ -119,24 +129,7 @@ class WebToolSuite:
         )
 
     def warm_up(self) -> dict[str, Any]:
-        payload: dict[str, Any] = {}
-        needs_render_prewarm = any(
-            str(handler.target).startswith("core.render_non_browser:")
-            for handler in self._render_handlers
-        )
-        if not needs_render_prewarm:
-            return payload
-
-        logger.info("WebToolSuite: prewarming render provider...")
-        info = ensure_non_browser_render_ready(prewarm=True)
-        payload["render"] = info
-        logger.info(
-            "WebToolSuite: render prewarm done (platform={}, prewarmed={}, paths={})",
-            info.get("platform"),
-            info.get("prewarmed"),
-            info.get("paths"),
-        )
-        return payload
+        return {}
 
     def _next_search_index(self) -> int:
         self._search_index_counter += 1
@@ -160,14 +153,16 @@ class WebToolSuite:
             return await result
         return result
 
-    async def _search_text(
+    async def _search_via_handlers(
         self,
+        handlers: list[Any],
+        *,
         query: str,
         kl: Optional[str],
         max_results: int,
-    ) -> tuple[List[Dict[str, Any]], dict[str, Any]]:
-        errors: list[str] = []
-        for handler in self._search_handlers:
+        errors: list[str],
+    ) -> tuple[List[Dict[str, Any]], dict[str, Any]] | None:
+        for handler in handlers:
             try:
                 raw = await self._call_handler(
                     handler,
@@ -206,6 +201,36 @@ class WebToolSuite:
                 logger.info("WebToolSuite(search): {} -> {} result(s)", handler.provider, len(results))
                 return results, meta
             errors.append(f"{handler.provider}: empty result")
+        return None
+
+    async def _search_text(
+        self,
+        query: str,
+        kl: Optional[str],
+        max_results: int,
+    ) -> tuple[List[Dict[str, Any]], dict[str, Any]]:
+        errors: list[str] = []
+        primary = await self._search_via_handlers(
+            self._search_handlers,
+            query=query,
+            kl=kl,
+            max_results=max_results,
+            errors=errors,
+        )
+        if primary is not None:
+            return primary
+
+        if self._emergency_search_handlers and any(_looks_like_payment_required_error(item) for item in errors):
+            logger.warning("WebToolSuite(search): configured provider hit 402, falling back to {}", [handler.provider for handler in self._emergency_search_handlers])
+            fallback = await self._search_via_handlers(
+                self._emergency_search_handlers,
+                query=query,
+                kl=kl,
+                max_results=max_results,
+                errors=errors,
+            )
+            if fallback is not None:
+                return fallback
 
         raise RuntimeError("; ".join(errors) if errors else "no search provider is configured")
 

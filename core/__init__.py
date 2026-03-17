@@ -5,7 +5,6 @@ from .render import (
     RenderCallable,
     RenderResult,
     render_markdown_base64,
-    render_markdown_non_browser_result,
     render_markdown_result,
 )
 from .web_search import WebToolSuite, on_shutdown, on_startup, page_extract, wait_until_ready, web_search
@@ -22,7 +21,6 @@ __all__ = [
     "on_startup",
     "page_extract",
     "render_markdown_base64",
-    "render_markdown_non_browser_result",
     "render_markdown_result",
     "wait_until_ready",
     "web_search",

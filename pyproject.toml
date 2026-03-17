@@ -13,11 +13,7 @@ dependencies = [
     "prompt-toolkit",
     "ddgs",
     "httpx",
-    "markdown",
-    "Pygments",
-    "matplotlib",
-    "weasyprint",
-    "PyMuPDF",
+    "md2png-lite>=0.1.1",
     "Pillow",
 ]
 
@@ -25,6 +21,10 @@ dependencies = [
 entari = [
     "arclet-alconna",
     "arclet-entari",
+    "md2png-lite>=0.1.1",
+]
+notosans = [
+    "md2png-lite[notosans]>=0.1.1",
 ]
 
 [dependency-groups]
@@ -32,13 +32,9 @@ dev = [
     "arclet.entari[yaml,cron,dotenv] >= 0.17.1",
     "entari-plugin-server>=0.6.2",
     "satori-python-adapter-onebot11>=0.4.2",
+    "md2png-lite[notosans]>=0.1.1",
     "ddgs",
-    "Pygments",
-    "matplotlib",
-    "weasyprint",
-    "PyMuPDF",
     "Pillow",
-    "markdown",
     "httpx",
 ]
 

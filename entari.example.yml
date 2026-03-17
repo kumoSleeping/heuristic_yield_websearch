@@ -15,6 +15,7 @@ plugins:
     use_config_prefix: false
   entari_plugin_hyw:
     question_command: ".q"
+    render_theme: "paper"  # available: paper | github-light | github-dark | solarized-light | graphite
   ::inspect: {}
   entari_plugin_server:
     direct_adapter: true

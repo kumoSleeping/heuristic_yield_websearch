@@ -1,35 +1,60 @@
 # Copy this file to ~/.hyw/config.yml and fill in your real keys.
 
-# Shared defaults for providers/models that use the same endpoint.
+# ==== Main model defaults ====
+# Shared provider defaults.
+# `models[*]` and `sub_agent.*` inherit these unless they override them.
 api_key: sk-or-xxx
 api_base: https://openrouter.ai/api/v1
 
-# Default model for startup and single-shot mode.
-active_model: openrouter/google/gemini-3.1-flash-lite-preview
-
 models:
-  - model: openrouter/google/gemini-3.1-flash-lite-preview
-  - model: openrouter/google/gemini-3-flash-preview
-  - model: openrouter/openai/gpt-oss-120b
+  - name: gemini-lite
+    model: openrouter/google/gemini-3.1-flash-lite-preview
+  - name: gemini-flash
+    model: openrouter/google/gemini-3-flash-preview
+  - name: gpt-oss-openrouter
+    model: openrouter/openai/gpt-oss-120b
     max_tokens: 65536
     extra_body:
       provider:
         only:
           - cerebras
-  - model: cerebras/gpt-oss-120b
+  - name: cerebras-gpt-oss
+    model: cerebras/gpt-oss-120b
     api_key: csk-xxx
     api_base: https://api.cerebras.ai/v1
-  - model: cerebras/llama3.1-8b
+  - name: cerebras-llama
+    model: cerebras/llama3.1-8b
     api_key: csk-xxx
     api_base: https://api.cerebras.ai/v1
 
+# ==== Runtime options actually used by the app ====
 language: zh-CN
+# Set `false` if the upstream provider has streaming / tool-call compatibility issues.
+stream: true
+# Whether browser-backed tools run headless.
 headless: false
-max_rounds: 6
+# Maximum main-loop rounds. Default is 8.
+max_rounds: 8
+# Appended to the main controller system prompt.
 system_prompt: ""
 
-# Tool capability index + selection.
-# You can override these import paths if you add your own providers.
+# ==== Legacy / compatibility child overrides ====
+# Kept for old configs; the current main flow does not dispatch these slots.
+sub_agent:
+  websearch:
+    # Legacy compatibility slot.
+    model: ""
+    api_key: ""
+    api_base: ""
+  page:
+    # Legacy compatibility slot.
+    model: ""
+    api_key: ""
+    api_base: ""
+
+# ==== Tool backend registry ====
+# Capability registry + default provider selection.
+# Override these import paths only if you add your own providers.
 tools:
   index:
     ddgs:
@@ -37,8 +62,8 @@ tools:
     jina_ai:
       search: core.search_jina_ai:jina_ai_search
       page_extract: core.search_jina_ai:jina_ai_page_extract
-    render:
-      render: core.render_non_browser:render_markdown_non_browser_result
+    md2png_lite:
+      render: md2png_lite.provider:render_md2png_lite_result
   config:
     jina_ai:
       search:
@@ -61,4 +86,8 @@ tools:
   use:
     search: ddgs
     page_extract: jina_ai
-    render: render
+    render: md2png_lite
+
+# Main-loop stage selection:
+# `models[0]` is stage1 by default.
+# `models[1]` is stage2 by default if it exists; otherwise stage2 falls back to `models[0]`.
