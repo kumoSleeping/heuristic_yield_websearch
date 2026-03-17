@@ -111,9 +111,9 @@ class MainPhaseFlowTests(unittest.TestCase):
             _PHASE_STAGE1,
             phase_state=_PhaseRuntimeState(phase=_PHASE_STAGE1, first_collection_mode="mix"),
         )
-        self.assertIn("## Page", page_prompt)
-        self.assertIn("你刚刚进行了页面查看", page_prompt)
-        self.assertIn("你当前主要拿到的是搜索结果摘要与候选来源", mix_prompt)
+        self.assertIn("## After Page", page_prompt)
+        self.assertIn("立即直接进入 skeleton", page_prompt)
+        self.assertIn("## After Search", mix_prompt)
 
     def test_decide_turn_stage1_block_advance_to_stage2(self):
         phase_state = _PhaseRuntimeState(phase=_PHASE_STAGE1)

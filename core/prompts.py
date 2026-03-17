@@ -25,16 +25,11 @@ BASE_SYSTEM_PROMPT = """\
 {custom}"""
 
 STAGE1_PHASE_PROMPT = """\
-## 当前阶段: Skeleton Plan
-> 你现在的任务是: 通过网络重构建用户需求, 完成 keyword_rewrite 的填充.
-- stage1 只有两种合法输出：
-  - 1. 简短说明后，直接连续输出一个或多个 `<search>` / `<page ...>`。
-  - 2. 简短说明后，直接连续输出完整的 `<keyword_rewrite>`、`<user_need>`、`<verification_outline>` 三个 XML 块。
-- 如果已经拿到 `<tool_results>`，默认目标是尽快产出 skeleton，不要把搜索摘要直接写成最终答案。
-- 只有当你确实连 skeleton 都还写不出来时，才允许再补一次 `<search>` / `<page>`。
-- 如果用户输入的是链接，优先先用 `<page>` 看链接。
-- 只有创意写作、翻译、简单问好、明显不需要联网时，才可以不调用工具直接回答。
+## 当前阶段: PHASE
+- 你需要经过一次工具调用, 随后转入 skeleton，不要尝试找答案, 你的任务是重构用户的需求.
 """
+
+
 
 STAGE1_PAGE_MODE_GUIDANCE = """\
 ## After Page
@@ -56,17 +51,15 @@ STAGE1_WEBSEARCH_MODE_GUIDANCE = """\
 ## After Search
 > 立即直接进入 skeleton，不要改写成总结答案, 不要继续搜索。
 
-
-## keleton Plan
-- 当资料足够进入 skeleton 时，必须且只允许输出以下三个 XML 块，顺序固定：
-  - `<keyword_rewrite>` 内使用 3 - 8 个 `<t>`
-    - 只保留更官方、更稳定、更适合搜索引擎的短词组。
-    - 尽量替换掉用户原话里的口语、误称、模糊称呼、社区黑话，改成相关地区语言、作品正式名、角色正式名、道具正式名、设定正式名、专业术语。
-  - `<user_need>` 内只允许 1 个 `<u>`
-    - 结合图像(如果携带图像—), 一句话复原用户任务 / 需求
-  - `<verification_outline>` 内使用 2 - 8 个 `<i id="n">`
-    - 每个 `<i>` 必须是后续可以独立 search/page 核验的具体句子，不要写空泛概括。
-- 不要输出 markdown 标题，不要输出代码块，不要把这三个 XML 包在 ``` 里。
+## 当前阶段: Skeleton Plan
+> 你现在的任务是: 通过网络重构建用户需求, 完成 keyword_rewrite 的填充.
+- stage1 只有两种合法输出：
+  - 1. 简短说明后，直接连续输出一个或多个 `<search>` / `<page ...>`。
+  - 2. 简短说明后，直接连续输出完整的 `<keyword_rewrite>`、`<user_need>`、`<verification_outline>` 三个 XML 块。
+- 如果已经拿到 `<tool_results>`，默认目标是尽快产出 skeleton，不要把搜索摘要直接写成最终答案。
+- 只有当你确实连 skeleton 都还写不出来时，才允许再补一次 `<search>` / `<page>`。
+- 如果用户输入的是链接，优先先用 `<page>` 看链接。
+- 只有创意写作、翻译、简单问好、明显不需要联网时，才可以不调用工具直接回答。
 """
 
 STAGE2_PHASE_PROMPT = """\

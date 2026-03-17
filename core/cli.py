@@ -375,6 +375,31 @@ def _render_reply_body(text: str, *, preview: bool = False):
     return grid
 
 
+def _render_turn_transcript(
+    *,
+    settled: list[object] | None = None,
+    reply_text: str = "",
+    preview: bool = False,
+    tool_renderable: object | None = None,
+    note_text: str = "",
+    note_style: str | None = None,
+):
+    blocks: list[object] = list(settled or [])
+    if str(reply_text or "").strip():
+        blocks.append(_render_reply_body(reply_text, preview=preview))
+    if tool_renderable is not None:
+        blocks.append(tool_renderable)
+    if str(note_text or "").strip():
+        if blocks:
+            blocks.append(Text(""))
+        blocks.append(Text(str(note_text), style=note_style or TEXT_MUTED))
+    if not blocks:
+        return Text("", style=TEXT_MUTED)
+    if len(blocks) == 1:
+        return blocks[0]
+    return Group(*blocks)
+
+
 def _parse_md_table_row(line: str) -> list[str] | None:
     stripped = str(line or "").strip()
     if "|" not in stripped:
@@ -2250,6 +2275,28 @@ def _run_non_streaming(
     t_start = time.monotonic()
     turn_stats_before = _stats_snapshot(stats)
     settled: list[object] = []
+
+    def _finish_live(
+        *,
+        reply_text: str = "",
+        preview: bool = False,
+        note_text: str = "",
+        note_style: str | None = None,
+    ) -> None:
+        final_block = _render_turn_transcript(
+            settled=settled,
+            reply_text=reply_text,
+            preview=preview,
+            note_text=note_text,
+            note_style=note_style,
+        )
+        try:
+            live.update(final_block, refresh=True)
+            live.transient = False
+            live.stop()
+        except Exception:
+            console.print(final_block)
+
     live = Live(
         _render_live_request_block(
             mode_state=mode_state,
@@ -2304,21 +2351,15 @@ def _run_non_streaming(
             context=context,
         )
     except KeyboardInterrupt:
-        live.stop()
-        console.print(f"\n  [{TEXT_MUTED}]已中断[/{TEXT_MUTED}]")
+        _finish_live(note_text="已中断", note_style=TEXT_MUTED)
         raise
     except Exception as e:
-        live.stop()
-        console.print(f"  [red]错误: {e}[/red]")
+        _finish_live(note_text=f"错误: {e}", note_style="red")
         return ""
 
     text = _clean_answer(answer) if answer else "未获得有效回答。"
     del multi_turn
-    final_blocks = list(settled)
-    final_blocks.append(_render_reply_body(text))
-    live.update(Group(*final_blocks), refresh=True)
-    live.transient = False
-    live.stop()
+    _finish_live(reply_text=text)
     return text
 
 
@@ -2369,6 +2410,35 @@ def _run_streaming(
         if isinstance(tool_renderable, Text) and not tool_renderable.plain.strip():
             return None
         return tool_renderable
+
+    def _finish_live(
+        *,
+        reply_text: str = "",
+        preview: bool = False,
+        note_text: str = "",
+        note_style: str | None = None,
+    ) -> None:
+        with tool_state_lock:
+            tool_renderable = _snapshot_tool_status()
+            tool_states.clear()
+            next_tool_done_index[0] = 0
+        final_block = _render_turn_transcript(
+            settled=settled,
+            reply_text=reply_text,
+            preview=preview,
+            tool_renderable=tool_renderable,
+            note_text=note_text,
+            note_style=note_style,
+        )
+        try:
+            if live:
+                live.update(final_block, refresh=True)
+                live.transient = False
+                live.stop()
+            else:
+                console.print(final_block)
+        except Exception:
+            console.print(final_block)
 
     def _current_live_renderable() -> object:
         preview_text = _clean_answer("".join(chunks))
@@ -2532,34 +2602,25 @@ def _run_streaming(
             context=context,
         )
     except KeyboardInterrupt:
-        if live:
-            live.transient = True
-            live.stop()
-        console.print(f"\n  [{TEXT_MUTED}]已中断[/{TEXT_MUTED}]")
+        _finish_live(
+            reply_text=_clean_answer("".join(chunks)),
+            preview=True,
+            note_text="已中断",
+            note_style=TEXT_MUTED,
+        )
         raise
     except Exception as e:
-        if live:
-            live.transient = True
-            live.stop()
-        console.print(f"  [red]错误: {e}[/red]")
+        _finish_live(
+            reply_text=_clean_answer("".join(chunks)),
+            preview=True,
+            note_text=f"错误: {e}",
+            note_style="red",
+        )
         return ""
 
     text = _clean_answer(answer) if answer else "未获得有效回答。"
     del multi_turn
-    with tool_state_lock:
-        tool_renderable = _snapshot_tool_status()
-        if tool_renderable is not None:
-            settled.append(tool_renderable)
-        tool_states.clear()
-    final_blocks = list(settled)
-    final_blocks.append(_render_reply_body(text))
-    final_block = Group(*final_blocks)
-    if live:
-        live.update(final_block, refresh=True)
-        live.transient = False
-        live.stop()
-    else:
-        console.print(final_block)
+    _finish_live(reply_text=text)
     return text
 
 
@@ -2721,6 +2782,7 @@ def main(argv: list[str] | None = None):
             ctx = last_context if multi else None
 
             try:
+                answer = ""
                 turn_stats_before = _stats_snapshot(session_stats)
                 turn_started_at = time.monotonic()
                 request_config = _session_request_config()
@@ -2754,8 +2816,12 @@ def main(argv: list[str] | None = None):
                     elapsed=time.monotonic() - turn_started_at,
                 )
             except KeyboardInterrupt:
-                console.print()
-                break
+                mode_state["last_turn_stats"] = _stats_delta(
+                    turn_stats_before,
+                    _stats_snapshot(session_stats),
+                    elapsed=time.monotonic() - turn_started_at,
+                )
+                continue
             finally:
                 _cleanup_image_paths(cleanup_paths)
 
