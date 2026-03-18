@@ -1,10 +1,10 @@
 """
-hyw/main.py - 极简 LLM 对话循环 + XML 标签工具调用 + 统计 + 调用日志
+hyw/main.py - 极简 LLM 对话循环 + LiteLLM 原生工具调用 + 统计 + 调用日志
 
 依赖: litellm, hyw/web_search (自带)
 配置: ~/.hyw/config.yml, 兼容单模型与多模型写法
 
-工具调用方式: 模型在文本中输出 <search>/<page> XML 标签, 解析后执行工具, 注入结果再让模型继续.
+工具调用方式: 使用 LiteLLM 原生 tools/function calling.
 """
 from __future__ import annotations
 
@@ -15,6 +15,7 @@ from importlib import import_module
 import json
 import logging
 import mimetypes
+import os
 import re
 import threading
 import time
@@ -25,6 +26,12 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
+from .codex_transport import (
+    message_payload as codex_transport_message_payload,
+    model_response as codex_transport_model_response,
+    should_use_codex_mirror_transport,
+    stream_response as codex_transport_stream_response,
+)
 from .config import (
     CONFIG_PATH,
     DEFAULT_MODEL,
@@ -35,25 +42,41 @@ from .config import (
     load_config,
     resolve_tool_handlers,
 )
-from .prompts import (
+from .prompt import (
     BASE_SYSTEM_PROMPT,
-    CONTEXT_SWITCH_PROMPT,
-    EMPTY_VERIFICATION_OUTLINE_PROMPT,
-    FINAL_PHASE_PROMPT,
-    HEADING_KEYWORD_REWRITE,
-    HEADING_USER_NEED,
-    HEADING_VERIFICATION_CLAIMS,
-    HEADING_VERIFICATION_OUTLINE,
-    STAGE1_IMAGE_GUIDANCE,
-    STAGE1_PAGE_MODE_GUIDANCE,
-    STAGE1_PHASE_PROMPT,
-    STAGE1_RETRY_PROMPT,
-    STAGE1_SKELETON_RETRY_PROMPT,
-    STAGE1_WEBSEARCH_MODE_GUIDANCE,
-    STAGE2_FINAL_REPLY_PROMPT,
-    STAGE2_KICKOFF_PROMPT,
-    STAGE2_PHASE_PROMPT,
-    STAGE2_RETRY_PROMPT,
+    CANDIDATE_EVIDENCE_HEADING,
+    CANDIDATE_EVIDENCE_REPLACEMENT_TEXT,
+    CANDIDATE_EVIDENCE_TEXT,
+    CONTEXT_MANAGEMENT_TOOL_PROMPT,
+    DEFAULT_NO_RESULTS_TEXT,
+    DEFAULT_NO_TITLE_TEXT,
+    DEFAULT_PAGE_NO_MATCHING_CACHED_TEXT,
+    DEFAULT_PAGE_NO_MATCHING_TEXT,
+    DUPLICATE_QUERY_SKIPPED_TEXT,
+    EVIDENCE_CONTEXT_EMPTY_TEXT,
+    EVIDENCE_CONTEXT_HEADING,
+    EVIDENCE_CONTEXT_ID_TEXT,
+    EVIDENCE_CONTEXT_KEPT_TEXT,
+    FIRST_SEARCH_PROMPT,
+    NORMAL_LOOP_PROMPT,
+    POST_SEARCH_SKELETON_PROMPT,
+    POST_SKELETON_REFINE_PROMPT,
+    PAGE_MARKDOWN_CACHE_HIT_TEXT,
+    PAGE_MARKDOWN_CACHE_MISS_TEXT,
+    PAGE_MARKDOWN_CACHE_PREFIX,
+    PAGE_MARKDOWN_EMPTY_TITLE,
+    PAGE_MARKDOWN_KEYWORDS_PREFIX,
+    PAGE_MARKDOWN_MATCHED_LINES_TEXT,
+    PAGE_MARKDOWN_TITLE_PREFIX,
+    PAGE_MARKDOWN_WINDOW_ALL_TEXT,
+    PAGE_MARKDOWN_WINDOW_PREFIX,
+    PAGE_MARKDOWN_WINDOW_SUFFIX,
+    format_context_budget_message,
+    # format_context_delete_markdown,
+    format_context_keep_markdown,
+    format_progressive_budget_error,
+    format_progressive_skeleton_error,
+    litellm_tool_config_for_phase,
 )
 
 
@@ -346,13 +369,13 @@ def _tool_markdown_for_model(name: str, args: dict[str, Any], payload: dict[str,
 
         rows = results if isinstance(results, list) else []
         if not rows:
-            lines.append("No results.")
+            lines.append(DEFAULT_NO_RESULTS_TEXT)
             return "\n".join(lines).strip()
 
         for idx, row in enumerate(rows, start=1):
             if not isinstance(row, dict):
                 continue
-            title = str(row.get("title") or "No Title").strip() or "No Title"
+            title = str(row.get("title") or DEFAULT_NO_TITLE_TEXT).strip() or DEFAULT_NO_TITLE_TEXT
             url = str(row.get("url") or "").strip()
             snippet = str(row.get("snippet") or row.get("intro") or "").strip()
             if url:
@@ -500,7 +523,7 @@ def get_web_search_backend(config: dict[str, Any] | None = None) -> str:
 
 
 _DIRECT_SEARCH_TIMEOUT_S = 12.0
-_DIRECT_PAGE_TIMEOUT_S = 18.0
+_DIRECT_PAGE_TIMEOUT_S = 60.0
 
 
 def _run_async(coro):
@@ -652,7 +675,7 @@ def _public_search_results(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
             continue
         public_rows.append(
             {
-                "title": str(item.get("title") or "").strip() or "No Title",
+                "title": str(item.get("title") or "").strip() or DEFAULT_NO_TITLE_TEXT,
                 "url": str(item.get("url") or "").strip(),
                 "snippet": str(item.get("snippet") or "").strip(),
                 "provider": str(item.get("provider") or "").strip(),
@@ -712,6 +735,12 @@ def _tool_capability(name: str) -> str:
         return "search"
     if name == "page_extract":
         return "page_extract"
+    if name == "context_update":
+        return "context_update"
+    if name == "context_keep":
+        return "context"
+    if name == "context_delete":
+        return "context"
     return ""
 
 
@@ -729,6 +758,9 @@ def _tool_display_name(name: str, *, provider: str = "") -> str:
         "web_search": "websearch",
         "web_search_wiki": "wiki",
         "page_extract": "page",
+        "context_update": "context_update",
+        "context_keep": "context_keep",
+        "context_delete": "context_delete",
     }.get(name, str(name or "").strip())
     prefix = _tool_provider_label(provider)
     return f"{prefix}_{suffix}" if prefix else suffix
@@ -762,7 +794,12 @@ def _tool_provider_from_config(name: str, config: dict[str, Any] | None = None) 
     capability = _tool_capability(name)
     if not capability:
         return ""
-    handlers = resolve_tool_handlers(config, capability)
+    if capability not in {"search", "page_extract", "render"}:
+        return ""
+    try:
+        handlers = resolve_tool_handlers(config, capability)
+    except Exception:
+        return ""
     if not handlers:
         return ""
     return str(handlers[0].provider or "").strip()
@@ -817,196 +854,258 @@ def _tool_callback_args(
     return merged
 
 
-# ── XML 标签工具调用解析 ─────────────────────────────────────
-_TOOL_TAG_RE = re.compile(r"<(search|wiki|page)\b([^>]*)>(.*?)</\1>", re.DOTALL)
-_INLINE_CODE_RE = re.compile(r"`[^`]+`")
-_TASK_LIST_BLOCK_RE = re.compile(r"<task_list\b[^>]*>.*?</task_list>", re.IGNORECASE | re.DOTALL)
-_ARTICLE_SKELETON_BLOCK_RE = re.compile(r"<article_skeleton\b[^>]*>.*?</article_skeleton>", re.IGNORECASE | re.DOTALL)
-_SEARCH_REWRITE_BLOCK_RE = re.compile(r"<search_rewrite\b[^>]*>.*?</search_rewrite>", re.IGNORECASE | re.DOTALL)
-_KEYWORD_REWRITE_BLOCK_RE = re.compile(r"<keyword_rewrite\b[^>]*>.*?</keyword_rewrite>", re.IGNORECASE | re.DOTALL)
-_USER_NEED_BLOCK_RE = re.compile(r"<user_need\b[^>]*>.*?</user_need>", re.IGNORECASE | re.DOTALL)
-_VERIFICATION_OUTLINE_BLOCK_RE = re.compile(r"<verification_outline\b[^>]*>.*?</verification_outline>", re.IGNORECASE | re.DOTALL)
-_MARKDOWN_USER_NEED_HEADING_RE = re.compile(r"^\s{0,3}#{1,6}\s*(?:user need reconstruction|user need restore|用户需求复原|需求复原|user need)\s*$", re.IGNORECASE)
-_MARKDOWN_SEARCH_REWRITE_HEADING_RE = re.compile(r"^\s{0,3}#{1,6}\s*(?:keyword rewrite|关键词重绘|搜索词重绘|search rewrite)\s*$", re.IGNORECASE)
-_MARKDOWN_SKELETON_HEADING_RE = re.compile(r"^\s{0,3}#{1,6}\s*(?:verification outline|verification skeleton|核验骨架|文章骨架|article skeleton|skeleton)\s*$", re.IGNORECASE)
+def _normalize_native_tool_name(name: str) -> str:
+    normalized = str(name or "").strip()
+    aliases = {
+        "search": "web_search",
+        "page": "page_extract",
+    }
+    return aliases.get(normalized, normalized)
 
 
-def _parse_tag_attrs(raw: str) -> dict[str, str]:
-    attrs: dict[str, str] = {}
-    text = str(raw or "")
-    for key, dq, sq in re.findall(r'([:\w-]+)\s*=\s*(?:"([^"]*)"|\'([^\']*)\')', text):
-        value = dq if dq != "" else sq
-        attrs[str(key or "").strip().lower()] = str(value or "").strip()
-    return attrs
+def _tool_arguments_to_dict(raw: Any) -> dict[str, Any]:
+    if isinstance(raw, dict):
+        return dict(raw)
+    if isinstance(raw, str):
+        text = raw.strip()
+        if not text:
+            return {}
+        try:
+            payload = json.loads(text)
+        except Exception:
+            return {}
+        return dict(payload) if isinstance(payload, dict) else {}
+    return {}
 
 
-def _parse_tool_tags(text: str) -> list[dict]:
-    """提取主模型允许的工具 XML 标签。"""
-    # 先去掉 `...` 内联代码，避免匹配到模型解释文本中的标签
-    cleaned = _INLINE_CODE_RE.sub("", text)
-    calls: list[dict] = []
+def _sanitize_native_tool_call(name: str, args: dict[str, Any], *, call_id: str = "") -> dict[str, Any] | None:
+    normalized_name = _normalize_native_tool_name(name)
+    payload = dict(args or {})
+    if normalized_name == "web_search":
+        query = str(payload.get("query") or payload.get("q") or "").strip()
+        if not query:
+            return None
+        clean_args: dict[str, Any] = {"query": query}
+    elif normalized_name == "page_extract":
+        url = str(payload.get("url") or payload.get("target") or "").strip()
+        ref = _normalize_context_ref(str(payload.get("ref") or "").strip())
+        query = str(payload.get("query") or payload.get("keyword") or payload.get("keywords") or "").strip()
+        lines = str(payload.get("lines") or "").strip()
+        if not url and not ref:
+            return None
+        clean_args = {}
+        if url:
+            clean_args["url"] = url
+        if ref:
+            clean_args["ref"] = ref
+        if query:
+            clean_args["query"] = query
+        if lines:
+            clean_args["lines"] = lines
+    elif normalized_name == "context_update":
+        clean_args = {}
+        create = payload.get("create")
+        update = payload.get("update")
+        if isinstance(create, list):
+            clean_args["create"] = [dict(item) for item in create if isinstance(item, dict)]
+        if isinstance(update, list):
+            clean_args["update"] = [dict(item) for item in update if isinstance(item, dict)]
+        if not clean_args:
+            return None
+    elif normalized_name == "context_keep":
+        ids, last_block = _normalize_context_keep_args(payload)
+        if not ids and not last_block:
+            return None
+        clean_args = {}
+        if ids:
+            clean_args["ids"] = ids
+        if last_block:
+            clean_args["last_block"] = True
+    elif normalized_name == "context_delete":
+        ids = _normalize_context_delete_ids(payload.get("ids", []))
+        if not ids:
+            return None
+        clean_args = {"ids": ids}
+    else:
+        return None
+
+    if call_id:
+        clean_args["_call_id"] = call_id
+    return {"name": normalized_name, "args": clean_args}
+
+
+def _parse_native_tool_calls(payload: dict[str, Any] | None) -> list[dict[str, Any]]:
+    if not isinstance(payload, dict):
+        return []
+    raw_tool_calls = payload.get("tool_calls")
+    if not isinstance(raw_tool_calls, list):
+        return []
+
+    calls: list[dict[str, Any]] = []
     seen: set[tuple[str, tuple[tuple[str, str], ...]]] = set()
-    for m in _TOOL_TAG_RE.finditer(cleaned):
-        tag = str(m.group(1) or "").strip().lower()
-        attrs = _parse_tag_attrs(m.group(2))
-        query = m.group(3).strip()
-        if tag == "search":
-            task = query
-            if not task:
-                continue
-            name = "web_search"
-            args = {"query": task}
-        elif tag == "page":
-            task = query
-            url = str(attrs.get("url") or attrs.get("target") or "").strip()
-            if not task or not url:
-                continue
-            name = "page_extract"
-            args = {
-                "url": url,
-                "query": task,
-                "lines": str(attrs.get("lines") or "").strip(),
-            }
-        else:
+    for raw_call in raw_tool_calls:
+        call_payload = _to_dict(raw_call)
+        if not isinstance(call_payload, dict):
+            continue
+        call_id = str(call_payload.get("id") or "").strip()
+        function_payload = call_payload.get("function")
+        if function_payload is None and isinstance(call_payload.get("function_call"), dict):
+            function_payload = call_payload.get("function_call")
+        function_payload = _to_dict(function_payload) if function_payload is not None else {}
+        if not isinstance(function_payload, dict):
+            function_payload = {}
+        name = str(function_payload.get("name") or call_payload.get("name") or "").strip()
+        arguments = _tool_arguments_to_dict(function_payload.get("arguments") or call_payload.get("arguments"))
+        call = _sanitize_native_tool_call(name, arguments, call_id=call_id)
+        if not isinstance(call, dict):
             continue
         signature = (
-            name,
-            tuple(sorted((str(key), str(value)) for key, value in args.items())),
+            str(call.get("name") or "").strip(),
+            tuple(
+                sorted(
+                    (str(key), str(value))
+                    for key, value in (call.get("args") or {}).items()
+                    if str(key) != "_call_id"
+                )
+            ),
         )
         if signature in seen:
             continue
         seen.add(signature)
-        calls.append({"name": name, "args": args})
+        calls.append(call)
     return calls
 
 
-def _strip_tool_tags(text: str) -> str:
-    """从最终回答中去掉工具标签"""
-    cleaned = _TASK_LIST_BLOCK_RE.sub("", str(text or ""))
-    cleaned = _ARTICLE_SKELETON_BLOCK_RE.sub("", cleaned)
-    cleaned = _SEARCH_REWRITE_BLOCK_RE.sub("", cleaned)
-    cleaned = _KEYWORD_REWRITE_BLOCK_RE.sub("", cleaned)
-    cleaned = _USER_NEED_BLOCK_RE.sub("", cleaned)
-    cleaned = _VERIFICATION_OUTLINE_BLOCK_RE.sub("", cleaned)
-    return _TOOL_TAG_RE.sub("", cleaned).strip()
+def _merge_stream_tool_call_deltas(
+    state: dict[int, dict[str, Any]],
+    delta_payload: dict[str, Any],
+) -> None:
+    raw_tool_calls = delta_payload.get("tool_calls")
+    if not isinstance(raw_tool_calls, list):
+        return
+    for fallback_index, raw_call in enumerate(raw_tool_calls):
+        call_payload = _to_dict(raw_call)
+        if not isinstance(call_payload, dict):
+            continue
+        raw_index = call_payload.get("index")
+        try:
+            index = int(raw_index)
+        except Exception:
+            index = fallback_index
+            while index in state:
+                index += 1
+        current = state.setdefault(
+            index,
+            {
+                "id": "",
+                "type": "function",
+                "function": {"name": "", "arguments": ""},
+            },
+        )
+        call_id = str(call_payload.get("id") or "").strip()
+        if call_id:
+            current["id"] = call_id
+        function_payload = _to_dict(call_payload.get("function")) if call_payload.get("function") is not None else {}
+        if not isinstance(function_payload, dict):
+            function_payload = {}
+        name_delta = str(function_payload.get("name") or "")
+        if name_delta:
+            current["function"]["name"] = str(current["function"].get("name") or "") + name_delta
+        arguments_delta = function_payload.get("arguments")
+        if arguments_delta is not None:
+            current["function"]["arguments"] = str(current["function"].get("arguments") or "") + str(arguments_delta)
 
 
-def _format_tool_call_xml(call: dict[str, Any]) -> str:
-    name = str(call.get("name") or "").strip()
-    args = call.get("args") if isinstance(call, dict) else {}
-    if not isinstance(args, dict):
-        args = {}
-    if name == "web_search":
-        return f"<search>{str(args.get('query') or '').strip()}</search>"
-    if name == "page_extract":
-        attrs: list[str] = []
-        url = str(args.get("url") or "").strip()
-        lines = str(args.get("lines") or "").strip()
-        if url:
-            attrs.append(f'url="{url.replace(chr(34), "&quot;")}"')
-        if lines:
-            attrs.append(f'lines="{lines.replace(chr(34), "&quot;")}"')
-        attr_text = (" " + " ".join(attrs)) if attrs else ""
-        return f"<page{attr_text}>{str(args.get('query') or '').strip()}</page>"
+def _finalize_stream_tool_calls(state: dict[int, dict[str, Any]]) -> list[dict[str, Any]]:
+    if not state:
+        return []
+    ordered = [state[index] for index in sorted(state)]
+    return _parse_native_tool_calls({"tool_calls": ordered})
+
+
+def _tool_calls_preview_text(calls: list[dict[str, Any]]) -> str:
+    lines: list[str] = []
+    for call in calls:
+        if not isinstance(call, dict):
+            continue
+        name = str(call.get("name") or "").strip()
+        args = call.get("args") if isinstance(call.get("args"), dict) else {}
+        if name == "web_search":
+            query = str(args.get("query") or "").strip()
+            if query:
+                lines.append(f"[tool] web_search({query})")
+            continue
+        if name == "page_extract":
+            target = str(args.get("ref") or args.get("url") or "").strip()
+            query = str(args.get("query") or "").strip()
+            lines.append(f"[tool] page_extract({target}{', ' + query if query else ''})")
+            continue
+        if name == "context_update":
+            lines.append("[tool] context_update(...)")
+            continue
+        if name == "context_keep":
+            ids = args.get("ids") if isinstance(args, dict) else []
+            last_block = bool(args.get("last_block")) if isinstance(args, dict) else False
+            chunks: list[str] = []
+            if isinstance(ids, list) and ids:
+                chunks.append(", ".join(str(item) for item in ids))
+            if last_block:
+                chunks.append("last_block=true")
+            lines.append(f"[tool] context_keep({'; '.join(chunks) if chunks else '...'})")
+            continue
+        if name == "context_delete":
+            ids = args.get("ids") if isinstance(args, dict) else []
+            if isinstance(ids, list) and ids:
+                lines.append(f"[tool] context_delete({', '.join(str(item) for item in ids)})")
+    return "\n".join(lines).strip()
+
+
+def _normalize_context_ref(value: str) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    text = re.sub(r"\s+", "", text)
+    if re.fullmatch(r"\d+", text):
+        return text
     return ""
 
 
-def _tool_turn_preamble(text: str) -> str:
-    match = _TOOL_TAG_RE.search(str(text or ""))
-    if not match:
-        return _strip_tool_tags(text)
-    return str(text[:match.start()]).strip()
+def _resolve_page_call_refs(calls: list[dict[str, Any]], phase_state: "_PhaseRuntimeState") -> None:
+    if not calls:
+        return
+    for call in calls:
+        if not isinstance(call, dict):
+            continue
+        if str(call.get("name") or "").strip() != "page_extract":
+            continue
+        args = call.get("args") if isinstance(call.get("args"), dict) else None
+        if not isinstance(args, dict):
+            continue
+        if str(args.get("url") or "").strip():
+            continue
+        ref = _normalize_context_ref(str(args.get("ref") or "").strip())
+        if not ref:
+            continue
+        try:
+            item_id = int(ref)
+        except Exception:
+            continue
+        item = _find_context_item(phase_state, item_id)
+        if item is None:
+            continue
+        resolved_url = _normalize_state_url(str(item.data.get("url") or "").strip()) or str(item.data.get("url") or "").strip()
+        if resolved_url:
+            args["url"] = resolved_url
+_TOOL_LIMIT = 8
+
+
+def _clean_model_text(text: str) -> str:
+    return str(text or "").strip()
 
 
 def _normalize_tool_turn_message(text: str, calls: list[dict[str, Any]]) -> str:
-    preamble = _tool_turn_preamble(text)
-    tags = "\n".join(_format_tool_call_xml(call) for call in calls).strip()
-    if preamble and tags:
-        return f"{preamble}\n\n{tags}"
-    return preamble or tags
-
-
-def _tool_tags_only_message(calls: list[dict[str, Any]]) -> str:
-    return "\n".join(_format_tool_call_xml(call) for call in calls).strip()
-
-
-def _strip_tool_xml_only(text: str) -> str:
-    return _TOOL_TAG_RE.sub("", str(text or "")).strip()
-
-
-def _extract_markdown_section_block(
-    text: str,
-    *,
-    heading_re: re.Pattern[str],
-    stop_heading_res: tuple[re.Pattern[str], ...] = (),
-    stop_on_tool_tag: bool = False,
-) -> str:
-    lines = str(text or "").splitlines()
-    start_index: int | None = None
-    for index, raw_line in enumerate(lines):
-        if heading_re.match(str(raw_line or "")):
-            start_index = index
-            break
-    if start_index is None:
-        return ""
-
-    end_index = len(lines)
-    for index in range(start_index + 1, len(lines)):
-        raw_line = str(lines[index] or "")
-        if stop_on_tool_tag and _TOOL_TAG_RE.search(raw_line):
-            end_index = index
-            break
-        if any(pattern.match(raw_line) for pattern in stop_heading_res):
-            end_index = index
-            break
-    return "\n".join(lines[start_index:end_index]).strip()
-
-
-def _extract_article_skeleton(text: str) -> str:
-    match = _VERIFICATION_OUTLINE_BLOCK_RE.search(str(text or ""))
-    if match:
-        return str(match.group(0) or "").strip()
-    match = _ARTICLE_SKELETON_BLOCK_RE.search(str(text or ""))
-    if not match:
-        return _extract_markdown_section_block(
-            str(text or ""),
-            heading_re=_MARKDOWN_SKELETON_HEADING_RE,
-            stop_on_tool_tag=True,
-        )
-    return str(match.group(0) or "").strip()
-
-
-def _extract_search_rewrite(text: str) -> str:
-    match = _KEYWORD_REWRITE_BLOCK_RE.search(str(text or ""))
-    if match:
-        return str(match.group(0) or "").strip()
-    match = _SEARCH_REWRITE_BLOCK_RE.search(str(text or ""))
-    if not match:
-        return _extract_markdown_section_block(
-            str(text or ""),
-            heading_re=_MARKDOWN_SEARCH_REWRITE_HEADING_RE,
-            stop_heading_res=(_MARKDOWN_USER_NEED_HEADING_RE, _MARKDOWN_SKELETON_HEADING_RE),
-            stop_on_tool_tag=True,
-        )
-    return str(match.group(0) or "").strip()
-
-
-def _extract_user_need_restore(text: str) -> str:
-    match = _USER_NEED_BLOCK_RE.search(str(text or ""))
-    if match:
-        return str(match.group(0) or "").strip()
-    return _extract_markdown_section_block(
-        str(text or ""),
-        heading_re=_MARKDOWN_USER_NEED_HEADING_RE,
-        stop_heading_res=(_MARKDOWN_SKELETON_HEADING_RE,),
-        stop_on_tool_tag=True,
-    )
-
-
-_PHASE_STAGE1 = "stage1"
-_PHASE_STAGE2 = "stage2"
-_PHASE_FINAL = "final"
-_PHASE_TOOL_LIMIT = 8
+    del calls
+    return _clean_model_text(text)
 
 def _message_content_text(content: Any) -> str:
     if isinstance(content, str):
@@ -1047,77 +1146,394 @@ def _append_context_messages(msgs: list[dict[str, Any]], context: Any) -> None:
             continue
         msgs.append({"role": role, "content": content})
 
+def _append_search_evidence_items(call: dict[str, Any], payload: dict[str, Any], state: _PhaseRuntimeState) -> list[int]:
+    args = call.get("args") if isinstance(call.get("args"), dict) else {}
+    query = str(args.get("query") or payload.get("query") or "").strip()
+    rows = payload.get("results") if isinstance(payload.get("results"), list) else []
+    created_ids: list[int] = []
+    if not rows:
+        item = _add_context_item(
+            state,
+            "evidence.search",
+            {
+                "query": query,
+                "text": str(payload.get("error") or DEFAULT_NO_RESULTS_TEXT).strip() or DEFAULT_NO_RESULTS_TEXT,
+                "snippet": str(payload.get("error") or DEFAULT_NO_RESULTS_TEXT).strip() or DEFAULT_NO_RESULTS_TEXT,
+            },
+            pending=True,
+        )
+        created_ids.append(item.item_id)
+        return created_ids
 
-def _tool_results_for_next_round(results_xml: str, *, round_i: int, max_rounds: int) -> str:
-    del round_i, max_rounds
-    return str(results_xml or "").strip()
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        item = _add_context_item(
+            state,
+            "evidence.search",
+            {
+                "query": query,
+                "title": str(row.get("title") or DEFAULT_NO_TITLE_TEXT).strip() or DEFAULT_NO_TITLE_TEXT,
+                "url": str(row.get("url") or "").strip(),
+                "snippet": re.sub(r"\s+", " ", str(row.get("snippet") or row.get("intro") or "").strip()),
+            },
+            pending=True,
+        )
+        created_ids.append(item.item_id)
+    return created_ids
 
 
-def _stage1_mode_guidance(phase_state: _PhaseRuntimeState) -> str:
-    mode = str(phase_state.first_collection_mode or "").strip().lower()
-    if mode == "page":
-        return STAGE1_PAGE_MODE_GUIDANCE.strip()
-    return STAGE1_WEBSEARCH_MODE_GUIDANCE.strip()
+def _group_page_matches(matches: list[dict[str, Any]]) -> list[tuple[str, str]]:
+    groups: list[tuple[int, int, list[str]]] = []
+    for item in matches:
+        if not isinstance(item, dict):
+            continue
+        try:
+            line_no = int(item.get("line") or 0)
+        except Exception:
+            continue
+        text = re.sub(r"\s+", " ", str(item.get("text") or "").strip())
+        if not line_no or not text:
+            continue
+        if groups and line_no <= groups[-1][1] + 1:
+            start, _, texts = groups[-1]
+            groups[-1] = (start, line_no, [*texts, text])
+        else:
+            groups.append((line_no, line_no, [text]))
+    rendered: list[tuple[str, str]] = []
+    for start, end, texts in groups:
+        line_span = f"{start}" if start == end else f"{start}-{end}"
+        rendered.append((line_span, "\n".join(texts)))
+    return rendered
 
 
-def _stage1_image_guidance(phase_state: _PhaseRuntimeState) -> str:
-    if not phase_state.input_has_images:
-        return ""
-    return STAGE1_IMAGE_GUIDANCE.strip()
+def _append_page_evidence_items(call: dict[str, Any], payload: dict[str, Any], state: _PhaseRuntimeState) -> list[int]:
+    args = call.get("args") if isinstance(call.get("args"), dict) else {}
+    url = str(payload.get("url") or args.get("url") or "").strip()
+    title = str(payload.get("title") or "").strip()
+    query = str(payload.get("query") or args.get("query") or "").strip()
+    matches = payload.get("matched_lines") if isinstance(payload.get("matched_lines"), list) else []
+    created_ids: list[int] = []
+    grouped = _group_page_matches(matches)
+    if not grouped:
+        item = _add_context_item(
+            state,
+            "evidence.page",
+            {
+                "title": title,
+                "url": url,
+                "query": query,
+                "text": str(payload.get("page_error") or payload.get("error") or DEFAULT_PAGE_NO_MATCHING_TEXT).strip() or DEFAULT_PAGE_NO_MATCHING_TEXT,
+            },
+            pending=True,
+        )
+        created_ids.append(item.item_id)
+        return created_ids
+
+    for source_lines, text in grouped:
+        item = _add_context_item(
+            state,
+            "evidence.page",
+            {
+                "title": title,
+                "url": url,
+                "query": query,
+                "source_lines": source_lines,
+                "text": text,
+            },
+            pending=True,
+        )
+        created_ids.append(item.item_id)
+    return created_ids
 
 
-def _build_phase_prompt(
-    phase: str,
+def _normalize_bool_flag(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    text = str(value or "").strip().lower()
+    return text in {"1", "true", "yes", "y", "on"}
+
+
+def _normalize_context_delete_ids(value: Any) -> list[int]:
+    raw_items: list[Any] = []
+    if isinstance(value, list):
+        raw_items = list(value)
+    elif isinstance(value, str):
+        raw_items = [chunk.strip() for chunk in re.split(r"[,\n|]+", value)]
+
+    ids: list[int] = []
+    seen: set[int] = set()
+    for item in raw_items:
+        try:
+            normalized = int(item)
+        except Exception:
+            continue
+        if normalized in seen or normalized < 0:
+            continue
+        seen.add(normalized)
+        ids.append(normalized)
+    return ids
+
+
+def _normalize_context_keep_args(args: dict[str, Any] | None) -> tuple[list[int], bool]:
+    payload = dict(args or {}) if isinstance(args, dict) else {}
+    ids = _normalize_context_delete_ids(payload.get("ids", []))
+    last_block = _normalize_bool_flag(payload.get("last_block"))
+    return ids, last_block
+
+
+def _context_keep_markdown(
     *,
-    phase_state: _PhaseRuntimeState,
+    kept_ids: list[int],
+    already_kept_ids: list[int],
+    missing_ids: list[int],
+    reason: str = "",
 ) -> str:
-    if phase == _PHASE_STAGE1:
-        parts = [STAGE1_PHASE_PROMPT.strip()]
-        image_guidance = _stage1_image_guidance(phase_state)
-        if image_guidance:
-            parts.append(image_guidance)
-        parts.append(_stage1_mode_guidance(phase_state))
-        return "\n".join(part for part in parts if part).strip()
-    if phase == _PHASE_FINAL:
-        return FINAL_PHASE_PROMPT.strip()
+    return format_context_keep_markdown(
+        kept_ids=kept_ids,
+        already_kept_ids=already_kept_ids,
+        missing_ids=missing_ids,
+        reason=reason,
+    )
 
-    skeleton_parts: list[str] = []
-    user_need_context = _user_need_context_text(phase_state)
-    if user_need_context:
-        skeleton_parts.append(user_need_context)
-    search_rewrite_context = _search_rewrite_context_text(phase_state)
-    if search_rewrite_context:
-        skeleton_parts.append(search_rewrite_context)
-    if phase_state.skeleton_xml:
-        skeleton_parts.append(HEADING_VERIFICATION_OUTLINE)
-        skeleton_parts.append(phase_state.skeleton_xml)
-    claim_checklist = _claim_checklist_text(phase_state)
-    if claim_checklist:
-        skeleton_parts.append(claim_checklist)
-    context = "\n\n".join(part for part in skeleton_parts if part).strip()
-    parts = [
-        STAGE2_PHASE_PROMPT.format(
-            skeleton_context=context or EMPTY_VERIFICATION_OUTLINE_PROMPT,
-        ).strip()
+
+def _context_delete_markdown(
+    *,
+    deleted_ids: list[int],
+    missing_ids: list[int],
+    reason: str = "",
+) -> str:
+    return format_context_delete_markdown(
+        deleted_ids=deleted_ids,
+        missing_ids=missing_ids,
+        reason=reason,
+    )
+
+
+def _keep_session_context_refs(
+    state: "_PhaseRuntimeState",
+    ids: list[int],
+    *,
+    last_block: bool = False,
+    reason: str = "",
+) -> dict[str, Any]:
+    requested_ids: list[int] = []
+    seen: set[int] = set()
+    for item_id in ids:
+        if item_id in seen:
+            continue
+        seen.add(item_id)
+        requested_ids.append(item_id)
+    if last_block:
+        for raw_id in state.last_tool_block_ids:
+            try:
+                item_id = int(raw_id)
+            except Exception:
+                continue
+            if item_id in seen:
+                continue
+            seen.add(item_id)
+            requested_ids.append(item_id)
+
+    if not requested_ids:
+        return {
+            "ok": False,
+            "error": "no valid ids to keep",
+            "kept_ids": [],
+            "already_kept_ids": [],
+            "missing_ids": [],
+            "_model_markdown": _context_keep_markdown(
+                kept_ids=[],
+                already_kept_ids=[],
+                missing_ids=[],
+                reason=reason,
+            ),
+        }
+
+    kept_map = {
+        int(item.item_id): item
+        for item in state.items
+        if item.item_type.startswith("evidence.")
+    }
+    pending_map = {
+        int(item.item_id): item
+        for item in state.pending_items
+        if item.item_type.startswith("evidence.")
+    }
+
+    kept_ids: list[int] = []
+    already_kept_ids: list[int] = []
+    missing_ids: list[int] = []
+    moved_items: list[_ContextItem] = []
+
+    for item_id in requested_ids:
+        if item_id in kept_map:
+            already_kept_ids.append(item_id)
+            continue
+        item = pending_map.get(item_id)
+        if item is None:
+            missing_ids.append(item_id)
+            continue
+        kept_ids.append(item_id)
+        moved_items.append(item)
+
+    if moved_items:
+        moved_id_set = {int(item.item_id) for item in moved_items}
+        state.pending_items = [item for item in state.pending_items if int(item.item_id) not in moved_id_set]
+        state.items.extend(moved_items)
+
+    return {
+        "ok": bool(kept_ids),
+        "kept_ids": kept_ids,
+        "already_kept_ids": already_kept_ids,
+        "missing_ids": missing_ids,
+        "reason": reason,
+        "count": len(kept_ids),
+        "_model_markdown": _context_keep_markdown(
+            kept_ids=kept_ids,
+            already_kept_ids=already_kept_ids,
+            missing_ids=missing_ids,
+            reason=reason,
+        ),
+    }
+
+
+def _delete_session_context_refs(
+    state: "_PhaseRuntimeState",
+    ids: list[int],
+    *,
+    reason: str = "",
+) -> dict[str, Any]:
+    normalized_ids = _normalize_context_delete_ids(ids)
+    if not normalized_ids:
+        return {
+            "ok": False,
+            "error": "no valid ids to delete",
+            "deleted_ids": [],
+            "missing_ids": [],
+            "_model_markdown": _context_delete_markdown(deleted_ids=[], missing_ids=[], reason=reason),
+        }
+
+    found_ids = {
+        int(item.item_id)
+        for item in [*state.items, *state.pending_items]
+        if item.item_type.startswith("evidence.")
+    }
+    deleted_ids: list[int] = [item_id for item_id in normalized_ids if item_id in found_ids]
+    missing_ids: list[int] = [item_id for item_id in normalized_ids if item_id not in found_ids]
+    deleted_id_set = set(deleted_ids)
+    state.items = [
+        item
+        for item in state.items
+        if not (item.item_type.startswith("evidence.") and int(item.item_id) in deleted_id_set)
     ]
-    if int(phase_state.stage2_turns or 0) >= 2:
-        parts.append(STAGE2_FINAL_REPLY_PROMPT.strip())
-    return "\n\n".join(part for part in parts if part).strip()
+    state.pending_items = [
+        item
+        for item in state.pending_items
+        if not (item.item_type.startswith("evidence.") and int(item.item_id) in deleted_id_set)
+    ]
+    return {
+        "ok": bool(deleted_ids),
+        "deleted_ids": deleted_ids,
+        "missing_ids": missing_ids,
+        "reason": reason,
+        "count": len(deleted_ids),
+        "_model_markdown": _context_delete_markdown(
+            deleted_ids=deleted_ids,
+            missing_ids=missing_ids,
+            reason=reason,
+        ),
+    }
 
 
-def _build_system_prompt(
-    cfg: dict,
+def _build_accumulated_context_message(state: "_PhaseRuntimeState") -> str:
+    evidence_items = _evidence_items(state)
+    candidate_items = _candidate_evidence_items(state)
+    if not evidence_items and not candidate_items and not state.pending_user_note:
+        return ""
+    parts = [EVIDENCE_CONTEXT_HEADING]
+    if evidence_items:
+        parts.extend(
+            [
+                EVIDENCE_CONTEXT_KEPT_TEXT,
+                EVIDENCE_CONTEXT_ID_TEXT,
+            ]
+        )
+    else:
+        parts.append(EVIDENCE_CONTEXT_EMPTY_TEXT)
+    for item in evidence_items:
+        data = dict(item.data)
+        parts.append(f"[{item.item_id}] {item.item_type}")
+        for key in ("query", "title", "url", "snippet", "source_lines", "text"):
+            value = str(data.get(key) or "").strip()
+            if value:
+                parts.append(f"{key}: {value}")
+        parts.append("")
+    if candidate_items:
+        parts.extend(
+            [
+                "",
+                CANDIDATE_EVIDENCE_HEADING,
+                CANDIDATE_EVIDENCE_TEXT,
+                CANDIDATE_EVIDENCE_REPLACEMENT_TEXT,
+            ]
+        )
+        for item in candidate_items:
+            data = dict(item.data)
+            parts.append(f"[{item.item_id}] {item.item_type}")
+            for key in ("query", "title", "url", "snippet", "source_lines", "text"):
+                value = str(data.get(key) or "").strip()
+                if value:
+                    parts.append(f"{key}: {value}")
+            parts.append("")
+    if state.pending_user_note:
+        parts.extend(["", state.pending_user_note])
+    return "\n".join(part for part in parts if str(part).strip()).strip()
+
+
+def _render_skeleton_markdown(state: "_PhaseRuntimeState") -> str:
+    lines = ["# Skeleton Context"]
+    skeleton_items = _skeleton_items(state)
+    if not skeleton_items:
+        lines.extend(["", "- Skeleton not built yet."])
+        return "\n".join(lines).strip()
+    for item in skeleton_items:
+        data = dict(item.data)
+        lines.extend(["", f"[{item.item_id}] {item.item_type}"])
+        if str(data.get("claim_id") or "").strip():
+            lines.append(f"claim_id: {str(data.get('claim_id') or '').strip()}")
+        text = str(data.get("text") or "").strip()
+        if text:
+            lines.append(f"text: {text}")
+    return "\n".join(lines).strip()
+
+
+def _build_skeleton_context_message(state: "_PhaseRuntimeState") -> str:
+    return _render_skeleton_markdown(state)
+
+
+def _build_round_brief_message(state: "_PhaseRuntimeState") -> str:
+    prompts: list[str] = []
+    if state.disclosure_step <= 0:
+        prompts.append(FIRST_SEARCH_PROMPT.strip())
+    elif state.disclosure_step == 1:
+        prompts.append(POST_SEARCH_SKELETON_PROMPT.strip())
+    elif state.disclosure_step == 2 and not state.disclosure_refine_consumed:
+        prompts.append(POST_SKELETON_REFINE_PROMPT.strip())
+    return "\n\n".join(part for part in prompts if str(part).strip()).strip()
+
+
+def _build_loop_system_prompt(
+    cfg: dict[str, Any],
     user_message: str = "",
     *,
-    phase: str = _PHASE_STAGE1,
-    phase_state: _PhaseRuntimeState | None = None,
+    disclosure_step: int = 0,
 ) -> str:
     custom = str(cfg.get("system_prompt") or "").strip()
     name = str(cfg.get("name") or DEFAULT_NAME).strip()
-    current_phase_state = phase_state or _PhaseRuntimeState()
-    display_user_message = user_message
-    if phase in {_PHASE_STAGE2, _PHASE_FINAL} and current_phase_state.search_rewrite_terms:
-        display_user_message = CONTEXT_SWITCH_PROMPT
+    context_management_tool_prompt = ""
+    if int(disclosure_step) > 0:
+        context_management_tool_prompt = CONTEXT_MANAGEMENT_TOOL_PROMPT.strip()
     return "\n\n".join(
         part
         for part in (
@@ -1126,12 +1542,90 @@ def _build_system_prompt(
                 language=cfg.get("language") or "zh-CN",
                 time=datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z"),
                 custom=(custom + "\n") if custom else "",
-                user_message=display_user_message,
+                context_management_tool_prompt=(context_management_tool_prompt + "\n") if context_management_tool_prompt else "",
+                user_message=user_message,
             ).strip(),
-            _build_phase_prompt(phase, phase_state=current_phase_state),
+            NORMAL_LOOP_PROMPT.strip(),
         )
         if part
     ).strip()
+
+
+def _build_loop_messages(
+    *,
+    cfg: dict[str, Any],
+    prompt_text: str,
+    history: list[dict[str, Any]],
+    state: _PhaseRuntimeState,
+    context: Any = None,
+) -> list[dict[str, Any]]:
+    msgs: list[dict[str, Any]] = [
+        {
+            "role": "system",
+            "content": _build_loop_system_prompt(
+                cfg,
+                prompt_text,
+                disclosure_step=state.disclosure_step,
+            ),
+        }
+    ]
+    _append_context_messages(msgs, context)
+    for item in history:
+        if not isinstance(item, dict):
+            continue
+        role = str(item.get("role") or "").strip().lower()
+        if role not in {"user", "assistant"}:
+            continue
+        content = item.get("content")
+        if not _message_content_text(content):
+            continue
+        msgs.append({"role": role, "content": deepcopy(content)})
+    round_brief = _build_round_brief_message(state)
+    if round_brief:
+        msgs.append({"role": "user", "content": round_brief})
+        if state.disclosure_step == 2:
+            state.disclosure_refine_consumed = True
+    skeleton_message = _build_skeleton_context_message(state)
+    if skeleton_message:
+        msgs.append({"role": "user", "content": skeleton_message})
+    context_message = _build_accumulated_context_message(state)
+    if context_message:
+        msgs.append({"role": "user", "content": context_message})
+    return msgs
+
+
+def _estimate_messages_tokens(model: str, messages: list[dict[str, Any]]) -> int:
+    parts: list[str] = []
+    for item in messages:
+        if not isinstance(item, dict):
+            continue
+        role = str(item.get("role") or "").strip()
+        content = _format_log_message_content(item.get("content"))
+        if not content:
+            continue
+        parts.append(f"[{role}]\n{content}")
+    return _estimate_text_tokens(model, "\n\n".join(parts).strip())
+
+
+def _budget_warning_message(token_estimate: int) -> str:
+    return format_context_budget_message(token_estimate)
+
+
+def _apply_input_budget_message(
+    *,
+    cfg: dict[str, Any],
+    state: _PhaseRuntimeState,
+    messages: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    model = str(cfg.get("model") or DEFAULT_MODEL).strip()
+    estimate = _estimate_messages_tokens(model, messages)
+    state.last_input_token_estimate = estimate
+    if estimate <= 5000:
+        return messages
+    budget_message = _budget_warning_message(estimate)
+    patched = [*messages, {"role": "user", "content": budget_message}]
+    state.last_input_token_estimate = _estimate_messages_tokens(model, patched)
+    return patched
 
 
 def _format_model_error_message(exc: Exception) -> str:
@@ -1242,8 +1736,8 @@ def _resolve_max_rounds(cfg: dict[str, Any]) -> int:
     try:
         value = int(str(cfg.get("max_rounds") or "").strip())
     except Exception:
-        value = 8
-    return max(2, min(value or 8, 16))
+        value = 15
+    return max(2, min(value or 15, 32))
 
 
 _INLINE_IMAGE_BASE64_PREFIXES = (
@@ -1314,7 +1808,18 @@ def _build_multimodal_content(question: str, image_paths: list[str] | None = Non
 def _block_has_model_overrides(block: Any) -> bool:
     if not isinstance(block, dict):
         return False
-    for key in ("model", "api_key", "api_base", "reasoning_effort", "max_tokens", "max_completion_tokens"):
+    for key in (
+        "model",
+        "model_provider",
+        "custom_llm_provider",
+        "api_key",
+        "api_key_env",
+        "api_base",
+        "wire_api",
+        "reasoning_effort",
+        "max_tokens",
+        "max_completion_tokens",
+    ):
         if block.get(key) not in (None, ""):
             return True
     return isinstance(block.get("extra_body"), dict)
@@ -1335,13 +1840,24 @@ def _build_override_model_config(cfg: dict[str, Any], *paths: str) -> dict[str, 
     explicit_transport_override = False
     explicit_reasoning_override = False
     explicit_limit_override = False
-    for key in ("model", "api_key", "api_base", "reasoning_effort", "max_tokens", "max_completion_tokens"):
+    for key in (
+        "model",
+        "model_provider",
+        "custom_llm_provider",
+        "api_key",
+        "api_key_env",
+        "api_base",
+        "wire_api",
+        "reasoning_effort",
+        "max_tokens",
+        "max_completion_tokens",
+    ):
         value = block.get(key)
         if value in (None, ""):
             continue
         child_cfg[key] = deepcopy(value)
         has_override = True
-        if key in {"model", "api_key", "api_base"}:
+        if key in {"model", "model_provider", "custom_llm_provider", "api_key", "api_key_env", "api_base", "wire_api"}:
             explicit_transport_override = True
         if key == "reasoning_effort":
             explicit_reasoning_override = True
@@ -1366,7 +1882,17 @@ def _build_override_model_config(cfg: dict[str, Any], *paths: str) -> dict[str, 
     child_profile: dict[str, Any] = {
         "model": str(child_cfg.get("model") or cfg.get("model") or DEFAULT_MODEL).strip() or DEFAULT_MODEL,
     }
-    for key in ("api_key", "api_base", "reasoning_effort", "max_tokens", "max_completion_tokens"):
+    for key in (
+        "model_provider",
+        "custom_llm_provider",
+        "api_key",
+        "api_key_env",
+        "api_base",
+        "wire_api",
+        "reasoning_effort",
+        "max_tokens",
+        "max_completion_tokens",
+    ):
         value = child_cfg.get(key)
         if value in (None, ""):
             continue
@@ -1426,28 +1952,23 @@ class _SessionRuntimeState:
 
 
 @dataclass
-class _SkeletonClaim:
-    claim_id: str
-    text: str
-    section: str = ""
+class _ContextItem:
+    item_id: int
+    item_type: str
+    data: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
 class _PhaseRuntimeState:
-    phase: str = _PHASE_STAGE1
-    skeleton_xml: str = ""
-    skeleton_title: str = ""
-    claims: list[_SkeletonClaim] = field(default_factory=list)
-    user_need_markdown: str = ""
-    user_need_items: list[str] = field(default_factory=list)
-    search_rewrite_xml: str = ""
-    search_rewrite_terms: list[str] = field(default_factory=list)
-    first_collection_mode: str = ""
+    items: list[_ContextItem] = field(default_factory=list)
+    pending_items: list[_ContextItem] = field(default_factory=list)
+    next_item_id: int = 0
+    pending_user_note: str = ""
+    last_tool_block_ids: list[str] = field(default_factory=list)
     input_has_images: bool = False
-    stage2_turns: int = 0
-    execute_tool_rounds: int = 0
-    execute_search_rounds: int = 0
-    execute_page_rounds: int = 0
+    disclosure_step: int = 0
+    disclosure_refine_consumed: bool = False
+    last_input_token_estimate: int = 0
 
 
 def _truncate_text(text: Any, limit: int = 240) -> str:
@@ -1498,221 +2019,148 @@ def _normalize_search_query(query: str) -> str:
     return text.lower()
 
 
-def _parse_article_skeleton(block: str) -> tuple[str, list[_SkeletonClaim]]:
-    text = str(block or "").strip()
-    if not text:
-        return "", []
-
-    claims: list[_SkeletonClaim] = []
-    seen_ids: set[str] = set()
-
-    if "<verification_outline" in text.lower():
-        for claim_match in re.finditer(r"<i\b[^>]*\bid\s*=\s*['\"]?(\d+)['\"]?[^>]*>(.*?)</i>", text, flags=re.IGNORECASE | re.DOTALL):
-            claim_id = str(claim_match.group(1) or "").strip()
-            claim_text = re.sub(r"\s+", " ", str(claim_match.group(2) or "").strip())
-            if not claim_id or not claim_text or claim_id in seen_ids:
-                continue
-            seen_ids.add(claim_id)
-            claims.append(_SkeletonClaim(claim_id=claim_id, text=claim_text))
-        return "", claims
-
-    if "<article_skeleton" in text.lower():
-        title_match = re.search(r"<title\b[^>]*>(.*?)</title>", text, flags=re.IGNORECASE | re.DOTALL)
-        title = re.sub(r"\s+", " ", str(title_match.group(1) or "").strip()) if title_match else ""
-
-        section_matches = list(
-            re.finditer(r"<section\b([^>]*)>(.*?)</section>", text, flags=re.IGNORECASE | re.DOTALL)
-        )
-        if section_matches:
-            for match in section_matches:
-                attrs = _parse_tag_attrs(match.group(1))
-                section_name = str(attrs.get("name") or attrs.get("title") or "").strip()
-                body = str(match.group(2) or "")
-                for claim_match in re.finditer(r"^\s*(?:[-*]\s*)?\[(\d+)\]\s+(.+?)\s*$", body, flags=re.MULTILINE):
-                    claim_id = str(claim_match.group(1) or "").strip()
-                    claim_text = re.sub(r"\s+", " ", str(claim_match.group(2) or "").strip())
-                    if not claim_id or not claim_text or claim_id in seen_ids:
-                        continue
-                    seen_ids.add(claim_id)
-                    claims.append(_SkeletonClaim(claim_id=claim_id, text=claim_text, section=section_name))
-            return title, claims
-
-        for claim_match in re.finditer(r"^\s*(?:[-*]\s*)?\[(\d+)\]\s+(.+?)\s*$", text, flags=re.MULTILINE):
-            claim_id = str(claim_match.group(1) or "").strip()
-            claim_text = re.sub(r"\s+", " ", str(claim_match.group(2) or "").strip())
-            if not claim_id or not claim_text or claim_id in seen_ids:
-                continue
-            seen_ids.add(claim_id)
-            claims.append(_SkeletonClaim(claim_id=claim_id, text=claim_text))
-        return title, claims
-
-    title = ""
-    current_section = ""
-    lines = text.splitlines()
-    if lines and _MARKDOWN_SKELETON_HEADING_RE.match(lines[0]):
-        lines = lines[1:]
-    for raw_line in lines:
-        line = str(raw_line or "").rstrip()
-        stripped = line.strip()
-        if not stripped:
-            continue
-        heading_match = re.match(r"^\s{0,3}(#{1,6})\s+(.+?)\s*$", line)
-        if heading_match:
-            heading_text = re.sub(r"\s+", " ", str(heading_match.group(2) or "").strip())
-            if not title:
-                title = heading_text
-            else:
-                current_section = heading_text
-            continue
-        title_match = re.match(r"^\s*title\s*:\s*(.+?)\s*$", stripped, flags=re.IGNORECASE)
-        if title_match and not title:
-            title = re.sub(r"\s+", " ", str(title_match.group(1) or "").strip())
-            continue
-        claim_match = re.match(r"^\s*(?:[-*]\s*)?\[(\d+)\]\s+(.+?)\s*$", line)
-        if not claim_match:
-            continue
-        claim_id = str(claim_match.group(1) or "").strip()
-        claim_text = re.sub(r"\s+", " ", str(claim_match.group(2) or "").strip())
-        if not claim_id or not claim_text or claim_id in seen_ids:
-            continue
-        seen_ids.add(claim_id)
-        claims.append(_SkeletonClaim(claim_id=claim_id, text=claim_text, section=current_section))
-    return title, claims
+def _next_context_item_id(state: _PhaseRuntimeState) -> int:
+    item_id = int(state.next_item_id)
+    state.next_item_id += 1
+    return item_id
 
 
-def _update_skeleton_state(phase_state: _PhaseRuntimeState, block: str) -> bool:
-    title, claims = _parse_article_skeleton(block)
-    if not block.strip():
-        return False
-    if not claims:
-        return False
-    phase_state.skeleton_xml = block.strip()
-    phase_state.skeleton_title = title
-    phase_state.claims = claims
-    return True
+def _add_context_item(
+    state: _PhaseRuntimeState,
+    item_type: str,
+    data: dict[str, Any],
+    *,
+    pending: bool = False,
+) -> _ContextItem:
+    item = _ContextItem(item_id=_next_context_item_id(state), item_type=str(item_type).strip(), data=dict(data))
+    target = state.pending_items if pending else state.items
+    target.append(item)
+    return item
 
 
-def _parse_user_need_items(block: str) -> list[str]:
-    text = str(block or "").strip()
-    if not text:
-        return []
-    if "<user_need" in text.lower():
-        items: list[str] = []
-        seen: set[str] = set()
-        for match in re.finditer(r"<u\b[^>]*>(.*?)</u>", text, flags=re.IGNORECASE | re.DOTALL):
-            item = re.sub(r"\s+", " ", str(match.group(1) or "").strip())
-            normalized = item.lower()
-            if not item or normalized in seen:
-                continue
-            seen.add(normalized)
-            items.append(item)
-        return items[:6]
-    items: list[str] = []
-    seen: set[str] = set()
-    lines = text.splitlines()
-    if lines and _MARKDOWN_USER_NEED_HEADING_RE.match(lines[0]):
-        lines = lines[1:]
-    for line in lines:
-        candidate = re.sub(r"^\s*(?:[-*]|\d+[.)]|\[[^\]]+\])\s*", "", str(line or "").strip())
-        candidate = re.sub(r"\s+", " ", candidate).strip()
-        normalized = candidate.lower()
-        if not candidate or normalized in seen:
-            continue
-        seen.add(normalized)
-        items.append(candidate)
-    return items[:6]
+def _find_context_item(state: _PhaseRuntimeState, item_id: int) -> _ContextItem | None:
+    for item in [*state.items, *state.pending_items]:
+        if int(item.item_id) == int(item_id):
+            return item
+    return None
 
 
-def _update_user_need_state(phase_state: _PhaseRuntimeState, block: str) -> bool:
-    items = _parse_user_need_items(block)
-    if not block.strip() or not items:
-        return False
-    phase_state.user_need_markdown = block.strip()
-    phase_state.user_need_items = items
-    return True
+def _iter_context_items(
+    state: _PhaseRuntimeState,
+    prefix: str = "",
+    *,
+    include_pending: bool = False,
+) -> list[_ContextItem]:
+    source = [*state.items, *state.pending_items] if include_pending else state.items
+    items = sorted(source, key=lambda item: int(item.item_id))
+    if not prefix:
+        return items
+    return [item for item in items if item.item_type.startswith(prefix)]
 
 
-def _user_need_context_text(phase_state: _PhaseRuntimeState) -> str:
-    if not phase_state.user_need_items:
-        return ""
-    lines = ["# User Need Reconstruction"]
-    for index, item in enumerate(phase_state.user_need_items, start=1):
-        lines.append(f"{index}. {item}")
+def _skeleton_items(state: _PhaseRuntimeState) -> list[_ContextItem]:
+    return _iter_context_items(state, "skeleton.")
+
+
+def _evidence_items(state: _PhaseRuntimeState) -> list[_ContextItem]:
+    return _iter_context_items(state, "evidence.")
+
+
+def _candidate_evidence_items(state: _PhaseRuntimeState) -> list[_ContextItem]:
+    return sorted(
+        [item for item in state.pending_items if item.item_type.startswith("evidence.")],
+        key=lambda item: int(item.item_id),
+    )
+
+
+def _normalize_context_item_type(value: str) -> str:
+    text = str(value or "").strip().lower()
+    aliases = {
+        "project_language": "skeleton.project_language",
+        "keyword": "skeleton.keyword",
+        "user_need": "skeleton.user_need",
+        "claim": "skeleton.claim",
+        "search": "evidence.search",
+        "page": "evidence.page",
+    }
+    return aliases.get(text, text)
+
+
+def _clean_context_item_data(item_type: str, payload: dict[str, Any]) -> dict[str, Any]:
+    cleaned: dict[str, Any] = {}
+    for key in ("text", "title", "url", "snippet", "source_lines", "claim_id", "query"):
+        value = str(payload.get(key) or "").strip()
+        if value:
+            cleaned[key] = value
+    if item_type == "skeleton.project_language" and "text" not in cleaned:
+        value = str(payload.get("project_language") or "").strip()
+        if value:
+            cleaned["text"] = value
+    return cleaned
+
+
+def _context_update_markdown(
+    *,
+    created: list[int],
+    updated: list[int],
+    missing: list[int],
+) -> str:
+    lines = ["# Context Update", ""]
+    lines.append(f"Created: {', '.join(str(item) for item in created) if created else 'none'}")
+    lines.append(f"Updated: {', '.join(str(item) for item in updated) if updated else 'none'}")
+    if missing:
+        lines.append(f"Missing: {', '.join(str(item) for item in missing)}")
     return "\n".join(lines).strip()
 
 
-def _claim_checklist_text(phase_state: _PhaseRuntimeState) -> str:
-    if not phase_state.claims:
-        return ""
-    lines = ["# Verification Claims"]
-    for claim in phase_state.claims:
-        section_prefix = f"{claim.section} / " if claim.section else ""
-        lines.append(f"[{claim.claim_id}] {section_prefix}{claim.text}")
-    return "\n".join(lines).strip()
+def _apply_context_update(
+    state: _PhaseRuntimeState,
+    args: dict[str, Any],
+) -> dict[str, Any]:
+    created_ids: list[int] = []
+    updated_ids: list[int] = []
+    missing_ids: list[int] = []
 
-
-def _parse_search_rewrite_terms(block: str) -> list[str]:
-    text = str(block or "").strip()
-    if not text:
-        return []
-
-    terms: list[str] = []
-    seen: set[str] = set()
-
-    if "<keyword_rewrite" in text.lower():
-        for match in re.finditer(r"<t\b[^>]*>(.*?)</t>", text, flags=re.IGNORECASE | re.DOTALL):
-            term = re.sub(r"\s+", " ", str(match.group(1) or "").strip())
-            normalized = term.lower()
-            if not term or normalized in seen:
-                continue
-            seen.add(normalized)
-            terms.append(term)
-        return terms[:12]
-
-    if "<search_rewrite" in text.lower():
-        for match in re.finditer(r"<term\b[^>]*>(.*?)</term>", text, flags=re.IGNORECASE | re.DOTALL):
-            term = re.sub(r"\s+", " ", str(match.group(1) or "").strip())
-            normalized = term.lower()
-            if not term or normalized in seen:
-                continue
-            seen.add(normalized)
-            terms.append(term)
-        if terms:
-            return terms[:12]
-        text = re.sub(r"</?search_rewrite\b[^>]*>", "", text, flags=re.IGNORECASE)
-
-    lines = text.splitlines()
-    if lines and _MARKDOWN_SEARCH_REWRITE_HEADING_RE.match(lines[0]):
-        lines = lines[1:]
-    for line in lines:
-        if _MARKDOWN_SKELETON_HEADING_RE.match(str(line or "")):
-            break
-        candidate = re.sub(r"^\s*(?:[-*]|\d+[.)]|\[[^\]]+\])\s*", "", str(line or "").strip())
-        candidate = re.sub(r"\s+", " ", candidate).strip()
-        normalized = candidate.lower()
-        if not candidate or normalized in seen:
+    for item in args.get("create", []) if isinstance(args.get("create"), list) else []:
+        if not isinstance(item, dict):
             continue
-        seen.add(normalized)
-        terms.append(candidate)
-    return terms[:12]
+        item_type = _normalize_context_item_type(str(item.get("type") or "").strip())
+        if not item_type:
+            continue
+        data = _clean_context_item_data(item_type, item)
+        if not data:
+            continue
+        created = _add_context_item(state, item_type, data)
+        created_ids.append(created.item_id)
 
+    for item in args.get("update", []) if isinstance(args.get("update"), list) else []:
+        if not isinstance(item, dict):
+            continue
+        try:
+            item_id = int(item.get("id"))
+        except Exception:
+            continue
+        current = _find_context_item(state, item_id)
+        if current is None:
+            missing_ids.append(item_id)
+            continue
+        data = _clean_context_item_data(current.item_type, item)
+        if not data:
+            continue
+        current.data.update(data)
+        updated_ids.append(item_id)
 
-def _update_search_rewrite_state(phase_state: _PhaseRuntimeState, block: str) -> bool:
-    terms = _parse_search_rewrite_terms(block)
-    if not block.strip() or not terms:
-        return False
-    phase_state.search_rewrite_xml = block.strip()
-    phase_state.search_rewrite_terms = terms
-    return True
-
-
-def _search_rewrite_context_text(phase_state: _PhaseRuntimeState) -> str:
-    if not phase_state.search_rewrite_terms:
-        return ""
-    lines = ["# Keyword Rewrite"]
-    for index, term in enumerate(phase_state.search_rewrite_terms, start=1):
-        lines.append(f"{index}. {term}")
-    return "\n".join(lines).strip()
+    return {
+        "ok": bool(created_ids or updated_ids),
+        "created_ids": created_ids,
+        "updated_ids": updated_ids,
+        "missing_ids": missing_ids,
+        "_model_markdown": _context_update_markdown(
+            created=created_ids,
+            updated=updated_ids,
+            missing=missing_ids,
+        ),
+    }
 
 
 def _merge_search_results(
@@ -1746,7 +2194,7 @@ def _merge_search_results(
         raw_url = str(row.get("url") or "").strip()
         url = _normalize_state_url(raw_url)
         key = url or f"fallback::{next_order}"
-        title = str(row.get("title") or "").strip() or "No Title"
+        title = str(row.get("title") or "").strip() or DEFAULT_NO_TITLE_TEXT
         snippet = str(row.get("snippet") or row.get("intro") or "").strip()
         provider = str(row.get("provider") or "").strip()
         domain = _url_domain(url)
@@ -1813,16 +2261,16 @@ def _build_search_payload_markdown(
         "",
     ]
     if skipped_duplicate:
-        lines.append("Skipped duplicate query from this session.")
+        lines.append(DUPLICATE_QUERY_SKIPPED_TEXT)
         return "\n".join(lines).strip()
     if error:
         lines.append(error)
         return "\n".join(lines).strip()
     if not public_results:
-        lines.append("No results.")
+        lines.append(DEFAULT_NO_RESULTS_TEXT)
         return "\n".join(lines).strip()
     for index, item in enumerate(public_results, start=1):
-        title = str(item.get("title") or "No Title").strip() or "No Title"
+        title = str(item.get("title") or DEFAULT_NO_TITLE_TEXT).strip() or DEFAULT_NO_TITLE_TEXT
         url = str(item.get("url") or "").strip()
         snippet = _truncate_text(item.get("snippet") or "", 180)
         matched_queries = [
@@ -1856,12 +2304,13 @@ def _run_direct_web_search(
     skipped_duplicate = _search_history_contains(runtime_state, query_text)
     if skipped_duplicate:
         return {
-            "ok": True,
+            "ok": False,
             "provider": _tool_provider_from_config("web_search", cfg),
             "query": query_text,
             "count": 0,
             "results": [],
             "skipped_duplicate": True,
+            "error": "duplicate query skipped in this session",
             "_model_markdown": _build_search_payload_markdown(
                 query=query_text,
                 public_results=[],
@@ -2079,23 +2528,26 @@ def _build_page_probe_markdown(
     page_error: str = "",
     from_cache: bool = False,
 ) -> str:
-    lines = [
-        f"# Page: {url}" if url else "# Page",
-        "",
-    ]
+    lines = [f"# Page: {url}" if url else PAGE_MARKDOWN_EMPTY_TITLE, ""]
     if title:
-        lines.append(f"Title: {title}")
+        lines.append(f"{PAGE_MARKDOWN_TITLE_PREFIX}{title}")
     if keywords and window != "all":
-        lines.append(f"Keywords: {' | '.join(keywords)}")
-    lines.append("Window: all lines" if window == "all" else f"Window: {window} lines")
-    lines.append(f"Cache: {'hit' if from_cache else 'miss'}")
+        lines.append(f"{PAGE_MARKDOWN_KEYWORDS_PREFIX}{' | '.join(keywords)}")
+    lines.append(
+        PAGE_MARKDOWN_WINDOW_ALL_TEXT
+        if window == "all"
+        else f"{PAGE_MARKDOWN_WINDOW_PREFIX}{window}{PAGE_MARKDOWN_WINDOW_SUFFIX}"
+    )
+    lines.append(
+        f"{PAGE_MARKDOWN_CACHE_PREFIX}{PAGE_MARKDOWN_CACHE_HIT_TEXT if from_cache else PAGE_MARKDOWN_CACHE_MISS_TEXT}"
+    )
     if page_error:
         lines.extend(["", page_error])
         return "\n".join(lines).strip()
     if not matches:
-        lines.extend(["", "No matching lines found in cached page content."])
+        lines.extend(["", DEFAULT_PAGE_NO_MATCHING_CACHED_TEXT])
         return "\n".join(lines).strip()
-    lines.extend(["", "Matched lines:"])
+    lines.extend(["", PAGE_MARKDOWN_MATCHED_LINES_TEXT])
     for item in matches:
         if not isinstance(item, dict):
             continue
@@ -2218,6 +2670,10 @@ def _prepare_user_input_content(
 
 # ── LLM 调用 ─────────────────────────────────────────────────
 def _to_dict(obj: Any) -> Any:
+    if isinstance(obj, dict):
+        return dict(obj)
+    if isinstance(obj, list):
+        return list(obj)
     for attr in ("model_dump", "dict", "to_dict"):
         fn = getattr(obj, attr, None)
         if callable(fn):
@@ -2229,6 +2685,32 @@ def _to_dict(obj: Any) -> Any:
 def _completion_extra_body(cfg: dict[str, Any]) -> dict[str, Any] | None:
     extra_body = cfg.get("extra_body")
     return deepcopy(extra_body) if isinstance(extra_body, dict) else None
+
+
+def _completion_api_key(cfg: dict[str, Any]) -> str:
+    api_key = str(cfg.get("api_key") or "").strip()
+    if api_key.startswith("os.environ/"):
+        env_name = api_key.partition("/")[2].strip()
+        if env_name:
+            return str(os.getenv(env_name) or "").strip()
+    if api_key:
+        return api_key
+    env_name = str(cfg.get("api_key_env") or "").strip()
+    if env_name:
+        return str(os.getenv(env_name) or "").strip()
+    return ""
+
+
+def _apply_completion_transport_options(cfg: dict[str, Any], kw: dict[str, Any]) -> None:
+    api_base = str(cfg.get("api_base") or "").strip()
+    if api_base:
+        kw["api_base"] = api_base
+    api_key = _completion_api_key(cfg)
+    if api_key:
+        kw["api_key"] = api_key
+    custom_llm_provider = str(cfg.get("custom_llm_provider") or "").strip()
+    if custom_llm_provider:
+        kw["custom_llm_provider"] = custom_llm_provider
 
 
 def _normalized_reasoning_effort(cfg: dict[str, Any]) -> str:
@@ -2279,6 +2761,8 @@ def _usage_reasoning_tokens(usage: dict[str, Any]) -> int:
     if not isinstance(usage, dict):
         return 0
     details = usage.get("completion_tokens_details")
+    if not isinstance(details, dict):
+        details = usage.get("output_tokens_details")
     if not isinstance(details, dict):
         return 0
     try:
@@ -2369,7 +2853,7 @@ def _render_reasoning_display(
     encrypted_blocks = 0
     for detail in details:
         kind = str(detail.get("type") or "").strip().lower()
-        if kind == "reasoning.encrypted":
+        if kind == "reasoning.encrypted" or (kind == "reasoning" and str(detail.get("encrypted_content") or "").strip()):
             encrypted_blocks += 1
             continue
         if kind == "reasoning.text":
@@ -2400,8 +2884,12 @@ def _render_reasoning_display(
         seen_parts.add(normalized)
         deduped_parts.append(str(item).strip())
 
+    reasoning_tokens = _usage_reasoning_tokens(usage or {})
+    if reasoning_tokens <= 0 and encrypted_blocks > 0:
+        reasoning_tokens = encrypted_blocks
+
     meta = {
-        "reasoning_tokens": _usage_reasoning_tokens(usage or {}),
+        "reasoning_tokens": reasoning_tokens,
         "encrypted_blocks": encrypted_blocks,
         "detail_count": len(details),
         "plaintext_available": bool(deduped_parts),
@@ -2447,31 +2935,62 @@ def _apply_completion_limits(cfg: dict[str, Any], kw: dict[str, Any]) -> None:
         kw["max_tokens"] = max_tokens
 
 
-def llm_call(messages, *, config, stats=None, trace_label="Model", log_id=None):
+def llm_call(
+    messages,
+    *,
+    config,
+    stats=None,
+    trace_label="Model",
+    log_id=None,
+    phase: str = "loop",
+    disclosure_step: int | None = None,
+):
     cfg = build_model_config(config)
     model = str(cfg.get("model") or DEFAULT_MODEL).strip()
     # Fail fast on provider throttling instead of waiting through SDK retries.
     kw: dict[str, Any] = {"model": model, "messages": messages, "temperature": 0.2, "drop_params": True, "max_retries": 0}
-    if cfg.get("api_base"): kw["api_base"] = cfg["api_base"]
-    if cfg.get("api_key"): kw["api_key"] = cfg["api_key"]
+    tool_cfg = litellm_tool_config_for_phase(phase, disclosure_step=disclosure_step)
+    _apply_completion_transport_options(cfg, kw)
     _apply_completion_limits(cfg, kw)
+    for key, value in tool_cfg.items():
+        if key == "tools" and not value:
+            continue
+        kw[key] = deepcopy(value) if isinstance(value, (dict, list)) else value
     extra_body = _completion_extra_body(cfg)
     if extra_body:
         kw["extra_body"] = extra_body
     _apply_reasoning_options(cfg, kw)
-    litellm_mod = _get_litellm()
 
     t0 = time.perf_counter()
-    try:
-        resp = litellm_mod.completion(**kw)
-    except Exception as e:
-        duration_ms = (time.perf_counter() - t0) * 1000
-        log_model_call(
-            label=trace_label, model=model, messages=messages,
-            output="", error=str(e)[:300], duration_ms=duration_ms, config=cfg,
-            log_id=log_id,
-        )
-        raise
+    if should_use_codex_mirror_transport(cfg):
+        try:
+            resp = codex_transport_model_response(
+                codex_transport_stream_response(
+                    cfg=cfg,
+                    messages=messages,
+                    tools=tool_cfg.get("tools") if isinstance(tool_cfg.get("tools"), list) else [],
+                )
+            )
+        except Exception as e:
+            duration_ms = (time.perf_counter() - t0) * 1000
+            log_model_call(
+                label=trace_label, model=model, messages=messages,
+                output="", error=str(e)[:300], duration_ms=duration_ms, config=cfg,
+                log_id=log_id,
+            )
+            raise
+    else:
+        litellm_mod = _get_litellm()
+        try:
+            resp = litellm_mod.completion(**kw)
+        except Exception as e:
+            duration_ms = (time.perf_counter() - t0) * 1000
+            log_model_call(
+                label=trace_label, model=model, messages=messages,
+                output="", error=str(e)[:300], duration_ms=duration_ms, config=cfg,
+                log_id=log_id,
+            )
+            raise
     duration_ms = (time.perf_counter() - t0) * 1000
 
     # 提取 usage / cost
@@ -2492,6 +3011,13 @@ def llm_call(messages, *, config, stats=None, trace_label="Model", log_id=None):
     choices = getattr(resp, "choices", None) or []
     msg = choices[0].message if choices else None
     output_text = _text(msg) if msg else ""
+    native_calls = _parse_native_tool_calls(_to_dict(msg) if msg is not None else {})
+    if native_calls:
+        tool_preview = _tool_calls_preview_text(native_calls)
+        if output_text and tool_preview:
+            output_text = f"{output_text}\n\n{tool_preview}".strip()
+        elif tool_preview:
+            output_text = tool_preview
 
     # 写日志
     log_model_call(
@@ -2513,53 +3039,20 @@ def _text(msg) -> str:
     return ""
 
 
-def _build_main_loop_user_message(
-    user_content: str | list[dict[str, Any]],
-    *,
-    round_i: int,
-    max_rounds: int,
-    tool_results_text: str = "",
-) -> str | list[dict[str, Any]]:
-    if tool_results_text:
-        return tool_results_text
-    del round_i, max_rounds
-    prompt_body = _message_content_text(user_content) or "images"
-    text_block = "\n\n".join(["# 原始用户问题", prompt_body]).strip()
-    if isinstance(user_content, list):
-        images = [
-            deepcopy(item)
-            for item in user_content
-            if isinstance(item, dict) and str(item.get("type") or "").strip() == "image_url"
-        ]
-        if images:
-            return [{"type": "text", "text": text_block}, *images]
-    return text_block
-
-
-def _select_main_loop_calls(
-    calls: list[dict[str, Any]],
-    *,
-    round_i: int,
-    max_rounds: int,
-    phase: str,
-) -> list[dict[str, Any]]:
-    current = min(round_i + 1, max_rounds)
-    if current >= max_rounds or phase == _PHASE_FINAL:
-        return []
-
+def _select_loop_calls(calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
     selected: list[dict[str, Any]] = []
-    seen_page_keys: set[tuple[str, str, str]] = set()
     seen_search_queries: set[str] = set()
-    # Search phase still defaults to search-first by prompt, but direct-link
-    # questions may legitimately start with a page fetch in round 1.
-    allowed_tools = {"web_search", "page_extract"}
+    seen_page_keys: set[tuple[str, str, str]] = set()
+    seen_keep_signatures: set[tuple[tuple[int, ...], bool]] = set()
+    seen_delete_ids: set[tuple[int, ...]] = set()
+    allowed_tools = {"web_search", "page_extract", "context_update", "context_keep", "context_delete"}
 
     for call in calls:
         if not isinstance(call, dict):
             continue
         name = str(call.get("name") or "").strip()
         args = call.get("args") if isinstance(call.get("args"), dict) else {}
-        if name not in allowed_tools:
+        if name not in allowed_tools or not isinstance(args, dict):
             continue
 
         if name == "web_search":
@@ -2569,7 +3062,7 @@ def _select_main_loop_calls(
                 continue
             seen_search_queries.add(normalized_query)
             selected.append({"name": "web_search", "args": {"query": query}})
-            if len(selected) >= _PHASE_TOOL_LIMIT:
+            if len(selected) >= _TOOL_LIMIT:
                 break
             continue
 
@@ -2581,37 +3074,75 @@ def _select_main_loop_calls(
             if not normalized_url or page_key in seen_page_keys:
                 continue
             seen_page_keys.add(page_key)
-            selected.append(
-                {
-                    "name": "page_extract",
-                    "args": {
-                        "url": normalized_url,
-                        "query": query,
-                        "lines": str(_normalize_page_window(lines)),
-                    },
-                }
-            )
-            if len(selected) >= _PHASE_TOOL_LIMIT:
+            payload = {
+                "url": normalized_url,
+                "query": query,
+                "lines": str(_normalize_page_window(lines)),
+            }
+            if str(args.get("_call_id") or "").strip():
+                payload["_call_id"] = str(args.get("_call_id") or "").strip()
+            selected.append({"name": "page_extract", "args": payload})
+            if len(selected) >= _TOOL_LIMIT:
                 break
             continue
+
+        if name == "context_keep":
+            ids, last_block = _normalize_context_keep_args(args)
+            if not ids and not last_block:
+                continue
+            signature = (tuple(ids), last_block)
+            if signature in seen_keep_signatures:
+                continue
+            seen_keep_signatures.add(signature)
+            payload: dict[str, Any] = {}
+            if ids:
+                payload["ids"] = ids
+            if last_block:
+                payload["last_block"] = True
+            if str(args.get("_call_id") or "").strip():
+                payload["_call_id"] = str(args.get("_call_id") or "").strip()
+            selected.append({"name": "context_keep", "args": payload})
+            if len(selected) >= _TOOL_LIMIT:
+                break
+            continue
+
+        if name == "context_delete":
+            ids = _normalize_context_delete_ids(args.get("ids", []))
+            if not ids:
+                continue
+            signature = tuple(ids)
+            if signature in seen_delete_ids:
+                continue
+            seen_delete_ids.add(signature)
+            payload = {"ids": ids}
+            if str(args.get("_call_id") or "").strip():
+                payload["_call_id"] = str(args.get("_call_id") or "").strip()
+            selected.append({"name": "context_delete", "args": payload})
+            if len(selected) >= _TOOL_LIMIT:
+                break
+            continue
+
+        if name == "context_update":
+            payload = dict(args)
+            selected.append({"name": "context_update", "args": payload})
+            if len(selected) >= _TOOL_LIMIT:
+                break
 
     return selected
 
 
-def _tool_result_tag_xml(call: dict[str, Any], result_text: str) -> str:
-    name = str(call.get("name") or "").strip()
-    args = call.get("args") if isinstance(call.get("args"), dict) else {}
-    attrs = [f'name="{name}"']
-    tools = str(args.get("tools") or "").strip()
-    url = str(args.get("url") or "").strip()
-    lines = str(args.get("lines") or "").strip()
-    if tools:
-        attrs.append(f'tools="{tools.replace(chr(34), "&quot;")}"')
-    if url:
-        attrs.append(f'url="{url.replace(chr(34), "&quot;")}"')
-    if lines:
-        attrs.append(f'lines="{lines.replace(chr(34), "&quot;")}"')
-    return f"<result {' '.join(attrs)}>\n{result_text}\n</result>"
+def _collect_loop_calls(
+    *,
+    text: str,
+    message_payload: dict[str, Any],
+    state: _PhaseRuntimeState,
+    round_i: int,
+) -> list[dict[str, Any]]:
+    raw_calls = _parse_native_tool_calls(message_payload)
+    _resolve_page_call_refs(raw_calls, state)
+    calls = _select_loop_calls(raw_calls)
+    _ensure_call_ids(calls, round_i=round_i)
+    return calls
 
 
 def _ensure_call_ids(calls: list[dict[str, Any]], *, round_i: int) -> None:
@@ -2626,7 +3157,7 @@ def _ensure_call_ids(calls: list[dict[str, Any]], *, round_i: int) -> None:
         args["_call_id"] = f"r{round_i + 1}c{index}"
 
 
-def _execute_calls_parallel(
+def _execute_loop_calls(
     *,
     calls: list[dict[str, Any]],
     cfg: dict[str, Any],
@@ -2634,277 +3165,235 @@ def _execute_calls_parallel(
     prompt_text: str,
     log_id: str | None,
     runtime_state: _SessionRuntimeState | None,
+    context_state: _PhaseRuntimeState,
     started_at: float,
     on_tool: Any | None = None,
     progress_callback: Any | None = None,
 ) -> dict[int, dict[str, Any]]:
-    if not calls:
-        return {}
+    payload_map: dict[int, dict[str, Any]] = {}
+    note_parts: list[str] = []
+    external_calls: list[tuple[int, dict[str, Any]]] = []
+    batch_created_ids: list[int] = []
 
-    results_map: dict[int, dict[str, Any]] = {}
-    with ThreadPoolExecutor(max_workers=len(calls)) as pool:
-        futures = {
-            pool.submit(
-                execute_tool_payload,
-                call["name"],
-                call["args"],
-                config=cfg,
-                stats=stats,
-                user_question=prompt_text,
-                log_id=log_id,
-                runtime_state=runtime_state,
-                progress_callback=progress_callback,
-            ): (idx, call)
-            for idx, call in enumerate(calls)
-        }
-        for fut in as_completed(futures):
-            idx, call = futures[fut]
-            payload = fut.result()
-            if not isinstance(payload, dict):
-                payload = {"ok": False, "error": "invalid tool payload"}
+    def _emit_tool_progress_event(name: str, args: dict[str, Any], event: dict[str, Any], *, started_at_s: float) -> None:
+        if not callable(on_tool):
+            return
+        merged = dict(args)
+        if isinstance(event, dict):
+            status = str(event.get("status") or "").strip().lower()
+            if status:
+                merged["_progress_status"] = status
+                merged["_pending"] = status not in {"done", "failed"}
+            if "count" in event:
+                merged["_count"] = event.get("count")
+            if "query" in event and not merged.get("query"):
+                merged["query"] = event.get("query")
+            if "url" in event and not merged.get("url"):
+                merged["url"] = event.get("url")
+            if "error" in event:
+                merged["_error"] = event.get("error")
+        merged["_elapsed_s"] = max(0.0, time.perf_counter() - started_at_s)
+        try:
+            on_tool(name, merged)
+        except Exception:
+            pass
+
+    for index, call in enumerate(calls):
+        name = str(call.get("name") or "").strip()
+        args = call.get("args") if isinstance(call.get("args"), dict) else {}
+        if not isinstance(args, dict):
+            args = {}
+        call_started_at = time.perf_counter()
+
+        if name == "context_keep":
+            ids, last_block = _normalize_context_keep_args(args)
+            payload = _keep_session_context_refs(
+                context_state,
+                ids,
+                last_block=last_block,
+            )
+        elif name == "context_delete":
+            payload = _delete_session_context_refs(
+                context_state,
+                args.get("ids", []),
+            )
+        elif name == "context_update":
+            payload = _apply_context_update(context_state, args)
+        else:
+            external_calls.append((index, call))
+            continue
+
+        if not isinstance(payload, dict):
+            payload = {"ok": False, "error": "invalid tool payload"}
+        _record_tool_stats(stats, payload)
+        payload_map[index] = payload
+        model_note = str(payload.get("_model_markdown") or "").strip()
+        if name in {"context_keep", "context_delete"} and model_note:
+            note_parts.append(model_note)
+        if callable(on_tool):
+            try:
+                on_tool(
+                    name,
+                    _tool_callback_args(
+                        name,
+                        args,
+                        payload,
+                        elapsed_s=time.perf_counter() - call_started_at,
+                        config=cfg,
+                    ),
+                )
+            except Exception:
+                pass
+
+    if external_calls:
+        context_state.pending_items = []
+        futures: dict[Any, tuple[int, dict[str, Any], float]] = {}
+        with ThreadPoolExecutor(max_workers=len(external_calls)) as pool:
+            for index, call in external_calls:
+                name = str(call.get("name") or "").strip()
+                args = call.get("args") if isinstance(call.get("args"), dict) else {}
+                if not isinstance(args, dict):
+                    args = {}
+                call_started_at = time.perf_counter()
+                wrapped_progress = None
+                if callable(on_tool) or callable(progress_callback):
+                    def _callback(event: dict[str, Any], *, _name=name, _args=dict(args), _started=call_started_at) -> None:
+                        if callable(progress_callback):
+                            try:
+                                progress_callback(event)
+                            except Exception:
+                                pass
+                        _emit_tool_progress_event(_name, _args, event if isinstance(event, dict) else {}, started_at_s=_started)
+                    wrapped_progress = _callback
+                futures[
+                    pool.submit(
+                        execute_tool_payload,
+                        name,
+                        args,
+                        config=cfg,
+                        stats=stats,
+                        user_question=prompt_text,
+                        log_id=log_id,
+                        runtime_state=runtime_state,
+                        progress_callback=wrapped_progress,
+                    )
+                ] = (index, call, call_started_at)
+
+            external_payloads: dict[int, tuple[dict[str, Any], float, dict[str, Any]]] = {}
+            for future in as_completed(futures):
+                index, call, call_started_at = futures[future]
+                payload = future.result()
+                if not isinstance(payload, dict):
+                    payload = {"ok": False, "error": "invalid tool payload"}
+                external_payloads[index] = (payload, call_started_at, call)
+
+        for index, call in external_calls:
+            payload, call_started_at, original_call = external_payloads.get(index, ({"ok": False, "error": "missing tool payload"}, time.perf_counter(), call))
+            name = str(original_call.get("name") or "").strip()
+            args = original_call.get("args") if isinstance(original_call.get("args"), dict) else {}
+            if not isinstance(args, dict):
+                args = {}
+            if name == "web_search":
+                created_ids = _append_search_evidence_items(original_call, payload, context_state)
+                batch_created_ids.extend(created_ids)
+            elif name == "page_extract":
+                created_ids = _append_page_evidence_items(original_call, payload, context_state)
+                batch_created_ids.extend(created_ids)
             _record_tool_stats(stats, payload)
-            results_map[idx] = payload
+            payload_map[index] = payload
+            model_note = str(payload.get("_model_markdown") or "").strip()
+            if name == "context_delete" and model_note:
+                note_parts.append(model_note)
             if callable(on_tool):
                 try:
                     on_tool(
-                        call["name"],
+                        name,
                         _tool_callback_args(
-                            call["name"],
-                            call["args"],
+                            name,
+                            args,
                             payload,
-                            elapsed_s=time.perf_counter() - started_at,
+                            elapsed_s=time.perf_counter() - call_started_at,
                             config=cfg,
                         ),
                     )
                 except Exception:
                     pass
-    return results_map
+        context_state.last_tool_block_ids = [str(item_id) for item_id in batch_created_ids]
+
+    context_state.pending_user_note = "\n\n".join(part for part in note_parts if part).strip()
+    return payload_map
 
 
-def _results_xml_from_payloads(
+def _validate_progressive_tool_requirements(
+    state: _PhaseRuntimeState,
     calls: list[dict[str, Any]],
-    payload_map: dict[int, dict[str, Any]],
 ) -> str:
-    parts: list[str] = []
-    for index, call in enumerate(calls):
-        payload = payload_map.get(index) or {"ok": False, "error": "missing tool payload"}
-        parts.append(_tool_result_tag_xml(call, _tool_markdown_for_model(call["name"], call["args"], payload)))
-    return "<tool_results>\n" + "\n".join(parts) + "\n</tool_results>"
+    tool_names = {str(call.get("name") or "").strip() for call in calls if isinstance(call, dict)}
+    if state.last_input_token_estimate > 5000 and calls:
+        if not tool_names.intersection({"context_keep", "context_delete", "context_update"}):
+            return (
+                f"系统提示：本轮输入 token 估算约为 {state.last_input_token_estimate}，已经超过 5000。"
+                "如果你还要继续调用工具，就必须先整理上下文。"
+                "如果当前有用信息还在 Candidate Evidence 里，请先调用 context_keep(ids=[...]) 或 context_keep(last_block=true)；"
+                "如果 kept evidence 太臃肿，请先调用 context_update(update=[...]) 压缩内容，或用 context_delete(ids=[...]) 清理误 keep 的 evidence，再继续搜索。"
+            )
+
+    if state.disclosure_step == 1:
+        missing: list[str] = []
+        has_skeleton_update = _calls_include_skeleton_update(state, calls)
+        if not has_skeleton_update:
+            missing.append("context_update")
+        if missing:
+            return (
+                "系统提示：你上一轮没有真正发出所需的工具调用。"
+                f"本轮必须直接调用 {', '.join(missing)}。"
+                "不要继续只写分析文字；先用 context_update(create=[...]) 建 skeleton。若上一轮候选里已有关键证据，再用 context_keep(ids=[...]) 保留它们。"
+            )
+    return ""
 
 
-@dataclass
-class _TurnDecision:
-    kind: str
-    calls: list[dict[str, Any]] = field(default_factory=list)
-    assistant_content: str = ""
-    user_content: str = ""
-    final_text: str = ""
-    next_phase: str = _PHASE_STAGE1
-    store_assistant_turn: bool = True
+def _calls_include_skeleton_update(state: _PhaseRuntimeState, calls: list[dict[str, Any]]) -> bool:
+    for call in calls:
+        if not isinstance(call, dict) or str(call.get("name") or "").strip() != "context_update":
+            continue
+        args = call.get("args") if isinstance(call.get("args"), dict) else {}
+        if not isinstance(args, dict):
+            continue
+        for item in args.get("create", []) if isinstance(args.get("create"), list) else []:
+            if not isinstance(item, dict):
+                continue
+            item_type = _normalize_context_item_type(str(item.get("type") or "").strip())
+            if item_type.startswith("skeleton."):
+                return True
+        for item in args.get("update", []) if isinstance(args.get("update"), list) else []:
+            if not isinstance(item, dict):
+                continue
+            try:
+                item_id = int(item.get("id"))
+            except Exception:
+                continue
+            current = _find_context_item(state, item_id)
+            if current is not None and current.item_type.startswith("skeleton."):
+                return True
+    return False
 
 
-def _phase_for_round(
-    phase_state: _PhaseRuntimeState,
-    *,
-    round_i: int,
-    max_rounds: int,
-) -> str:
-    if phase_state.phase == _PHASE_STAGE2 and round_i + 1 >= max_rounds:
-        return _PHASE_FINAL
-    return phase_state.phase
-
-
-def _search_retry_message() -> str:
-    return STAGE1_RETRY_PROMPT.strip()
-
-
-def _skeleton_retry_message() -> str:
-    return STAGE1_SKELETON_RETRY_PROMPT.strip()
-
-
-def _execute_kickoff_message(phase_state: _PhaseRuntimeState) -> str:
-    parts = [line for line in STAGE2_KICKOFF_PROMPT.strip().splitlines() if line.strip()]
-    user_need_context = _user_need_context_text(phase_state)
-    if user_need_context:
-        parts.extend(["", user_need_context])
-    search_rewrite_context = _search_rewrite_context_text(phase_state)
-    if search_rewrite_context:
-        parts.extend(["", search_rewrite_context])
-    if phase_state.skeleton_xml:
-        parts.extend(["", phase_state.skeleton_xml])
-    checklist = _claim_checklist_text(phase_state)
-    if checklist:
-        parts.extend(["", checklist])
-    return "\n".join(parts).strip()
-
-
-def _execute_retry_message(*, final_soon: bool) -> str:
-    message = STAGE2_RETRY_PROMPT.strip()
-    if final_soon:
-        message += " 下一轮将进入 final，请在这轮尽量补齐关键证据。"
-    return message
-
-
-def _reset_runtime_state_for_execute(runtime_state: _SessionRuntimeState | None) -> None:
-    if runtime_state is None:
-        return
-    with runtime_state.lock:
-        runtime_state.search_history_raw.clear()
-        runtime_state.search_history_normalized.clear()
-        runtime_state.search_results_deduped.clear()
-
-
-def _build_stage2_phase_messages(
-    *,
-    cfg: dict[str, Any],
-    prompt_text: str,
-    phase_state: _PhaseRuntimeState,
-) -> list[dict[str, Any]]:
-    return [
-        {
-            "role": "system",
-            "content": _build_system_prompt(cfg, prompt_text, phase=_PHASE_STAGE2, phase_state=phase_state),
-        },
-        {
-            "role": "user",
-            "content": _execute_kickoff_message(phase_state),
-        },
-    ]
-
-
-def _record_first_collection_mode(
-    phase_state: _PhaseRuntimeState,
+def _advance_progressive_disclosure(
+    state: _PhaseRuntimeState,
     calls: list[dict[str, Any]],
 ) -> None:
-    if str(phase_state.first_collection_mode or "").strip():
+    tool_names = {str(call.get("name") or "").strip() for call in calls if isinstance(call, dict)}
+    if state.disclosure_step <= 0 and tool_names.intersection({"web_search", "page_extract"}):
+        state.disclosure_step = 1
+        state.pending_user_note = ""
         return
-    has_search = any(str(call.get("name") or "").strip() == "web_search" for call in calls if isinstance(call, dict))
-    has_page = any(str(call.get("name") or "").strip() == "page_extract" for call in calls if isinstance(call, dict))
-    if has_search and has_page:
-        phase_state.first_collection_mode = "mix"
-    elif has_page:
-        phase_state.first_collection_mode = "page"
-    elif has_search:
-        phase_state.first_collection_mode = "websearch"
-
-
-def _store_assistant_turn(
-    msgs: list[dict[str, Any]],
-    msg: Any,
-    *,
-    content: str,
-    reasoning_text: str = "",
-    reasoning_details: list[dict[str, Any]] | None = None,
-    reasoning_text_parts: list[str] | None = None,
-) -> None:
-    if reasoning_text_parts is not None:
-        msgs.append(
-            _assistant_message_with_reasoning(
-                None,
-                content=content,
-                reasoning_text_parts=reasoning_text_parts,
-                reasoning_details=reasoning_details,
-            )
-        )
+    if state.disclosure_step == 1 and _calls_include_skeleton_update(state, calls):
+        state.disclosure_step = 2
+        state.disclosure_refine_consumed = False
+        state.pending_user_note = ""
         return
-    msgs.append(
-        _assistant_message_with_reasoning(
-            msg,
-            content=content,
-        )
-    )
-
-
-def _decide_turn(
-    *,
-    text: str,
-    phase: str,
-    round_i: int,
-    max_rounds: int,
-    phase_state: _PhaseRuntimeState,
-    cfg: dict[str, Any],
-) -> _TurnDecision:
-    skeleton_block = _extract_article_skeleton(text)
-    user_need_block = _extract_user_need_restore(text)
-    search_rewrite_block = _extract_search_rewrite(text)
-    raw_calls = _parse_tool_tags(text)
-    calls = _select_main_loop_calls(raw_calls, round_i=round_i, max_rounds=max_rounds, phase=phase)
-    _ensure_call_ids(calls, round_i=round_i)
-    clean = _strip_tool_tags(text)
-    nonfinal_content = _strip_tool_xml_only(text) or clean or text
-
-    if phase == _PHASE_STAGE1:
-        if calls:
-            _record_first_collection_mode(phase_state, calls)
-            return _TurnDecision(
-                kind="tools",
-                calls=calls,
-                assistant_content=_normalize_tool_turn_message(text, calls),
-                next_phase=_PHASE_STAGE1,
-            )
-        has_user_need = _update_user_need_state(phase_state, user_need_block) if user_need_block else bool(phase_state.user_need_items)
-        has_rewrite = _update_search_rewrite_state(phase_state, search_rewrite_block) if search_rewrite_block else bool(phase_state.search_rewrite_terms)
-        has_skeleton = _update_skeleton_state(phase_state, skeleton_block) if skeleton_block else bool(phase_state.claims)
-        if has_user_need and has_rewrite and has_skeleton:
-            return _TurnDecision(
-                kind="continue",
-                assistant_content=nonfinal_content,
-                user_content=_execute_kickoff_message(phase_state),
-                next_phase=_PHASE_STAGE2,
-            )
-        if not phase_state.first_collection_mode and round_i == 0 and clean:
-            return _TurnDecision(
-                kind="final",
-                final_text=clean,
-                next_phase=_PHASE_FINAL,
-            )
-        return _TurnDecision(
-            kind="continue",
-            assistant_content="",
-            user_content=_skeleton_retry_message(),
-            next_phase=_PHASE_STAGE1,
-            store_assistant_turn=False,
-        )
-
-    if phase == _PHASE_STAGE2:
-        if user_need_block:
-            _update_user_need_state(phase_state, user_need_block)
-        if search_rewrite_block:
-            _update_search_rewrite_state(phase_state, search_rewrite_block)
-        if skeleton_block:
-            _update_skeleton_state(phase_state, skeleton_block)
-            return _TurnDecision(
-                kind="continue",
-                assistant_content=nonfinal_content,
-                user_content=_execute_kickoff_message(phase_state),
-                next_phase=_PHASE_STAGE2,
-            )
-        if calls:
-            return _TurnDecision(
-                kind="tools",
-                calls=calls,
-                assistant_content=_normalize_tool_turn_message(text, calls),
-                next_phase=_PHASE_FINAL if round_i + 2 >= max_rounds else _PHASE_STAGE2,
-            )
-        if not clean:
-            final_soon = round_i + 2 >= max_rounds
-            return _TurnDecision(
-                kind="continue",
-                assistant_content=nonfinal_content,
-                user_content=_execute_retry_message(final_soon=final_soon),
-                next_phase=_PHASE_FINAL if final_soon else _PHASE_STAGE2,
-            )
-        return _TurnDecision(
-            kind="final",
-            final_text=clean or _format_empty_output_message(cfg, round_i=round_i),
-            next_phase=_PHASE_FINAL,
-        )
-
-    return _TurnDecision(
-        kind="final",
-        final_text=clean or _format_empty_output_message(cfg, round_i=round_i),
-        next_phase=_PHASE_FINAL,
-    )
+    if state.disclosure_step == 2 and state.disclosure_refine_consumed:
+        state.disclosure_step = 3
 
 
 def run(
@@ -2917,10 +3406,7 @@ def run(
     images: list[str] | None = None,
     context: str | list[dict[str, Any]] | None = None,
 ) -> str:
-    """单次问答: 多轮 XML 标签工具调用循环, 返回最终文本.
-
-    context — 上一轮对话消息, 用于多轮对话上下文传递.
-    """
+    """单次问答: 正常多轮循环 + LiteLLM 原生工具调用 + 可删除的累积上下文."""
     image_paths = [str(path).strip() for path in (images or []) if str(path).strip()]
     if not question.strip() and not image_paths:
         return ""
@@ -2932,8 +3418,8 @@ def run(
     started_at = time.perf_counter()
     warning_messages: list[str] = []
     runtime_state = _SessionRuntimeState()
-    phase_state = _PhaseRuntimeState()
-    phase_state.input_has_images = bool(image_paths)
+    loop_state = _PhaseRuntimeState()
+    loop_state.input_has_images = bool(image_paths)
     user_content, input_error = _prepare_user_input_content(
         question,
         image_paths,
@@ -2945,48 +3431,53 @@ def run(
     if input_error:
         return input_error
 
-    msgs: list[dict] = [
-        {
-            "role": "system",
-            "content": _build_system_prompt(cfg, prompt_text, phase=phase_state.phase, phase_state=phase_state),
-        }
-    ]
-    _append_context_messages(msgs, context)
-    msgs.append(
-        {
-            "role": "user",
-            "content": _build_main_loop_user_message(
-                user_content,
-                round_i=0,
-                max_rounds=max_rounds,
-            ),
-        }
-    )
+    history: list[dict[str, Any]] = [{"role": "user", "content": user_content}]
     last = ""
 
     for round_i in range(max_rounds):
-        phase = _phase_for_round(phase_state, round_i=round_i, max_rounds=max_rounds)
-        if phase == _PHASE_STAGE2:
-            phase_state.stage2_turns += 1
-        phase_cfg = build_stage_model_config(cfg, phase)
-        msgs[0]["content"] = _build_system_prompt(cfg, prompt_text, phase=phase, phase_state=phase_state)
+        msgs = _build_loop_messages(
+            cfg=cfg,
+            prompt_text=prompt_text,
+            history=history,
+            state=loop_state,
+            context=context,
+        )
+        msgs = _apply_input_budget_message(
+            cfg=cfg,
+            state=loop_state,
+            messages=msgs,
+        )
+        loop_state.pending_user_note = ""
         try:
-            resp = llm_call(msgs, config=phase_cfg, stats=st, trace_label=f"round {round_i + 1}", log_id=lid)
+            resp = llm_call(
+                msgs,
+                config=cfg,
+                stats=st,
+                trace_label=f"round {round_i + 1}",
+                log_id=lid,
+                phase="loop",
+                disclosure_step=loop_state.disclosure_step,
+            )
         except Exception as e:
             return _prepend_runtime_warnings(_format_model_error_message(e), warning_messages)
 
         choices = getattr(resp, "choices", None) or []
         msg = choices[0].message if choices else None
-        if msg is None: break
+        if msg is None:
+            break
+        msg_payload = _to_dict(msg)
+        if not isinstance(msg_payload, dict):
+            msg_payload = {}
         usage = _to_dict(getattr(resp, "usage", None) or {})
         if not isinstance(usage, dict):
             usage = {}
 
         text = _text(msg)
-        if text: last = text
+        if text:
+            last = text
 
         reasoning_text, reasoning_meta = _render_reasoning_display(
-            payload=_to_dict(msg),
+            payload=msg_payload,
             usage=usage,
         )
         if callable(on_reasoning):
@@ -2995,59 +3486,41 @@ def run(
             except Exception:
                 pass
 
-        decision = _decide_turn(
+        calls = _collect_loop_calls(
             text=text,
-            phase=phase,
+            message_payload=msg_payload,
+            state=loop_state,
             round_i=round_i,
-            max_rounds=max_rounds,
-            phase_state=phase_state,
-            cfg=cfg,
         )
+        assistant_content = _normalize_tool_turn_message(text, calls) if calls else _clean_model_text(text)
 
-        if decision.kind == "final":
-            final_message = decision.final_text or last or _format_empty_output_message(phase_cfg, round_i=round_i)
+        progressive_error = _validate_progressive_tool_requirements(loop_state, calls)
+        if progressive_error:
+            loop_state.pending_user_note = progressive_error
+            continue
+
+        if assistant_content.strip():
+            history.append({"role": "assistant", "content": assistant_content})
+
+        if not calls:
+            final_message = _clean_model_text(text) or last or _format_empty_output_message(cfg, round_i=round_i)
             return _prepend_runtime_warnings(final_message, warning_messages)
 
-        if decision.store_assistant_turn:
-            _store_assistant_turn(
-                msgs,
-                msg,
-                content=decision.assistant_content or (text or last or "继续"),
-            )
-        phase_transition_to_stage2 = phase != _PHASE_STAGE2 and decision.next_phase == _PHASE_STAGE2
-        phase_state.phase = decision.next_phase
-
-        if phase_transition_to_stage2:
-            _reset_runtime_state_for_execute(runtime_state)
-            phase_state.stage2_turns = 0
-            msgs = _build_stage2_phase_messages(
-                cfg=cfg,
-                prompt_text=prompt_text,
-                phase_state=phase_state,
-            )
-            continue
-
-        if decision.kind != "tools":
-            if decision.user_content:
-                msgs.append({"role": "user", "content": decision.user_content})
-            continue
-
-        payload_map = _execute_calls_parallel(
-            calls=decision.calls,
+        _execute_loop_calls(
+            calls=calls,
             cfg=cfg,
             stats=st,
             prompt_text=prompt_text,
             log_id=lid,
             runtime_state=runtime_state,
+            context_state=loop_state,
             started_at=started_at,
             on_tool=on_tool,
             progress_callback=None,
         )
-        results_xml = _results_xml_from_payloads(decision.calls, payload_map)
-        next_tool_results_text = _tool_results_for_next_round(results_xml, round_i=round_i, max_rounds=max_rounds)
-        msgs.append({"role": "user", "content": next_tool_results_text})
+        _advance_progressive_disclosure(loop_state, calls)
 
-    final_message = _strip_tool_tags(last) or _format_empty_output_message(cfg, round_i=max_rounds - 1)
+    final_message = _clean_model_text(last) or _format_empty_output_message(cfg, round_i=max_rounds - 1)
     return _prepend_runtime_warnings(final_message, warning_messages)
 
 
@@ -3065,16 +3538,7 @@ def run_stream(
     images: list[str] | None = None,
     context: str | list[dict[str, Any]] | None = None,
 ) -> str:
-    """流式对话循环, 通过回调驱动 CLI 显示.
-
-    on_chunk(delta)  — 每个 token 到达时调用 (实时流式)
-    on_rewind(thinking, tools) — 工具轮检测到后调用, thinking 为去标签文本, tools 为即将执行的工具列表
-    on_tool(name, args) — 工具调用回调
-    on_status(text)  — 状态回调: "Preparing...", "Thinking...", "Searching..."
-    context — 上一轮对话消息, 用于多轮对话上下文传递.
-
-    Returns 最终清理后的回答文本.
-    """
+    """流式对话循环: 正常多轮循环 + LiteLLM 原生工具调用 + 可删除的累积上下文."""
     image_paths = [str(path).strip() for path in (images or []) if str(path).strip()]
     if not question.strip() and not image_paths:
         return ""
@@ -3086,8 +3550,8 @@ def run_stream(
     started_at = time.perf_counter()
     warning_messages: list[str] = []
     runtime_state = _SessionRuntimeState()
-    phase_state = _PhaseRuntimeState()
-    phase_state.input_has_images = bool(image_paths)
+    loop_state = _PhaseRuntimeState()
+    loop_state.input_has_images = bool(image_paths)
     user_content, input_error = _prepare_user_input_content(
         question,
         image_paths,
@@ -3100,127 +3564,154 @@ def run_stream(
     if input_error:
         return input_error
 
-    msgs: list[dict] = [
-        {
-            "role": "system",
-            "content": _build_system_prompt(cfg, prompt_text, phase=phase_state.phase, phase_state=phase_state),
-        },
-    ]
-    _append_context_messages(msgs, context)
-    msgs.append(
-        {
-            "role": "user",
-            "content": _build_main_loop_user_message(
-                user_content,
-                round_i=0,
-                max_rounds=max_rounds,
-            ),
-        }
-    )
+    history: list[dict[str, Any]] = [{"role": "user", "content": user_content}]
+    last = ""
+
     for round_i in range(max_rounds):
-        phase = _phase_for_round(phase_state, round_i=round_i, max_rounds=max_rounds)
-        if phase == _PHASE_STAGE2:
-            phase_state.stage2_turns += 1
-        phase_cfg = build_stage_model_config(cfg, phase)
-        msgs[0]["content"] = _build_system_prompt(cfg, prompt_text, phase=phase, phase_state=phase_state)
-        litellm_mod = _get_litellm(on_status=on_status)
+        msgs = _build_loop_messages(
+            cfg=cfg,
+            prompt_text=prompt_text,
+            history=history,
+            state=loop_state,
+            context=context,
+        )
+        msgs = _apply_input_budget_message(
+            cfg=cfg,
+            state=loop_state,
+            messages=msgs,
+        )
+        loop_state.pending_user_note = ""
         if callable(on_status):
             on_status(STATUS_THINKING)
 
-        model = str(phase_cfg.get("model") or DEFAULT_MODEL).strip()
-        kw: dict[str, Any] = {
-            "model": model, "messages": msgs, "temperature": 0.2,
-            "stream": True, "drop_params": True,
-            "stream_options": {"include_usage": True},
-            "max_retries": 0,
-        }
-        if phase_cfg.get("api_base"):
-            kw["api_base"] = phase_cfg["api_base"]
-        if phase_cfg.get("api_key"):
-            kw["api_key"] = phase_cfg["api_key"]
-        _apply_completion_limits(phase_cfg, kw)
-        extra_body = _completion_extra_body(phase_cfg)
-        if extra_body:
-            kw["extra_body"] = extra_body
-        _apply_reasoning_options(phase_cfg, kw)
-
+        model = str(cfg.get("model") or DEFAULT_MODEL).strip()
+        tool_cfg = litellm_tool_config_for_phase("loop", disclosure_step=loop_state.disclosure_step)
         t0 = time.perf_counter()
-        try:
-            stream = litellm_mod.completion(**kw)
-        except Exception as e:
-            duration_ms = (time.perf_counter() - t0) * 1000
-            log_model_call(
-                label=f"round {round_i + 1}", model=model, messages=msgs,
-                output="", error=str(e)[:300], duration_ms=duration_ms, config=phase_cfg,
-                log_id=lid,
-            )
-            return _prepend_runtime_warnings(_format_model_error_message(e), warning_messages)
-
-        # ── 实时流式: 边收 chunk 边推给 CLI ──
         content_parts: list[str] = []
         usage: dict[str, Any] = {}
         reasoning_text_parts: list[str] = []
         reasoning_details: list[dict[str, Any]] = []
+        stream_tool_calls: dict[int, dict[str, Any]] = {}
         last_reasoning_emit_tokens = [0]
-        try:
-            for chunk in stream:
-                u = getattr(chunk, "usage", None)
-                if u:
-                    usage = _to_dict(u) if not isinstance(u, dict) else u
-
-                choices = getattr(chunk, "choices", None) or []
-                if not choices:
+        if should_use_codex_mirror_transport(cfg):
+            try:
+                response_payload = codex_transport_stream_response(
+                    cfg=cfg,
+                    messages=msgs,
+                    tools=tool_cfg.get("tools") if isinstance(tool_cfg.get("tools"), list) else [],
+                    on_text_delta=lambda delta: (
+                        content_parts.append(delta),
+                        callable(on_chunk) and on_chunk(delta),
+                    ),
+                )
+            except Exception as e:
+                duration_ms = (time.perf_counter() - t0) * 1000
+                log_model_call(
+                    label=f"round {round_i + 1}", model=model, messages=msgs,
+                    output="", error=str(e)[:300], duration_ms=duration_ms, config=cfg,
+                    log_id=lid,
+                )
+                return _prepend_runtime_warnings(_format_model_error_message(e), warning_messages)
+            usage = _to_dict(response_payload.get("usage") or {})
+            msg_payload = codex_transport_message_payload(response_payload)
+            reasoning_details = [
+                dict(item)
+                for item in response_payload.get("output") or []
+                if isinstance(item, dict) and str(item.get("type") or "").strip() == "reasoning"
+            ]
+        else:
+            litellm_mod = _get_litellm(on_status=on_status)
+            kw: dict[str, Any] = {
+                "model": model, "messages": msgs, "temperature": 0.2,
+                "stream": True, "drop_params": True,
+                "stream_options": {"include_usage": True},
+                "max_retries": 0,
+            }
+            _apply_completion_transport_options(cfg, kw)
+            _apply_completion_limits(cfg, kw)
+            for key, value in tool_cfg.items():
+                if key == "tools" and not value:
                     continue
-                delta = getattr(choices[0], "delta", None)
-                if not delta:
-                    continue
-                delta_payload = _to_dict(delta)
-                if isinstance(delta_payload, dict):
-                    delta_reasoning_text, _ = _render_reasoning_display(payload=delta_payload)
-                    if delta_reasoning_text:
-                        reasoning_text_parts.append(delta_reasoning_text)
-                        if callable(on_reasoning):
-                            estimated_tokens = _estimate_text_tokens(model, "\n\n".join(reasoning_text_parts))
-                            if estimated_tokens > last_reasoning_emit_tokens[0]:
-                                last_reasoning_emit_tokens[0] = estimated_tokens
-                                try:
-                                    on_reasoning(
-                                        "",
-                                        {
-                                            "reasoning_tokens": estimated_tokens,
-                                            "streaming": True,
-                                        },
-                                    )
-                                except Exception:
-                                    pass
-                    for detail in _reasoning_details_from_payload(delta_payload):
-                        reasoning_details.append(detail)
+                kw[key] = deepcopy(value) if isinstance(value, (dict, list)) else value
+            extra_body = _completion_extra_body(cfg)
+            if extra_body:
+                kw["extra_body"] = extra_body
+            _apply_reasoning_options(cfg, kw)
 
-                c = getattr(delta, "content", None)
-                if c:
-                    content_parts.append(c)
-                    if callable(on_chunk):
-                        try:
-                            on_chunk(c)
-                        except Exception:
-                            pass
-        except Exception as e:
-            duration_ms = (time.perf_counter() - t0) * 1000
-            partial = "".join(content_parts)
-            log_model_call(
-                label=f"round {round_i + 1}",
-                model=model,
-                messages=msgs,
-                output=partial,
-                error=str(e)[:300],
-                duration_ms=duration_ms,
-                config=phase_cfg,
-                log_id=lid,
-            )
-            return _prepend_runtime_warnings(_format_model_error_message(e), warning_messages)
+            try:
+                stream = litellm_mod.completion(**kw)
+            except Exception as e:
+                duration_ms = (time.perf_counter() - t0) * 1000
+                log_model_call(
+                    label=f"round {round_i + 1}", model=model, messages=msgs,
+                    output="", error=str(e)[:300], duration_ms=duration_ms, config=cfg,
+                    log_id=lid,
+                )
+                return _prepend_runtime_warnings(_format_model_error_message(e), warning_messages)
+
+            try:
+                for chunk in stream:
+                    u = getattr(chunk, "usage", None)
+                    if u:
+                        usage = _to_dict(u) if not isinstance(u, dict) else u
+
+                    choices = getattr(chunk, "choices", None) or []
+                    if not choices:
+                        continue
+                    delta = getattr(choices[0], "delta", None)
+                    if not delta:
+                        continue
+                    delta_payload = _to_dict(delta)
+                    if isinstance(delta_payload, dict):
+                        _merge_stream_tool_call_deltas(stream_tool_calls, delta_payload)
+                        delta_reasoning_text, _ = _render_reasoning_display(payload=delta_payload)
+                        if delta_reasoning_text:
+                            reasoning_text_parts.append(delta_reasoning_text)
+                            if callable(on_reasoning):
+                                estimated_tokens = _estimate_text_tokens(model, "\n\n".join(reasoning_text_parts))
+                                if estimated_tokens > last_reasoning_emit_tokens[0]:
+                                    last_reasoning_emit_tokens[0] = estimated_tokens
+                                    try:
+                                        on_reasoning(
+                                            "",
+                                            {
+                                                "reasoning_tokens": estimated_tokens,
+                                                "streaming": True,
+                                            },
+                                        )
+                                    except Exception:
+                                        pass
+                        for detail in _reasoning_details_from_payload(delta_payload):
+                            reasoning_details.append(detail)
+
+                    c = getattr(delta, "content", None)
+                    if c:
+                        content_parts.append(c)
+                        if callable(on_chunk):
+                            try:
+                                on_chunk(c)
+                            except Exception:
+                                pass
+            except Exception as e:
+                duration_ms = (time.perf_counter() - t0) * 1000
+                partial = "".join(content_parts)
+                log_model_call(
+                    label=f"round {round_i + 1}",
+                    model=model,
+                    messages=msgs,
+                    output=partial,
+                    error=str(e)[:300],
+                    duration_ms=duration_ms,
+                    config=cfg,
+                    log_id=lid,
+                )
+                return _prepend_runtime_warnings(_format_model_error_message(e), warning_messages)
+            msg_payload = {"tool_calls": [stream_tool_calls[index] for index in sorted(stream_tool_calls)]} if stream_tool_calls else {}
 
         duration_ms = (time.perf_counter() - t0) * 1000
         full_text = "".join(content_parts)
+        if full_text:
+            last = full_text
 
         # Stats & cost
         if not isinstance(usage, dict):
@@ -3233,11 +3724,23 @@ def run_stream(
         if st:
             st.record(usage, cost)
 
+        native_calls = _finalize_stream_tool_calls(stream_tool_calls)
+        if not native_calls and isinstance(msg_payload, dict):
+            native_calls = _parse_native_tool_calls(msg_payload)
+        logged_text = full_text or (_text(msg_payload) if isinstance(msg_payload, dict) else "")
+        tool_preview = _tool_calls_preview_text(native_calls)
+        if logged_text and tool_preview:
+            log_output = f"{logged_text}\n\n{tool_preview}".strip()
+        elif tool_preview:
+            log_output = tool_preview
+        else:
+            log_output = logged_text
+
         # Log
         log_model_call(
             label=f"round {round_i + 1}", model=model, messages=msgs,
-            output=full_text,
-            usage=usage, cost=cost, duration_ms=duration_ms, config=phase_cfg,
+            output=log_output,
+            usage=usage, cost=cost, duration_ms=duration_ms, config=cfg,
             log_id=lid,
         )
 
@@ -3252,75 +3755,54 @@ def run_stream(
             except Exception:
                 pass
 
-        decision = _decide_turn(
+        calls = _collect_loop_calls(
             text=full_text,
-            phase=phase,
+            message_payload=msg_payload,
+            state=loop_state,
             round_i=round_i,
-            max_rounds=max_rounds,
-            phase_state=phase_state,
-            cfg=cfg,
         )
+        assistant_content = _normalize_tool_turn_message(full_text, calls) if calls else _clean_model_text(full_text)
 
-        if decision.kind == "final":
-            final_message = decision.final_text or _format_empty_output_message(phase_cfg, round_i=round_i)
+        progressive_error = _validate_progressive_tool_requirements(loop_state, calls)
+        if progressive_error:
+            loop_state.pending_user_note = progressive_error
+            continue
+
+        if assistant_content.strip():
+            history.append({"role": "assistant", "content": assistant_content})
+
+        if not calls:
+            final_message = _clean_model_text(full_text) or last or _format_empty_output_message(cfg, round_i=round_i)
             return _prepend_runtime_warnings(final_message, warning_messages)
 
         if callable(on_rewind):
-            rewind_tools = None
-            if decision.kind == "tools":
-                rewind_tools = [
-                    (
-                        call["name"],
-                        _tool_preview_callback_args(call["name"], call["args"], config=cfg),
-                    )
-                    for call in decision.calls
-                ]
+            rewind_tools = [
+                (
+                    call["name"],
+                    _tool_preview_callback_args(call["name"], call["args"], config=cfg),
+                )
+                for call in calls
+            ]
             try:
-                on_rewind(decision.assistant_content or full_text, rewind_tools)
+                on_rewind(assistant_content or full_text, rewind_tools)
             except Exception:
                 pass
 
-        if decision.store_assistant_turn:
-            _store_assistant_turn(
-                msgs,
-                None,
-                content=decision.assistant_content or (full_text or "继续"),
-                reasoning_text_parts=reasoning_text_parts,
-                reasoning_details=reasoning_details,
-            )
-        phase_transition_to_stage2 = phase != _PHASE_STAGE2 and decision.next_phase == _PHASE_STAGE2
-        phase_state.phase = decision.next_phase
-
-        if phase_transition_to_stage2:
-            _reset_runtime_state_for_execute(runtime_state)
-            phase_state.stage2_turns = 0
-            msgs = _build_stage2_phase_messages(
-                cfg=cfg,
-                prompt_text=prompt_text,
-                phase_state=phase_state,
-            )
-            continue
-
-        if decision.kind != "tools":
-            if decision.user_content:
-                msgs.append({"role": "user", "content": decision.user_content})
-            continue
-
         if callable(on_status):
             on_status(STATUS_SEARCHING)
-        payload_map = _execute_calls_parallel(
-            calls=decision.calls,
+        _execute_loop_calls(
+            calls=calls,
             cfg=cfg,
             stats=st,
             prompt_text=prompt_text,
             log_id=lid,
             runtime_state=runtime_state,
+            context_state=loop_state,
             started_at=started_at,
             on_tool=on_tool,
-            progress_callback=on_tool if callable(on_tool) else None,
+            progress_callback=None,
         )
-        results_xml = _results_xml_from_payloads(decision.calls, payload_map)
-        next_tool_results_text = _tool_results_for_next_round(results_xml, round_i=round_i, max_rounds=max_rounds)
-        msgs.append({"role": "user", "content": next_tool_results_text})
+        _advance_progressive_disclosure(loop_state, calls)
 
-    return _prepend_runtime_warnings(_format_empty_output_message(cfg, round_i=max_rounds - 1), warning_messages)
+    final_message = _clean_model_text(last) or _format_empty_output_message(cfg, round_i=max_rounds - 1)
+    return _prepend_runtime_warnings(final_message, warning_messages)

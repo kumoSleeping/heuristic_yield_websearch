@@ -62,12 +62,23 @@ Config file: `~/.hyw/config.yml`. Use `/config` in interactive mode to edit dire
 An example based on the multi-model layout lives at `config.example.yml`.
 In interactive mode, `← / →` switches models, and `↑ / ↓` toggles multi-turn vs new session.
 Legacy single-model fields (`model` / `api_key` / `api_base`) still work.
+You can also define named transport presets via `model_provider` / `model_providers` for OpenAI-compatible relays.
 
 ```yaml
 # Shared provider defaults.
 # `models[*]` and `sub_agent.*` inherit these unless they override them.
 api_key: sk-or-xxx
 api_base: https://openrouter.ai/api/v1
+
+# Optional LiteLLM transport preset.
+# `requires_openai_auth: true` means "use OPENAI_API_KEY if api_key is omitted".
+# model_provider: mirror
+# model_providers:
+#   mirror:
+#     base_url: https://chat.soruxgpt.com/codex
+#     wire_api: responses
+#     requires_openai_auth: true
+#     custom_llm_provider: openai
 
 # Main controller model used at startup / single-shot mode.
 # You can set this to either a profile `name` or a raw model id.
@@ -135,6 +146,7 @@ stages:
 What each block does now:
 
 - `api_key` / `api_base`: shared defaults inherited by `models[*]` and `sub_agent.*`.
+- `model_provider` / `model_providers`: named transport presets that expand into LiteLLM fields such as `api_base`, `custom_llm_provider`, and `api_key_env`.
 - `active_model`: the main controller model currently selected; can match either a profile `name` or a raw model id.
 - `models`: switchable main-model profiles for CLI left/right model selection.
 - `language` / `stream` / `headless` / `system_prompt`: active runtime options used by the current flow.

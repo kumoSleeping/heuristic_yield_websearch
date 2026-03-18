@@ -37,13 +37,13 @@ from rich.theme import Theme
 from .config import (
     CONFIG_PATH,
     DEFAULT_NAME,
+    build_model_config,
     ensure_config_file,
     get_model_profiles,
     load_config,
 )
 from .main import (
     Stats,
-    build_stage_model_config,
     get_runtime_prewarm_label,
     run,
     run_stream,
@@ -51,6 +51,7 @@ from .main import (
     startup_tools,
     shutdown_tools,
 )
+from .tool_view import format_tool_view_argument
 
 try:
     from prompt_toolkit import PromptSession
@@ -90,6 +91,8 @@ _MD_IMAGE_RE = re.compile(r"!\[([^\]]*)\]\(([^)\n]+)\)")
 _TASK_LIST_BLOCK_RE = re.compile(r"<task_list\b[^>]*>.*?</task_list>", flags=re.IGNORECASE | re.DOTALL)
 _ARTICLE_SKELETON_BLOCK_RE = re.compile(r"<article_skeleton\b[^>]*>.*?</article_skeleton>", flags=re.IGNORECASE | re.DOTALL)
 _SEARCH_REWRITE_BLOCK_RE = re.compile(r"<search_rewrite\b[^>]*>.*?</search_rewrite>", flags=re.IGNORECASE | re.DOTALL)
+_PROJECT_LANGUAGE_BLOCK_RE = re.compile(r"<project_language\b[^>]*>.*?</project_language>", flags=re.IGNORECASE | re.DOTALL)
+_VERIFICATION_PROGRESS_BLOCK_RE = re.compile(r"<verification_progress\b[^>]*>.*?</verification_progress>", flags=re.IGNORECASE | re.DOTALL)
 _KEYWORD_REWRITE_BLOCK_RE = re.compile(r"<keyword_rewrite\b[^>]*>.*?</keyword_rewrite>", flags=re.IGNORECASE | re.DOTALL)
 _USER_NEED_BLOCK_RE = re.compile(r"<user_need\b[^>]*>.*?</user_need>", flags=re.IGNORECASE | re.DOTALL)
 _VERIFICATION_OUTLINE_BLOCK_RE = re.compile(r"<verification_outline\b[^>]*>.*?</verification_outline>", flags=re.IGNORECASE | re.DOTALL)
@@ -1141,24 +1144,7 @@ def _pull_clipboard_prompt_input() -> _PromptInput:
 
 # ── Tool call formatting ─────────────────────────────────────
 def _fmt_args(name: str, args: dict) -> str:
-    if name in ("web_search", "web_search_wiki"):
-        return str(args.get("query") or "").strip()
-    if name == "page_extract":
-        url = str(args.get("url") or "").strip()
-        query = re.sub(r"\s+", " ", str(args.get("query") or "").strip())
-        lines = str(args.get("lines") or "").strip()
-        host = ""
-        if url:
-            parsed = urlparse(url)
-            host = str(parsed.netloc or parsed.path or "").strip()
-            if host.startswith("www."):
-                host = host[4:]
-        line_label = "all" if lines.lower() == "all" else (f"{lines}line" if lines else "")
-        parts = [part for part in (host, query, line_label) if part]
-        return ", ".join(parts)
-    if name == "sub_agent_task":
-        return _format_sub_agent_argument(args)
-    return str(args)[:160]
+    return format_tool_view_argument(name, args, max_items=12, max_chars=160)
 
 
 def _sub_agent_binding_parts(args: dict) -> tuple[str, str]:
@@ -1230,6 +1216,7 @@ def _tool_line(name: str, args: dict) -> Text:
     page_usage_tokens = args.get("_page_usage_tokens")
     compression_cost_usd = args.get("_compression_cost_usd")
     level = max(0, int(args.get("_level") or 0))
+    progress_status = str(args.get("_progress_status") or "").strip().lower()
 
     line = Text()
     line.append("  " + ("  " * level) + "> ", style=f"bold {ACCENT}")
@@ -1253,6 +1240,15 @@ def _tool_line(name: str, args: dict) -> Text:
     elif formatted:
         line.append(f"({formatted})", style=TEXT_MUTED)
     if pending:
+        if name == "page_extract":
+            status_label = "querying"
+            if progress_status == "failed":
+                status_label = "failed"
+            elif progress_status == "done":
+                status_label = "done"
+            line.append(f" {status_label}", style=TEXT_MUTED)
+        elif name in ("web_search", "web_search_wiki"):
+            line.append(" searching", style=TEXT_MUTED)
         frame = _FRAMES[int(time.time() * 12) % len(_FRAMES)]
         line.append(f" {frame}", style=TEXT_MUTED)
     elif ok is False:
@@ -1352,6 +1348,15 @@ def _render_keyword_rewrite_xml(match: re.Match[str]) -> str:
     return "### Keyword Rewrite\n" + "\n".join(f"- {term}" for term in terms)
 
 
+def _render_project_language_xml(match: re.Match[str]) -> str:
+    block = str(match.group(0) or "")
+    value = re.sub(r"</?project_language\b[^>]*>", "", block, flags=re.IGNORECASE)
+    value = re.sub(r"\s+", " ", value).strip()
+    if not value:
+        return ""
+    return "### Project Language\n- " + value
+
+
 def _render_user_need_xml(match: re.Match[str]) -> str:
     block = str(match.group(0) or "")
     items = [
@@ -1395,6 +1400,7 @@ def _clean_answer(text: str) -> str:
         return f"{label}: [{raw_target}]({raw_target})"
 
     cleaned = _MD_IMAGE_RE.sub(_image_to_link, cleaned)
+    cleaned = _PROJECT_LANGUAGE_BLOCK_RE.sub(_render_project_language_xml, cleaned)
     cleaned = _KEYWORD_REWRITE_BLOCK_RE.sub(_render_keyword_rewrite_xml, cleaned)
     cleaned = _USER_NEED_BLOCK_RE.sub(_render_user_need_xml, cleaned)
     cleaned = _VERIFICATION_OUTLINE_BLOCK_RE.sub(_render_verification_outline_xml, cleaned)
@@ -1404,7 +1410,7 @@ def _clean_answer(text: str) -> str:
     cleaned = _TOOL_BLOCK_RE.sub("", cleaned)
     cleaned = _TOOL_SELF_CLOSING_RE.sub("", cleaned)
     # 清理残留的 XML 工具标签
-    cleaned = re.sub(r"</?(?:search|wiki|sub_agent|page|tool_results|result|article_skeleton|search_rewrite|keyword_rewrite|user_need|verification_outline|section|title|term|t|u|i)\b[^>]*>", "", cleaned)
+    cleaned = re.sub(r"</?(?:search|wiki|sub_agent|page|tool_results|result|article_skeleton|search_rewrite|project_language|verification_progress|keyword_rewrite|user_need|verification_outline|section|title|term|t|u|i)\b[^>]*>", "", cleaned)
     return cleaned.strip()
 
 
@@ -1446,6 +1452,23 @@ def _animated_placeholder_label(text: str) -> list[tuple[str, str]]:
     return [("", label)]
 
 
+def _model_placeholder_parts(model: str, runtime_label: str) -> list[tuple[str, str]]:
+    model_text = str(model or "").strip()
+    label = str(runtime_label or "").strip()
+    if not model_text:
+        return _animated_placeholder_label(label)
+
+    parts: list[tuple[str, str]] = [("class:model_placeholder", model_text)]
+    if label and label != "✓":
+        if label.endswith("..."):
+            parts.append(("", " "))
+            parts.append(("class:placeholder_hint", _spinner_frame()))
+        else:
+            parts.append(("", " "))
+            parts.append(("class:placeholder_hint", label))
+    return parts
+
+
 def _prompt_status(mode_state: dict | None = None) -> str:
     state = mode_state or {}
     if str(state.get("config_issue") or "").strip():
@@ -1467,11 +1490,9 @@ def _prompt_placeholder(mode_state: dict | None = None) -> list[tuple[str, str]]
     model = str(state.get("model") or "").strip()
     runtime = state.get("_runtime_label")
     label = str(runtime() if callable(runtime) else "").strip()
-    if label and label != "✓":
-        return _animated_placeholder_label(label)
-    if not model:
+    if not model and not label:
         return []
-    return [("", model)]
+    return _model_placeholder_parts(model, label)
 
 
 def _prompt_parts(mode_state: dict | None = None) -> list[tuple[str, str]]:
@@ -1566,6 +1587,12 @@ def _provider_from_model_id(model_id: str) -> str:
 
 
 def _model_provider(profile: dict[str, Any]) -> str:
+    provider = str(profile.get("model_provider") or "").strip().lower()
+    if provider:
+        return provider
+    provider = str(profile.get("custom_llm_provider") or "").strip().lower()
+    if provider:
+        return provider
     provider = _provider_from_api_base(str(profile.get("api_base") or ""))
     if provider:
         return provider
@@ -1595,7 +1622,11 @@ def _canonical_model_label(profile: dict[str, Any]) -> str:
 
 
 def _display_model_label(profile: dict[str, Any]) -> str:
-    return _canonical_model_label(profile)
+    label = _canonical_model_label(profile)
+    effort = str(profile.get("reasoning_effort") or "").strip().lower()
+    if label and effort and effort not in {"none"}:
+        return f"{label} ({effort})"
+    return label
 
 
 def _mode_stage_index(mode_state: dict[str, Any], key: str, default: int) -> int:
@@ -1607,63 +1638,8 @@ def _mode_stage_index(mode_state: dict[str, Any], key: str, default: int) -> int
     return default
 
 
-def _stage_model_display_label(cfg: dict[str, Any]) -> str:
-    profile = {
-        "model": str(cfg.get("model") or "").strip(),
-        "api_base": str(cfg.get("api_base") or "").strip(),
-    }
-    return _display_model_label(profile)
-
-
-def _stage_model_chain(
-    config: dict[str, Any],
-    *,
-    stage1_model_index: int,
-    stage2_model_index: int,
-) -> tuple[str, str, str]:
-    stage1_cfg = build_stage_model_config(
-        config,
-        "stage1",
-        stage1_model_index=stage1_model_index,
-        stage2_model_index=stage2_model_index,
-    )
-    stage2_cfg = build_stage_model_config(
-        config,
-        "stage2",
-        stage1_model_index=stage1_model_index,
-        stage2_model_index=stage2_model_index,
-    )
-    stage1_model_raw = str(stage1_cfg.get("model") or "").strip()
-    stage2_model_raw = str(stage2_cfg.get("model") or "").strip()
-    stage1_label = _stage_model_display_label(stage1_cfg)
-    stage2_label = _stage_model_display_label(stage2_cfg)
-    stage1_provider = _model_provider(
-        {
-            "model": str(stage1_cfg.get("model") or "").strip(),
-            "api_base": str(stage1_cfg.get("api_base") or "").strip(),
-        }
-    )
-    stage2_provider = _model_provider(
-        {
-            "model": str(stage2_cfg.get("model") or "").strip(),
-            "api_base": str(stage2_cfg.get("api_base") or "").strip(),
-        }
-    )
-    if stage1_model_raw and stage1_model_raw == stage2_model_raw:
-        stage2_label = stage1_label
-    elif stage1_provider and stage1_provider == stage2_provider:
-        compact_stage2 = _compact_model_id(str(stage2_cfg.get("model") or "").strip(), stage2_provider)
-        if compact_stage2:
-            stage2_label = compact_stage2
-    chain = stage1_label
-    if stage2_label and stage2_label != stage1_label:
-        chain = f"{stage1_label} -> {stage2_label}"
-    return stage1_label, stage2_label, chain
-
-
 def _apply_model_state(mode_state: dict, stage1_index: int | None = None, stage2_index: int | None = None) -> None:
     models = mode_state.get("models") or []
-    raw_config = mode_state.get("config") if isinstance(mode_state.get("config"), dict) else {}
     if not isinstance(models, list) or not models:
         mode_state["stage1_model_index"] = 0
         mode_state["stage2_model_index"] = 0
@@ -1677,38 +1653,27 @@ def _apply_model_state(mode_state: dict, stage1_index: int | None = None, stage2
 
     count = len(models)
     idx1 = int((0 if stage1_index is None else stage1_index) or 0) % count
-    idx2_default = 1 if count > 1 else 0
-    idx2 = int((idx2_default if stage2_index is None else stage2_index) or 0) % count
     current = models[idx1] if isinstance(models[idx1], dict) else {}
     provider = _model_provider(current)
-    stage1_label, stage2_label, chain_label = _stage_model_chain(
-        raw_config,
-        stage1_model_index=idx1,
-        stage2_model_index=idx2,
-    )
-    label = chain_label or _display_model_label(current)
+    label = _display_model_label(current)
     mode_state["stage1_model_index"] = idx1
-    mode_state["stage2_model_index"] = idx2
+    mode_state["stage2_model_index"] = idx1
     mode_state["model_count"] = len(models)
     mode_state["model"] = label
-    mode_state["model_id"] = stage1_label or str(current.get("model") or "").strip()
+    mode_state["model_id"] = str(current.get("model") or "").strip()
     mode_state["model_provider"] = provider
-    mode_state["stage1_model"] = stage1_label
-    mode_state["stage2_model"] = stage2_label
+    mode_state["stage1_model"] = label
+    mode_state["stage2_model"] = ""
 
 
 def _cycle_model(mode_state: dict, stage: str, delta: int = 1) -> None:
     models = mode_state.get("models") or []
     if not isinstance(models, list) or len(models) <= 1:
         return
-    stage_name = str(stage or "").strip().lower()
     stage1_index = _mode_stage_index(mode_state, "stage1_model_index", 0)
-    stage2_index = _mode_stage_index(mode_state, "stage2_model_index", 1 if len(models) > 1 else 0)
-    if stage_name == "stage2":
-        stage2_index += delta
-    else:
-        stage1_index += delta
-    _apply_model_state(mode_state, stage1_index, stage2_index)
+    del stage
+    stage1_index += delta
+    _apply_model_state(mode_state, stage1_index, stage1_index)
     runtime_prewarm = mode_state.get("_runtime_prewarm")
     if callable(runtime_prewarm):
         try:
@@ -1728,7 +1693,7 @@ def _ask(session, *, mode_state: dict | None = None) -> _PromptInput:
 
         @kb.add("left", filter=Condition(lambda: not session.app.current_buffer.text))
         def _cycle_stage1(event):
-            _cycle_model(mode_state, "stage1", 1)
+            _cycle_model(mode_state, "stage1", -1)
             event.app.invalidate()
 
         @kb.add("right", filter=Condition(lambda: not session.app.current_buffer.text))
@@ -1804,17 +1769,19 @@ def _ask(session, *, mode_state: dict | None = None) -> _PromptInput:
                 "prompt": f"bold {INPUT_ACCENT}",
                 "mode": "bold",
                 "status": INPUT_HINT,
+                "model_placeholder": f"fg:{INPUT_TEXT}",
                 "placeholder": f"fg:{INPUT_PLACEHOLDER}",
-                "placeholder_hint": f"fg:{INPUT_PLACEHOLDER}",
+                "placeholder_hint": f"fg:{INPUT_HINT}",
                 "bottom-toolbar": f"fg:{INPUT_PLACEHOLDER} bg:default noreverse",
                 "toolbar": f"fg:{INPUT_PLACEHOLDER}",
             }
         )
+        bottom_toolbar = _prompt_bottom_toolbar_provider(mode_state)
         try:
             raw_text = session.prompt(
                 _get_prompt,
                 rprompt=_get_rprompt,
-                bottom_toolbar=lambda: _prompt_bottom_toolbar(mode_state),
+                bottom_toolbar=bottom_toolbar,
                 multiline=False,
                 style=input_style,
                 input_processors=input_processors,
@@ -1834,15 +1801,17 @@ def _ask(session, *, mode_state: dict | None = None) -> _PromptInput:
                 "": INPUT_TEXT,
                 "prompt": f"bold {INPUT_ACCENT}",
                 "mode": "bold",
+                "model_placeholder": f"fg:{INPUT_TEXT}",
                 "placeholder": f"fg:{INPUT_PLACEHOLDER}",
-                "placeholder_hint": f"fg:{INPUT_PLACEHOLDER}",
+                "placeholder_hint": f"fg:{INPUT_HINT}",
                 "bottom-toolbar": f"fg:{INPUT_PLACEHOLDER} bg:default noreverse",
                 "toolbar": f"fg:{INPUT_PLACEHOLDER}",
             }
         )
+        bottom_toolbar = _prompt_bottom_toolbar_provider(mode_state)
         raw_text = session.prompt(
             _prompt_parts(mode_state),
-            bottom_toolbar=lambda: _prompt_bottom_toolbar(mode_state),
+            bottom_toolbar=bottom_toolbar,
             multiline=False,
             style=input_style,
             input_processors=[
@@ -2169,6 +2138,12 @@ def _prompt_bottom_toolbar(mode_state: dict | None = None) -> list[tuple[str, st
     return [("", " " * pad), *parts]
 
 
+def _prompt_bottom_toolbar_provider(mode_state: dict | None = None):
+    if not _turn_stats_toolbar_parts((mode_state or {}).get("last_turn_stats")):
+        return None
+    return lambda: _prompt_bottom_toolbar(mode_state)
+
+
 def _estimate_preview_tokens(text: str) -> int:
     body = str(text or "").strip()
     if not body:
@@ -2309,6 +2284,18 @@ def _run_non_streaming(
         transient=True,
     )
     live.start()
+    refresh_stop = threading.Event()
+
+    def _live_refresh_loop() -> None:
+        while not refresh_stop.is_set():
+            try:
+                _refresh_live()
+            except Exception:
+                pass
+            refresh_stop.wait(0.12)
+
+    refresh_thread = threading.Thread(target=_live_refresh_loop, name="hyw-live-refresh", daemon=True)
+    refresh_thread.start()
 
     def _on_reasoning(text: str, meta: dict[str, Any]) -> None:
         del text, meta
@@ -2388,6 +2375,8 @@ def _run_streaming(
     thinking_meta = [None]
     t_start = time.monotonic()
     turn_stats_before = _stats_snapshot(stats)
+    refresh_stop = threading.Event()
+    refresh_thread: threading.Thread | None = None
 
     def _current_turn_stats(preview_text: str = "") -> dict[str, Any]:
         delta = _stats_delta(turn_stats_before, _stats_snapshot(stats), elapsed=time.monotonic() - t_start)
@@ -2411,6 +2400,18 @@ def _run_streaming(
             return None
         return tool_renderable
 
+    def _settle_tool_status_history() -> object | None:
+        with tool_state_lock:
+            snapshot = [(name, dict(args)) for name, args in tool_states]
+            if not snapshot:
+                next_tool_done_index[0] = 0
+                return None
+            tool_renderable = Group(*(_tool_line(name, args) for name, args in snapshot))
+            settled.append(tool_renderable)
+            tool_states.clear()
+            next_tool_done_index[0] = 0
+            return tool_renderable
+
     def _finish_live(
         *,
         reply_text: str = "",
@@ -2418,6 +2419,7 @@ def _run_streaming(
         note_text: str = "",
         note_style: str | None = None,
     ) -> None:
+        refresh_stop.set()
         with tool_state_lock:
             tool_renderable = _snapshot_tool_status()
             tool_states.clear()
@@ -2439,6 +2441,11 @@ def _run_streaming(
                 console.print(final_block)
         except Exception:
             console.print(final_block)
+        try:
+            if refresh_thread is not None:
+                refresh_thread.join(timeout=0.2)
+        except Exception:
+            pass
 
     def _current_live_renderable() -> object:
         preview_text = _clean_answer("".join(chunks))
@@ -2505,13 +2512,7 @@ def _run_streaming(
 
     def _on_chunk(delta: str) -> None:
         nonlocal live
-        with tool_state_lock:
-            if tool_states:
-                tool_renderable = _snapshot_tool_status()
-                if tool_renderable is not None:
-                    settled.append(tool_renderable)
-                tool_states.clear()
-                next_tool_done_index[0] = 0
+        _settle_tool_status_history()
         chunks.append(delta)
         now = time.monotonic()
         if now - last_update[0] > 0.15:
@@ -2522,11 +2523,11 @@ def _run_streaming(
         rewind_source = str(thinking or "")
         if not rewind_source.strip():
             rewind_source = "".join(chunks)
+        _settle_tool_status_history()
         clean = _clean_answer(rewind_source) if rewind_source else ""
         if clean.strip():
             settled.append(_render_reply_body(clean, preview=True))
         with tool_state_lock:
-            tool_states.clear()
             for name, args in tools or []:
                 row_args = dict(args)
                 row_args["_pending"] = True
@@ -2587,6 +2588,17 @@ def _run_streaming(
         transient=True,
     )
     live.start()
+
+    def _live_refresh_loop() -> None:
+        while not refresh_stop.is_set():
+            try:
+                _refresh_live()
+            except Exception:
+                pass
+            refresh_stop.wait(0.12)
+
+    refresh_thread = threading.Thread(target=_live_refresh_loop, name="hyw-live-refresh", daemon=True)
+    refresh_thread.start()
 
     try:
         answer = run_stream(
@@ -2667,7 +2679,7 @@ def main(argv: list[str] | None = None):
         "config": config,
         "models": models,
         "stage1_model_index": config.get("stage1_model_index") or 0,
-        "stage2_model_index": config.get("stage2_model_index") if config.get("stage2_model_index") is not None else (1 if len(models) > 1 else 0),
+        "stage2_model_index": config.get("stage1_model_index") or 0,
         "name": config.get("name") or DEFAULT_NAME,
         "config_issue": config_issue,
         "config_error": config_error,
@@ -2678,22 +2690,18 @@ def main(argv: list[str] | None = None):
     _apply_model_state(
         mode_state,
         _mode_stage_index(mode_state, "stage1_model_index", 0),
-        _mode_stage_index(mode_state, "stage2_model_index", 1 if len(models) > 1 else 0),
+        _mode_stage_index(mode_state, "stage1_model_index", 0),
     )
 
     def _session_request_config() -> dict:
         request_cfg = dict(config)
-        request_cfg["stage1_model_index"] = _mode_stage_index(mode_state, "stage1_model_index", 0)
-        request_cfg["stage2_model_index"] = _mode_stage_index(mode_state, "stage2_model_index", 1 if len(mode_state.get("models") or []) > 1 else 0)
+        current_index = _mode_stage_index(mode_state, "stage1_model_index", 0)
+        request_cfg["stage1_model_index"] = current_index
+        request_cfg["stage2_model_index"] = current_index
         return request_cfg
 
     def _active_stage1_config() -> dict:
-        return build_stage_model_config(
-            _session_request_config(),
-            "stage1",
-            stage1_model_index=_mode_stage_index(mode_state, "stage1_model_index", 0),
-            stage2_model_index=_mode_stage_index(mode_state, "stage2_model_index", 1 if len(mode_state.get("models") or []) > 1 else 0),
-        )
+        return build_model_config(_session_request_config())
 
     if config_issue:
         mode_state["_runtime_prewarm"] = lambda: None
@@ -2752,7 +2760,7 @@ def main(argv: list[str] | None = None):
                 _apply_model_state(
                     mode_state,
                     _mode_stage_index(mode_state, "stage1_model_index", 0),
-                    _mode_stage_index(mode_state, "stage2_model_index", 1 if len(mode_state.get("models") or []) > 1 else 0),
+                    _mode_stage_index(mode_state, "stage1_model_index", 0),
                 )
                 headless = config.get("headless") not in (False, "false", "0", 0)
                 if config_issue:

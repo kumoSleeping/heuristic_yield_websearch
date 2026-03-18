@@ -46,6 +46,7 @@ from arclet.entari.event.lifespan import Cleanup, Startup
 from .config import DEFAULT_TOOL_SELECTIONS, cfg_get, load_config, normalize_tool_provider_name
 from .main import Stats, run, run_stream, shutdown_tools, startup_tools
 from .render import render_markdown_result
+from .tool_view import format_tool_view_argument
 
 try:
     from importlib.metadata import version as get_version
@@ -67,8 +68,14 @@ _MD_IMAGE_RE = re.compile(r"!\[[^\]]*]\(([^)]+)\)", flags=re.IGNORECASE)
 _TASK_LIST_BLOCK_RE = re.compile(r"<task_list\b[^>]*>.*?</task_list>", flags=re.IGNORECASE | re.DOTALL)
 _ARTICLE_SKELETON_BLOCK_RE = re.compile(r"<article_skeleton\b[^>]*>.*?</article_skeleton>", flags=re.IGNORECASE | re.DOTALL)
 _SEARCH_REWRITE_BLOCK_RE = re.compile(r"<search_rewrite\b[^>]*>.*?</search_rewrite>", flags=re.IGNORECASE | re.DOTALL)
-_TOOL_BLOCK_RE = re.compile(r"<(?:search|wiki|sub_agent|page)\b[^>]*>.*?</(?:search|wiki|sub_agent|page)>", flags=re.IGNORECASE | re.DOTALL)
-_TOOL_SELF_CLOSING_RE = re.compile(r"<(?:search|wiki|sub_agent|page)\b[^>]*/>", flags=re.IGNORECASE)
+_TOOL_BLOCK_RE = re.compile(
+    r"<(?:search|wiki|sub_agent|page|context_keep|context_update|context_delete)\b[^>]*>.*?</(?:search|wiki|sub_agent|page|context_keep|context_update|context_delete)>",
+    flags=re.IGNORECASE | re.DOTALL,
+)
+_TOOL_SELF_CLOSING_RE = re.compile(
+    r"<(?:search|wiki|sub_agent|page|context_keep|context_update|context_delete)\b[^>]*/>",
+    flags=re.IGNORECASE,
+)
 _ENTARI_RENDER_PROVIDER = "md2png_lite"
 
 
@@ -120,6 +127,7 @@ def _format_search_progress_lines(queries: list[str]) -> str:
 class PluginConfig(BasicConfModel):
     question_command: str = ".q"
     quote: bool = False
+    verbose: bool = False
     render_theme: str = "paper"
 
 
@@ -212,50 +220,16 @@ def _clean_answer(text: str) -> str:
     cleaned = _ARTICLE_SKELETON_BLOCK_RE.sub(_render_article_skeleton_xml, cleaned)
     cleaned = _TOOL_BLOCK_RE.sub("", cleaned)
     cleaned = _TOOL_SELF_CLOSING_RE.sub("", cleaned)
-    cleaned = re.sub(r"</?(?:search|wiki|sub_agent|page|tool_results|result|article_skeleton|search_rewrite|section|title|term)\b[^>]*>", "", cleaned)
+    cleaned = re.sub(
+        r"</?(?:search|wiki|sub_agent|page|context_keep|context_update|context_delete|tool_results|result|article_skeleton|search_rewrite|section|title|term)\b[^>]*>",
+        "",
+        cleaned,
+    )
     return cleaned.strip()
 
 
 def _format_tool_argument(name: str, arguments: Any) -> str:
-    payload = _as_dict(arguments)
-    if name in ("web_search", "web_search_wiki"):
-        return _format_web_search_query(payload)
-    if name == "page_extract":
-        url = str(payload.get("url") or "").strip()
-        host = ""
-        if url:
-            parsed = urlparse(url)
-            host = str(parsed.netloc or parsed.path or "").strip()
-            if host.startswith("www."):
-                host = host[4:]
-        query = re.sub(r"\s+", " ", str(payload.get("query") or "").strip())
-        lines = str(payload.get("lines") or "").strip()
-        line_label = "all" if lines.lower() == "all" else (f"{lines}line" if lines else "")
-        parts = [part for part in (host, query, line_label) if part]
-        return ", ".join(parts)
-    if name == "sub_agent_task":
-        tools = str(payload.get("tools") or "").strip()
-        url = str(payload.get("url") or "").strip()
-        task = re.sub(r"\s+", " ", str(payload.get("task") or "").strip())
-        host = ""
-        if url:
-            parsed = urlparse(url)
-            host = str(parsed.netloc or parsed.path or "").strip()
-            if host.startswith("www."):
-                host = host[4:]
-        binding = ""
-        if tools and host:
-            binding = f"{tools}({host})"
-        elif tools:
-            binding = tools
-        elif host:
-            binding = host
-        if task:
-            task = task[:120]
-        if binding and task:
-            return f"{binding}, {task}"
-        return binding or task
-    return json.dumps(payload, ensure_ascii=False) if payload else ""
+    return format_tool_view_argument(name, _as_dict(arguments), max_items=12, max_chars=160)
 
 
 def _format_tool_trace_line(name: str, arguments: Any) -> str:
@@ -367,13 +341,14 @@ def _provider_summary(config: dict[str, Any], capability: str) -> str:
 
 def _planned_notice_line(name: str, args: dict[str, Any], config: dict[str, Any]) -> str:
     payload = _as_dict(args)
-    if str(name or "").strip() == "web_search":
+    tool_name = str(name or "").strip()
+    if tool_name == "web_search":
         provider = _provider_summary(config, "search")
         suffix = f"[{provider}]" if provider else ""
         query = re.sub(r"\s+", " ", str(payload.get("query") or "").strip())
         return f"Search{suffix}: {query}".strip()
 
-    if str(name or "").strip() == "page_extract":
+    if tool_name == "page_extract":
         provider = _provider_summary(config, "page_extract")
         suffix = f"[{provider}]" if provider else ""
         url = str(payload.get("url") or "").strip()
@@ -384,6 +359,18 @@ def _planned_notice_line(name: str, args: dict[str, Any], config: dict[str, Any]
             host = str(parsed.netloc or parsed.path or "").strip()
         host_block = f"<{host}> " if host else ""
         return f"Page{suffix}: {host_block}{query}".strip()
+
+    if tool_name == "context_keep":
+        summary = _format_tool_argument(tool_name, payload)
+        return f"Context Keep: {summary}".strip(": ").strip()
+
+    if tool_name == "context_update":
+        summary = _format_tool_argument(tool_name, payload)
+        return f"Context Update: {summary}".strip(": ").strip()
+
+    if tool_name == "context_delete":
+        summary = _format_tool_argument(tool_name, payload)
+        return f"Context Delete: {summary}".strip(": ").strip()
 
     tools = str(payload.get("tools") or "").strip().lower()
     task = re.sub(r"\s+", " ", str(payload.get("task") or "").strip())
@@ -591,12 +578,7 @@ async def handle_question(session: Session[MessageCreatedEvent], result: Arparma
     if not user_input and not mc.get(Image):
         return
 
-    images, _ = await process_images(mc, None)
-    question = user_input or "请根据图片内容进行分析并回答。"
     quote_id = session.event.message.id if conf.quote else None
-    loop = asyncio.get_running_loop()
-    sent_round_messages: set[str] = set()
-    sent_round_lock = threading.Lock()
 
     def _build_round_chain(text: str) -> MessageChain:
         chain = MessageChain(Text(text))
@@ -604,7 +586,21 @@ async def handle_question(session: Session[MessageCreatedEvent], result: Arparma
             chain = MessageChain(Quote(quote_id)) + chain
         return chain
 
+    if not conf.verbose:
+        try:
+            await session.send(_build_round_chain("Thinking..."))
+        except Exception as exc:
+            logger.warning("Thinking notice send failed in entari plugin: {}", exc)
+
+    images, _ = await process_images(mc, None)
+    question = user_input or "请根据图片内容进行分析并回答。"
+    loop = asyncio.get_running_loop()
+    sent_round_messages: set[str] = set()
+    sent_round_lock = threading.Lock()
+
     def _on_rewind(thinking: str, tools: list[tuple[str, dict[str, Any]]] | None = None) -> None:
+        if not conf.verbose:
+            return
         clean = _planned_sub_agent_block(tools, config=config) if tools else ""
         if not clean:
             clean = _clean_answer(thinking)
@@ -633,7 +629,7 @@ async def handle_question(session: Session[MessageCreatedEvent], result: Arparma
             "stats": stats,
             "images": images,
         }
-        if runner is run_stream:
+        if runner is run_stream and conf.verbose:
             kwargs["on_rewind"] = _on_rewind
         final_content = await asyncio.to_thread(
             runner,

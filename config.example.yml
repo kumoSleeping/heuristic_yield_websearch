@@ -6,6 +6,16 @@
 api_key: sk-or-xxx
 api_base: https://openrouter.ai/api/v1
 
+# Optional named transport presets for LiteLLM.
+# Useful for OpenAI-compatible relays that should still use OPENAI_API_KEY.
+# model_provider: mirror
+# model_providers:
+#   mirror:
+#     base_url: https://chat.soruxgpt.com/codex
+#     wire_api: responses
+#     requires_openai_auth: true
+#     custom_llm_provider: openai
+
 models:
   - name: gemini-lite
     model: openrouter/google/gemini-3.1-flash-lite-preview

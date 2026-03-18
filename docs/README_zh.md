@@ -62,12 +62,23 @@ hyw -q "最近有什么科技新闻？"
 仓库根目录提供了一份可直接参考的 `config.example.yml`。
 交互模式里空输入时，`←` 用于切换 stage1，`→` 用于切换 stage2，`↑ / ↓` 用于切换多轮/新会话。
 旧的单模型写法（`model` / `api_key` / `api_base`）仍然兼容。
+也支持通过 `model_provider` / `model_providers` 定义命名 transport 预设，方便接 OpenAI 兼容中转。
 
 ```yaml
 # 共享 provider 默认值。
 # `models[*]` 和 `sub_agent.*` 没有单独覆写时都会继承这里。
 api_key: sk-or-xxx
 api_base: https://openrouter.ai/api/v1
+
+# 可选的 LiteLLM transport 预设。
+# `requires_openai_auth: true` 表示未显式填写 api_key 时，读取 OPENAI_API_KEY。
+# model_provider: mirror
+# model_providers:
+#   mirror:
+#     base_url: https://chat.soruxgpt.com/codex
+#     wire_api: responses
+#     requires_openai_auth: true
+#     custom_llm_provider: openai
 
 models:
   - name: gemini-lite
@@ -123,6 +134,7 @@ tools:
 现在可以直接这样理解这些配置：
 
 - `api_key` / `api_base`：顶层默认值，给 `models[*]` 和 `sub_agent.*` 继承。
+- `model_provider` / `model_providers`：命名 transport 预设，会展开成 LiteLLM 能识别的 `api_base`、`custom_llm_provider`、`api_key_env` 等字段。
 - `models`：两阶段主模型候选列表。默认 `models[0]` 是 stage1，`models[1]` 是 stage2。
 - `language` / `stream` / `headless` / `system_prompt`：当前主流程真实生效。
 - `max_rounds`：主循环最大轮次，默认是 `8`。

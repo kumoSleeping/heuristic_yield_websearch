@@ -143,7 +143,7 @@ def _jina_headers(
     if capability == "search":
         headers.setdefault("X-Respond-With", "no-content")
     if capability == "page_extract":
-        # headers.setdefault("X-Engine", "direct")
+        headers.setdefault("X-Engine", "direct")
         if _jina_prefer_free(config, capability) and _has_auth_header(headers) and not _use_page_extract_api_key(config):
             auth_key = _get_header_key(headers, "Authorization")
             if auth_key:
