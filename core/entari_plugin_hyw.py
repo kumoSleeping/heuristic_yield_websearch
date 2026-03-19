@@ -2,7 +2,8 @@
 core/entari_plugin_hyw.py - entari 插件 (保留原项目绝大部分功能)
 
 功能:
-- .q 命令触发问答
+- /q 命令触发问答
+- /stop 命令停止该用户最近一次提问
 - 引用消息 + 图片处理
 - 读取 ~/.hyw/config.yml
 - 搜索进度/里程碑推送
@@ -44,9 +45,9 @@ from arclet.entari.event.command import CommandReceive
 from arclet.entari.event.lifespan import Cleanup, Startup
 
 from .config import DEFAULT_TOOL_SELECTIONS, cfg_get, load_config, normalize_tool_provider_name
-from .main import Stats, run, run_stream, shutdown_tools, startup_tools
+from .main import Stats, StopRequestedError, run, run_stream, shutdown_tools, startup_tools
 from .render import render_markdown_result
-from .tool_view import format_tool_view_argument
+from .tool_view import format_tool_view_argument, format_tool_view_text
 
 try:
     from importlib.metadata import version as get_version
@@ -69,11 +70,11 @@ _TASK_LIST_BLOCK_RE = re.compile(r"<task_list\b[^>]*>.*?</task_list>", flags=re.
 _ARTICLE_SKELETON_BLOCK_RE = re.compile(r"<article_skeleton\b[^>]*>.*?</article_skeleton>", flags=re.IGNORECASE | re.DOTALL)
 _SEARCH_REWRITE_BLOCK_RE = re.compile(r"<search_rewrite\b[^>]*>.*?</search_rewrite>", flags=re.IGNORECASE | re.DOTALL)
 _TOOL_BLOCK_RE = re.compile(
-    r"<(?:search|wiki|sub_agent|page|context_keep|context_update|context_delete)\b[^>]*>.*?</(?:search|wiki|sub_agent|page|context_keep|context_update|context_delete)>",
+    r"<(?:search|wiki|sub_agent|page|context_keep|plan_update|context_update|context_delete)\b[^>]*>.*?</(?:search|wiki|sub_agent|page|context_keep|plan_update|context_update|context_delete)>",
     flags=re.IGNORECASE | re.DOTALL,
 )
 _TOOL_SELF_CLOSING_RE = re.compile(
-    r"<(?:search|wiki|sub_agent|page|context_keep|context_update|context_delete)\b[^>]*/>",
+    r"<(?:search|wiki|sub_agent|page|context_keep|plan_update|context_update|context_delete)\b[^>]*/>",
     flags=re.IGNORECASE,
 )
 _ENTARI_RENDER_PROVIDER = "md2png_lite"
@@ -125,13 +126,76 @@ def _format_search_progress_lines(queries: list[str]) -> str:
 
 @dataclass
 class PluginConfig(BasicConfModel):
-    question_command: str = ".q"
+    question_command: str = "/q"
+    stop_command: str = "/stop"
     quote: bool = False
-    verbose: bool = False
+    verbose: bool = True
     render_theme: str = "paper"
 
 
 conf = plugin_config(PluginConfig)
+
+
+@dataclass
+class _ActiveRequest:
+    request_id: str
+    task: asyncio.Task[Any]
+    stop_event: threading.Event
+
+
+_ACTIVE_REQUESTS: dict[str, list[_ActiveRequest]] = {}
+_ACTIVE_REQUESTS_LOCK = threading.Lock()
+
+
+def _session_request_scope(session: Session[MessageCreatedEvent]) -> str:
+    platform = str(getattr(getattr(session, "account", None), "platform", "") or "").strip() or "unknown"
+    self_id = str(getattr(getattr(session, "account", None), "self_id", "") or "").strip() or "unknown"
+    user_id = ""
+    channel_id = ""
+    try:
+        user_id = str(session.user.id or "").strip()
+    except Exception:
+        user_id = str(getattr(getattr(session.event, "user", None), "id", "") or "").strip()
+    try:
+        channel_id = str(session.channel.id or "").strip()
+    except Exception:
+        channel_id = str(getattr(getattr(session.event, "channel", None), "id", "") or "").strip()
+    target = f"user:{user_id}" if user_id else f"channel:{channel_id or 'unknown'}"
+    return f"{platform}:{self_id}:{target}"
+
+
+def _register_active_request(scope_key: str, request: _ActiveRequest) -> None:
+    with _ACTIVE_REQUESTS_LOCK:
+        bucket = [item for item in _ACTIVE_REQUESTS.get(scope_key, []) if not item.task.done()]
+        bucket.append(request)
+        _ACTIVE_REQUESTS[scope_key] = bucket
+
+
+def _unregister_active_request(scope_key: str, request_id: str) -> None:
+    with _ACTIVE_REQUESTS_LOCK:
+        bucket = [
+            item
+            for item in _ACTIVE_REQUESTS.get(scope_key, [])
+            if item.request_id != request_id and not item.task.done()
+        ]
+        if bucket:
+            _ACTIVE_REQUESTS[scope_key] = bucket
+        else:
+            _ACTIVE_REQUESTS.pop(scope_key, None)
+
+
+def _stop_latest_active_request(scope_key: str) -> bool:
+    with _ACTIVE_REQUESTS_LOCK:
+        bucket = [item for item in _ACTIVE_REQUESTS.get(scope_key, []) if not item.task.done()]
+        if not bucket:
+            _ACTIVE_REQUESTS.pop(scope_key, None)
+            return False
+        _ACTIVE_REQUESTS[scope_key] = bucket
+        active = bucket[-1]
+
+    active.stop_event.set()
+    active.task.cancel()
+    return True
 
 
 def _sanitize_filename(value: str) -> str:
@@ -221,7 +285,7 @@ def _clean_answer(text: str) -> str:
     cleaned = _TOOL_BLOCK_RE.sub("", cleaned)
     cleaned = _TOOL_SELF_CLOSING_RE.sub("", cleaned)
     cleaned = re.sub(
-        r"</?(?:search|wiki|sub_agent|page|context_keep|context_update|context_delete|tool_results|result|article_skeleton|search_rewrite|section|title|term)\b[^>]*>",
+        r"</?(?:search|wiki|sub_agent|page|context_keep|plan_update|context_update|context_delete|tool_results|result|article_skeleton|search_rewrite|section|title|term)\b[^>]*>",
         "",
         cleaned,
     )
@@ -234,10 +298,7 @@ def _format_tool_argument(name: str, arguments: Any) -> str:
 
 def _format_tool_trace_line(name: str, arguments: Any) -> str:
     payload = _as_dict(arguments)
-    argument = _format_tool_argument(name, payload)
-    line = f"> {name}"
-    if argument:
-        line += f"({argument})"
+    line = f"> {format_tool_view_text(name, payload, max_chars=200)}"
 
     extras: list[str] = []
     count = payload.get("_count")
@@ -251,7 +312,7 @@ def _format_tool_trace_line(name: str, arguments: Any) -> str:
     elif ok is True:
         extras.append("✓")
     if jina_tokens not in (None, ""):
-        extras.append(f"jina {jina_tokens}tok")
+        extras.append(f"{jina_tokens}tok")
     if elapsed_s not in (None, ""):
         try:
             extras.append(f"{float(elapsed_s):.1f}s")
@@ -279,12 +340,7 @@ def _build_notice_chain(text: str, quote_id: str | None = None) -> MessageChain:
 
 
 def _tool_text_line(name: str, args: dict[str, Any]) -> str:
-    display_name = str(args.get("_display_name") or name).strip() or str(name or "").strip()
-    argument = _format_tool_argument(name, args)
-    line = f"> {display_name}"
-    if argument:
-        line += f"({argument})"
-    return line
+    return f"> {format_tool_view_text(name, args, max_chars=200)}"
 
 
 def _planned_tool_block(tools: list[tuple[str, dict[str, Any]]] | None) -> str:
@@ -340,60 +396,8 @@ def _provider_summary(config: dict[str, Any], capability: str) -> str:
 
 
 def _planned_notice_line(name: str, args: dict[str, Any], config: dict[str, Any]) -> str:
-    payload = _as_dict(args)
-    tool_name = str(name or "").strip()
-    if tool_name == "web_search":
-        provider = _provider_summary(config, "search")
-        suffix = f"[{provider}]" if provider else ""
-        query = re.sub(r"\s+", " ", str(payload.get("query") or "").strip())
-        return f"Search{suffix}: {query}".strip()
-
-    if tool_name == "page_extract":
-        provider = _provider_summary(config, "page_extract")
-        suffix = f"[{provider}]" if provider else ""
-        url = str(payload.get("url") or "").strip()
-        query = re.sub(r"\s+", " ", str(payload.get("query") or "").strip())
-        host = ""
-        if url:
-            parsed = urlparse(url)
-            host = str(parsed.netloc or parsed.path or "").strip()
-        host_block = f"<{host}> " if host else ""
-        return f"Page{suffix}: {host_block}{query}".strip()
-
-    if tool_name == "context_keep":
-        summary = _format_tool_argument(tool_name, payload)
-        return f"Context Keep: {summary}".strip(": ").strip()
-
-    if tool_name == "context_update":
-        summary = _format_tool_argument(tool_name, payload)
-        return f"Context Update: {summary}".strip(": ").strip()
-
-    if tool_name == "context_delete":
-        summary = _format_tool_argument(tool_name, payload)
-        return f"Context Delete: {summary}".strip(": ").strip()
-
-    tools = str(payload.get("tools") or "").strip().lower()
-    task = re.sub(r"\s+", " ", str(payload.get("task") or "").strip())
-    if task:
-        task = task[:200]
-
-    if tools == "websearch":
-        provider = _provider_summary(config, "search")
-        suffix = f"[{provider}]" if provider else ""
-        return f"Sub Agent: Web Search{suffix}: {task}".strip()
-
-    if tools == "page":
-        provider = _provider_summary(config, "page_extract")
-        suffix = f"[{provider}]" if provider else ""
-        url = str(payload.get("url") or "").strip()
-        host = ""
-        if url:
-            parsed = urlparse(url)
-            host = str(parsed.netloc or parsed.path or "").strip()
-        host_block = f"<{host}> " if host else ""
-        return f"Sub Agent: Page{suffix}: {host_block}{task}".strip()
-
-    return ""
+    del config
+    return format_tool_view_text(str(name or "").strip(), _as_dict(args), max_chars=200)
 
 
 def _planned_sub_agent_block(
@@ -412,6 +416,22 @@ def _planned_sub_agent_block(
         seen.add(line)
         rows.append(line)
     return "\n".join(rows).strip()
+
+
+def _compose_round_notice(
+    thinking: str,
+    tools: list[tuple[str, dict[str, Any]]] | None,
+    *,
+    config: dict[str, Any],
+) -> str:
+    parts: list[str] = []
+    clean_thinking = _clean_answer(thinking)
+    if clean_thinking:
+        parts.append(clean_thinking)
+    tool_block = _planned_sub_agent_block(tools, config=config) if tools else ""
+    if tool_block:
+        parts.append(tool_block)
+    return "\n\n".join(part for part in parts if part).strip()
 
 
 def _build_entari_render_config(config: dict[str, Any]) -> dict[str, Any]:
@@ -556,6 +576,15 @@ async def remove_at(content: MessageChain):
 
 
 alc_q = Alconna(conf.question_command, Args["content;?", AllParam])
+alc_stop = Alconna(conf.stop_command)
+
+
+@command.on(alc_stop)
+async def handle_stop(session: Session[MessageCreatedEvent]):
+    scope_key = _session_request_scope(session)
+    quote_id = session.event.message.id if conf.quote else None
+    notice = "已停止你最近一次提问。" if _stop_latest_active_request(scope_key) else "没有正在处理的最近一次提问。"
+    await session.send(_build_notice_chain(notice, quote_id))
 
 
 @command.on(alc_q)
@@ -579,6 +608,21 @@ async def handle_question(session: Session[MessageCreatedEvent], result: Arparma
         return
 
     quote_id = session.event.message.id if conf.quote else None
+    stop_event = threading.Event()
+    current_task = asyncio.current_task()
+    if current_task is None:
+        logger.warning("Failed to register entari request: current task missing.")
+        return
+    scope_key = _session_request_scope(session)
+    request_id = f"{datetime.utcnow().strftime('%Y%m%d%H%M%S%f')}-{id(current_task)}"
+    _register_active_request(
+        scope_key,
+        _ActiveRequest(
+            request_id=request_id,
+            task=current_task,
+            stop_event=stop_event,
+        ),
+    )
 
     def _build_round_chain(text: str) -> MessageChain:
         chain = MessageChain(Text(text))
@@ -586,48 +630,51 @@ async def handle_question(session: Session[MessageCreatedEvent], result: Arparma
             chain = MessageChain(Quote(quote_id)) + chain
         return chain
 
-    if not conf.verbose:
-        try:
-            await session.send(_build_round_chain("Thinking..."))
-        except Exception as exc:
-            logger.warning("Thinking notice send failed in entari plugin: {}", exc)
-
-    images, _ = await process_images(mc, None)
-    question = user_input or "请根据图片内容进行分析并回答。"
-    loop = asyncio.get_running_loop()
-    sent_round_messages: set[str] = set()
-    sent_round_lock = threading.Lock()
-
-    def _on_rewind(thinking: str, tools: list[tuple[str, dict[str, Any]]] | None = None) -> None:
-        if not conf.verbose:
+    async def _send_round_notice(text: str) -> None:
+        if stop_event.is_set():
             return
-        clean = _planned_sub_agent_block(tools, config=config) if tools else ""
-        if not clean:
-            clean = _clean_answer(thinking)
-        if not clean:
-            return
-        with sent_round_lock:
-            if clean in sent_round_messages:
-                return
-            sent_round_messages.add(clean)
-        try:
-            future = asyncio.run_coroutine_threadsafe(
-                session.send(_build_round_chain(clean)),
-                loop,
-            )
-            future.result()
-        except Exception as exc:
-            logger.warning("Round message send failed in entari plugin: {}", exc)
-
-    config = load_config()
-    stats = Stats()
+        await session.send(_build_round_chain(text))
 
     try:
+        if not conf.verbose:
+            try:
+                await _send_round_notice("Thinking...")
+            except Exception as exc:
+                logger.warning("Thinking notice send failed in entari plugin: {}", exc)
+
+        images, _ = await process_images(mc, None)
+        question = user_input or "请根据图片内容进行分析并回答。"
+        loop = asyncio.get_running_loop()
+        sent_round_messages: set[str] = set()
+        sent_round_lock = threading.Lock()
+        config = load_config()
+        stats = Stats()
+
+        def _on_rewind(thinking: str, tools: list[tuple[str, dict[str, Any]]] | None = None) -> None:
+            if not conf.verbose or stop_event.is_set():
+                return
+            clean = _compose_round_notice(thinking, tools, config=config)
+            if not clean:
+                return
+            with sent_round_lock:
+                if clean in sent_round_messages:
+                    return
+                sent_round_messages.add(clean)
+            try:
+                future = asyncio.run_coroutine_threadsafe(
+                    _send_round_notice(clean),
+                    loop,
+                )
+                future.result()
+            except Exception as exc:
+                logger.warning("Round message send failed in entari plugin: {}", exc)
+
         runner = run_stream if config.get("stream") not in (False, "false", "0", 0) else run
         kwargs: dict[str, Any] = {
             "config": config,
             "stats": stats,
             "images": images,
+            "stop_checker": stop_event.is_set,
         }
         if runner is run_stream and conf.verbose:
             kwargs["on_rewind"] = _on_rewind
@@ -637,6 +684,8 @@ async def handle_question(session: Session[MessageCreatedEvent], result: Arparma
             **kwargs,
         )
 
+        if stop_event.is_set():
+            return
         answer_text = str(final_content or "").strip()
         if not answer_text:
             return
@@ -647,17 +696,28 @@ async def handle_question(session: Session[MessageCreatedEvent], result: Arparma
             quote_id=quote_id,
         )
         try:
+            if stop_event.is_set():
+                return
             await session.send(primary_chain)
         except Exception as exc:
             if rendered_ok:
                 logger.warning("Rendered message send failed in entari plugin: {}", exc)
-                await session.send(fallback_chain)
+                if not stop_event.is_set():
+                    await session.send(fallback_chain)
             else:
                 raise
 
+    except asyncio.CancelledError:
+        stop_event.set()
+        return
+    except StopRequestedError:
+        stop_event.set()
+        return
     except Exception as exc:
         logger.exception("Error in hyw execution: {}", exc)
         return
+    finally:
+        _unregister_active_request(scope_key, request_id)
 
 
 # ── 生命周期 ──────────────────────────────────────────────────

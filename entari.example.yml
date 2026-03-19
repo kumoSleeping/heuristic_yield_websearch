@@ -14,8 +14,9 @@ plugins:
   .commands:
     use_config_prefix: false
   entari_plugin_hyw:
-    question_command: ".q"
-    verbose: false  # false: immediately send "Thinking..." then only final reply; true: stream round notices as before
+    question_command: "/q"
+    stop_command: "/stop"
+    verbose: true  # true: stream round notices; false: immediately send "Thinking..." then only final reply
     render_theme: "paper"  # available: paper | github-light | github-dark | solarized-light | graphite
   ::inspect: {}
   entari_plugin_server:

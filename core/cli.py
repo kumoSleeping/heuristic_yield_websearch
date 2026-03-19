@@ -51,7 +51,7 @@ from .main import (
     startup_tools,
     shutdown_tools,
 )
-from .tool_view import format_tool_view_argument
+from .tool_view import format_tool_view_text
 
 try:
     from prompt_toolkit import PromptSession
@@ -1142,11 +1142,6 @@ def _pull_clipboard_prompt_input() -> _PromptInput:
     return _PromptInput(text=text, image_paths=[], cleanup_paths=[])
 
 
-# ── Tool call formatting ─────────────────────────────────────
-def _fmt_args(name: str, args: dict) -> str:
-    return format_tool_view_argument(name, args, max_items=12, max_chars=160)
-
-
 def _sub_agent_binding_parts(args: dict) -> tuple[str, str]:
     tools = str(args.get("tools") or "").strip()
     url = str(args.get("url") or "").strip()
@@ -1176,18 +1171,10 @@ def _format_sub_agent_argument(args: dict) -> str:
     return binding or task
 
 
-def _display_tool_name(name: str, args: dict) -> str:
-    return str(args.get("_display_name") or name).strip() or str(name or "").strip()
-
-
 def _tool_text_line(name: str, args: dict) -> str:
-    display_name = _display_tool_name(name, args)
-    formatted = _fmt_args(name, args)
     level = max(0, int(args.get("_level") or 0))
     prefix = "  " * level + "> "
-    line = f"{prefix}{display_name}"
-    if formatted:
-        line += f"({formatted})"
+    line = f"{prefix}{format_tool_view_text(name, args, max_chars=200)}"
     return line
 
 
@@ -1203,9 +1190,6 @@ def _planned_tool_block(tools: list[tuple[str, dict]] | None) -> str:
 
 
 def _tool_line(name: str, args: dict) -> Text:
-    formatted = _fmt_args(name, args)
-    display_name = _display_tool_name(name, args)
-    count = args.get("_count")
     jina_tokens = args.get("_jina_tokens")
     ok = args.get("_ok")
     elapsed_s = args.get("_elapsed_s")
@@ -1220,7 +1204,7 @@ def _tool_line(name: str, args: dict) -> Text:
 
     line = Text()
     line.append("  " + ("  " * level) + "> ", style=f"bold {ACCENT}")
-    line.append_text(_gradient_title(display_name))
+    line.append_text(_gradient_title(format_tool_view_text(name, args, max_chars=200)))
     if name == "sub_agent_task":
         tools, host = _sub_agent_binding_parts(args)
         task = re.sub(r"\s+", " ", str(args.get("task") or "").strip())
@@ -1237,11 +1221,9 @@ def _tool_line(name: str, args: dict) -> Text:
                     line.append(", ", style=TEXT_MUTED)
                 line.append(task, style=TEXT_MUTED)
             line.append(")", style=TEXT_MUTED)
-    elif formatted:
-        line.append(f"({formatted})", style=TEXT_MUTED)
     if pending:
         if name == "page_extract":
-            status_label = "querying"
+            status_label = "reading"
             if progress_status == "failed":
                 status_label = "failed"
             elif progress_status == "done":
@@ -1253,15 +1235,11 @@ def _tool_line(name: str, args: dict) -> Text:
         line.append(f" {frame}", style=TEXT_MUTED)
     elif ok is False:
         line.append(" !", style=TEXT_MUTED)
-    elif count not in (None, ""):
-        line.append(" ", style=TEXT_MUTED)
-        line.append(str(count), style=f"bold {ACCENT}")
-        line.append(" ✓", style=TEXT_MUTED)
     elif ok is not None:
         line.append(" ✓", style=TEXT_MUTED)
     if jina_tokens not in (None, ""):
         line.append(" ", style=TEXT_MUTED)
-        line.append(f"jina {jina_tokens}tok", style=TEXT_MUTED)
+        line.append(f"{jina_tokens}tok", style=TEXT_MUTED)
     if name == "sub_agent_task" and str(args.get("tools") or "").strip().lower() == "page":
         line.append(" ", style=TEXT_MUTED)
         if page_billing_mode == "free":

@@ -18,43 +18,59 @@ BASE_SYSTEM_PROMPT = """\
 - `web_search(query)`
   - 混用 wiki 式搜索(关键词本身) 和 关联式搜索(关键信息拓展).
   - `query` 风格: 1-2词, 短、严格, 去除助词, 遵循 `skeleton.project_language`, 优先使用 `skeleton.keyword` 组合
-  - 一次优先提出 2-4 份彼此错开的短搜索词，建立准确名词表、可信 URL 候选池、相关线索池。
-  - 搜索词优先保留用户原话中的核心实体，不要随意翻译、扩写、改领域。
   - 对于专业性知识，必要时补一条专业站点搜索，例如 GitHub、萌娘百科、mcwiki, 扩大搜索召回率.
 - `page_extract(url|ref, query, lines)`
   - `page_extract` 易失败, 需一次抓取多个可能的页面, 搜索目标
   - 优先读取已经出现在 `Evidence Context` 中的结果，必要时使用 `ref`。
-  - `query`: 定位所有此关键词, 返回所有匹配的片段, 使用 `xxx | yyy | zzz` 同时匹配多个片段.
-  - `query` 必须包含至少一个页面独有的短语、精确模型名或强识别词，禁止只用泛词作为 query，例如 `available | designed | list | docs`；这类词会命中大量导航/模板垃圾。
   - `lines`: 关键词附近的上下文窗口行；使用 15 - 30, 用户明确查看整页时才使用 `all`.
+  - `query` 使用 `xxx | yyy | zzz` 同时匹配多个片段时, 必须包含至少一个页面独有的短语、精确模型名或强识别词，禁止只用泛词作为 query，例如 `available | designed | list | docs`；这类词会命中大量导航/模板垃圾。
 {context_management_tool_prompt}
 - 积极的使用这些工具, 直到定位到关键信息, 立即进行最终回复.
-- 若用户给了链接，优先 `page_extract`, 若无任何要求立即进入总结.
 
-## 轮次规则 (重要!)
+## 每次必须满足轮次规则 (重要!)
 - 调用工具前先简单使用无加粗的普通文本, 1-3 句话简单汇报, 再同时进行其他操作.
-- 首轮、最终回复前无需 `context_keep` 和 `context_update`, 因为没必要.
 - 在最终答复之前，每个工具轮次都必须一次性调用多个工具，优先 3-6 个；不要把本应同轮完成的动作拆成多轮单工具执行。
-- 除此之外, 每一轮回复必须**同时包含** `context_keep(ids=[...])` 和 `context_update(update=[...])`，和 `page_extract` / `web_search` 至少各一种.
+- 必须积极调用 `context_keep(ids=[...])`、 `plan_update(create=[...], update=[...])`, 他们会辅助你产生更好的结果.
 - 有证据就答，不再验证, 严禁为了“更完美”“更稳妥”“再验证一下”而继续扩张检索；你能找到的资料通常已经基本找过了, 带着不确定性直接回答。
 
 """
 
 CONTEXT_MANAGEMENT_TOOL_PROMPT = """\
-- `context_keep(ids|last_block)`
+- `context_keep(ids)`
   - [重要] 你会在下一轮遗忘本次搜索/抽取得到的新证, 必须使用本工具保留才能继续出现在后续轮次的 `Evidence Context`。
-  - 不要累计所有结果；电商页、无关页、重复页、弱相关页、误命中页不 keep。
-- `context_update(...)`
-  - 用来新增或修改 `Skeleton Context` / `Evidence Context` 里的 item。
-  - 一旦获取新有用信息, 语言、关键词、用户需求或 claim 均需立即使用 `context_update` 使用最新知识修正。
+  - 由于 kept evidence 不能再删除，必须只 keep 最小必要集合, 电商页、无关页、重复页、弱相关页、误命中页不 keep。
+- `plan_update(...)`
+  - 用来新增或修改 `Skeleton Context` 里的 item。
+  - 一旦获取新有用信息, 语言、关键词、用户需求或 claim 均需立即使用 `plan_update` 使用最新知识修正。
   - 最常见的 skeleton 建法示例：
     - project_language 须仅根据搜索目标本身的原始客观属性（如原产地或文化背景）来决定搜索语言，严格排除用户提问语言或现有网络搜索结果语言的干扰。
-    - `create=[{{"type":"skeleton.project_language","text":"日语"}},{{"type":"skeleton.keyword","text":"超時空要塞マクロス"}},{{"type":"skeleton.user_need","text":"介绍"}},{{"type":"skeleton.claim","claim_id":"1","text":"萌娘百科的wiki网页"}}]`
+    - `create=[{{"type":"skeleton.project_language","text":"日语"}},{{"type":"skeleton.keyword","text":"超時空要塞マクロス"}},{{"type":"skeleton.user_need","text":"介绍"}},{{"type":"skeleton.claim","claim_id":"1","text":"wiki网页"}}]`
+"""
+
+FIRST_SEARCH_PROMPT = """
+## 首轮搜索
+- 对于复杂问题, 先提取用户消息中**关键词本身**进行 wiki 式单一搜索, 尝试获得其官方名称、含义、最新消息, 方便后续骨架解析.
+- 若用户给了链接，优先 `page_extract`, 若无任何要求立即进入总结.
+
+## 特殊情况可以不调用工具直接输出结果
+- 违纪违法、色情见证内容
+- 明确的快速任务: 简单翻译、文案编写、简单文本处理任务、闲聊、图片识别等明确不存在待搜索词的任务.
+"""
+
+POST_SEARCH_SKELETON_PROMPT = """
+"""
+
+POST_SKELETON_REFINE_PROMPT = """
 """
 
 NORMAL_LOOP_PROMPT = """\
 ## 方法
 - 一旦已有证据已经足够回答用户问题，就立刻结束，不要再进入任何额外验证流程。
+"""
+
+CONTEXT_KEEP_FOLLOWUP_REMINDER_TEXT = """\
+如果你不打算现在直接进行最终回复，请立刻调用 `context_keep(ids=[...])`，先保留本轮有价值的 Candidate Evidence。
+然后再同时调用你接下来需要的其他操作。
 """
 
 DEFAULT_NO_TITLE_TEXT = "No Title"
@@ -82,6 +98,7 @@ CANDIDATE_EVIDENCE_TEXT = "Items below came from the latest tool batch only."
 CANDIDATE_EVIDENCE_REPLACEMENT_TEXT = "They will be replaced by future tool results unless you keep them with context_keep."
 
 
+
 def format_context_keep_markdown(
     *,
     kept_ids: list[int],
@@ -99,64 +116,6 @@ def format_context_keep_markdown(
         lines.append(f"Missing: {', '.join(str(item) for item in missing_ids)}")
     return "\n".join(lines).strip()
 
-
-# def format_context_delete_markdown(
-#     *,
-#     deleted_ids: list[int],
-#     missing_ids: list[int],
-#     reason: str = "",
-# ) -> str:
-#     lines = ["# Context Delete", ""]
-#     if reason:
-#         lines.append(f"Reason: {reason}")
-#     lines.append(f"Deleted: {', '.join(str(item) for item in deleted_ids) if deleted_ids else 'none'}")
-#     if missing_ids:
-#         lines.append(f"Missing: {', '.join(str(item) for item in missing_ids)}")
-#     return "\n".join(lines).strip()
-
-
-def format_context_budget_message(token_estimate: int) -> str:
-    return (
-        "# Context Budget\n"
-        f"- Estimated input tokens this round: ~{int(token_estimate)}.\n"
-        "- This exceeds the 5000-token budget.\n"
-        "- If you continue using tools this round, first organize context.\n"
-        "- If the current useful evidence is still only in Candidate Evidence, you may use `context_keep(ids=[...])` or `context_keep(last_block=true)` first.\n"
-        "- Prefer `context_update(update=[...])` to compress bloated kept items.\n"
-        "- Do not keep accumulating irrelevant evidence when the budget is already too high."
-    )
-
-
-def format_progressive_budget_error(token_estimate: int) -> str:
-    return (
-        f"系统提示：本轮输入 token 估算约为 {int(token_estimate)}，已经超过 5000。"
-        "如果你还要继续调用工具，就必须先整理上下文。"
-        "如果当前有用信息还在 Candidate Evidence 里，请先调用 context_keep(ids=[...]) 或 context_keep(last_block=true)；"
-        "如果 kept evidence 太臃肿，请先调用 context_update(update=[...]) 压缩内容，再继续搜索。"
-    )
-
-
-def format_progressive_skeleton_error(missing: list[str]) -> str:
-    return (
-        "系统提示：你上一轮没有真正发出所需的工具调用。"
-        f"本轮必须直接调用 {', '.join(missing)}。"
-        "不要继续只写分析文字；先用 context_update(create=[...]) 建 skeleton。若上一轮候选里已有关键证据，再用 context_keep(ids=[...]) 保留它们。"
-    )
-
-FIRST_SEARCH_PROMPT = """
-## 首轮搜索
-- 对于复杂问题, 先提取用户消息中**关键词本身**进行 wiki 式单一搜索, 尝试获得其官方名称、含义、最新消息, 方便后续骨架解析.
-
-## 特殊情况可以不调用工具直接输出结果
-- 违纪违法、色情见证内容
-- 明确的快速任务: 简单翻译、文案编写、简单文本处理任务、闲聊等明确不存在待搜索词的任务.
-"""
-
-POST_SEARCH_SKELETON_PROMPT = """
-"""
-
-POST_SKELETON_REFINE_PROMPT = """
-"""
 
 HEADING_USER_NEED = "## User Need Reconstruction"
 HEADING_KEYWORD_REWRITE = "## Keyword Rewrite"
@@ -203,7 +162,7 @@ _TOOL_DEFINITIONS: tuple[dict[str, Any], ...] = (
                     },
                     "lines": {
                         "type": "string",
-                        "description": "Extraction window, such as '20' or 'all'.",
+                        "description": "Extraction window, such as '15-30'.",
                     },
                 },
                 "additionalProperties": False,
@@ -223,10 +182,6 @@ _TOOL_DEFINITIONS: tuple[dict[str, Any], ...] = (
                         "items": {"type": "integer"},
                         "description": "Candidate evidence ids to keep.",
                     },
-                    "last_block": {
-                        "type": "boolean",
-                        "description": "When true, keep all evidence created by the latest search/page tool batch.",
-                    },
                 },
                 "additionalProperties": False,
             },
@@ -235,8 +190,8 @@ _TOOL_DEFINITIONS: tuple[dict[str, Any], ...] = (
     {
         "type": "function",
         "function": {
-            "name": "context_update",
-            "description": "Create new context items or update existing ones in Skeleton Context or Evidence Context.",
+            "name": "plan_update",
+            "description": "Create or update plan skeleton items in Skeleton Context only.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -247,10 +202,6 @@ _TOOL_DEFINITIONS: tuple[dict[str, Any], ...] = (
                             "properties": {
                                 "type": {"type": "string"},
                                 "text": {"type": "string"},
-                                "title": {"type": "string"},
-                                "url": {"type": "string"},
-                                "snippet": {"type": "string"},
-                                "source_lines": {"type": "string"},
                                 "claim_id": {"type": "string"},
                             },
                             "required": ["type"],
@@ -264,10 +215,6 @@ _TOOL_DEFINITIONS: tuple[dict[str, Any], ...] = (
                             "properties": {
                                 "id": {"type": "integer"},
                                 "text": {"type": "string"},
-                                "title": {"type": "string"},
-                                "url": {"type": "string"},
-                                "snippet": {"type": "string"},
-                                "source_lines": {"type": "string"},
                                 "claim_id": {"type": "string"},
                             },
                             "required": ["id"],
@@ -281,7 +228,7 @@ _TOOL_DEFINITIONS: tuple[dict[str, Any], ...] = (
     },
 )
 
-_CONTEXT_MANAGEMENT_TOOL_NAMES = frozenset({"context_keep", "context_update"})
+_CONTEXT_MANAGEMENT_TOOL_NAMES = frozenset({"context_keep", "plan_update"})
 
 
 def litellm_tools_for_phase(phase: str, *, disclosure_step: int | None = None) -> list[dict[str, Any]]:

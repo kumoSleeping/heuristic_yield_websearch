@@ -32,6 +32,7 @@ from .codex_transport import (
     should_use_codex_mirror_transport,
     stream_response as codex_transport_stream_response,
 )
+from .tool_view import format_tool_view_text
 from .config import (
     CONFIG_PATH,
     DEFAULT_MODEL,
@@ -47,6 +48,7 @@ from .prompt import (
     CANDIDATE_EVIDENCE_HEADING,
     CANDIDATE_EVIDENCE_REPLACEMENT_TEXT,
     CANDIDATE_EVIDENCE_TEXT,
+    CONTEXT_KEEP_FOLLOWUP_REMINDER_TEXT,
     CONTEXT_MANAGEMENT_TOOL_PROMPT,
     DEFAULT_NO_RESULTS_TEXT,
     DEFAULT_NO_TITLE_TEXT,
@@ -71,11 +73,7 @@ from .prompt import (
     PAGE_MARKDOWN_WINDOW_ALL_TEXT,
     PAGE_MARKDOWN_WINDOW_PREFIX,
     PAGE_MARKDOWN_WINDOW_SUFFIX,
-    format_context_budget_message,
-    # format_context_delete_markdown,
     format_context_keep_markdown,
-    format_progressive_budget_error,
-    format_progressive_skeleton_error,
     litellm_tool_config_for_phase,
 )
 
@@ -143,6 +141,21 @@ STATUS_READY = "\u2713"
 _PREWARM_LOCK = threading.Lock()
 _PREWARM_THREADS: dict[str, threading.Thread] = {}
 _PREWARM_DONE: set[str] = set()
+
+
+class StopRequestedError(RuntimeError):
+    pass
+
+
+def _raise_if_stop_requested(stop_checker: Any | None = None) -> None:
+    if not callable(stop_checker):
+        return
+    try:
+        should_stop = bool(stop_checker())
+    except Exception:
+        should_stop = False
+    if should_stop:
+        raise StopRequestedError("run aborted by caller")
 
 
 def _get_litellm(*, on_status: Any | None = None):
@@ -735,35 +748,22 @@ def _tool_capability(name: str) -> str:
         return "search"
     if name == "page_extract":
         return "page_extract"
-    if name == "context_update":
-        return "context_update"
+    if name == "plan_update":
+        return "plan"
     if name == "context_keep":
-        return "context"
-    if name == "context_delete":
         return "context"
     return ""
 
 
-def _tool_provider_label(provider: str) -> str:
-    normalized = str(provider or "").strip().lower()
-    aliases = {
-        "jina_ai": "jina",
-        "ddgs": "duckduckgo",
-    }
-    return aliases.get(normalized, normalized)
-
-
 def _tool_display_name(name: str, *, provider: str = "") -> str:
-    suffix = {
-        "web_search": "websearch",
-        "web_search_wiki": "wiki",
-        "page_extract": "page",
-        "context_update": "context_update",
-        "context_keep": "context_keep",
-        "context_delete": "context_delete",
+    del provider
+    return {
+        "web_search": "Web Search",
+        "web_search_wiki": "Web Search",
+        "page_extract": "Read",
+        "plan_update": "Plan",
+        "context_keep": "Context",
     }.get(name, str(name or "").strip())
-    prefix = _tool_provider_label(provider)
-    return f"{prefix}_{suffix}" if prefix else suffix
 
 
 def _emit_tool_progress(callback: Any | None, name: str, args: dict[str, Any]) -> None:
@@ -831,6 +831,9 @@ def _tool_callback_args(
             merged["_count"] = payload.get("count")
         if "ok" in payload:
             merged["_ok"] = payload.get("ok")
+        if name == "plan_update":
+            merged["_created_count"] = len(payload.get("created_ids") or []) if isinstance(payload.get("created_ids"), list) else 0
+            merged["_updated_count"] = len(payload.get("updated_ids") or []) if isinstance(payload.get("updated_ids"), list) else 0
         if payload.get("from_cache"):
             merged["_from_cache"] = True
         meta = _tool_meta(payload)
@@ -902,30 +905,34 @@ def _sanitize_native_tool_call(name: str, args: dict[str, Any], *, call_id: str 
             clean_args["query"] = query
         if lines:
             clean_args["lines"] = lines
-    elif normalized_name == "context_update":
+    elif normalized_name == "plan_update":
         clean_args = {}
         create = payload.get("create")
         update = payload.get("update")
         if isinstance(create, list):
-            clean_args["create"] = [dict(item) for item in create if isinstance(item, dict)]
+            create_items: list[dict[str, Any]] = []
+            for item in create:
+                if not isinstance(item, dict):
+                    continue
+                normalized_type = _normalize_context_item_type(str(item.get("type") or "").strip())
+                if not normalized_type.startswith("skeleton."):
+                    continue
+                create_items.append({**dict(item), "type": normalized_type})
+            if create_items:
+                clean_args["create"] = create_items
         if isinstance(update, list):
-            clean_args["update"] = [dict(item) for item in update if isinstance(item, dict)]
+            update_items = [dict(item) for item in update if isinstance(item, dict) and item.get("id") not in (None, "")]
+            if update_items:
+                clean_args["update"] = update_items
         if not clean_args:
             return None
     elif normalized_name == "context_keep":
-        ids, last_block = _normalize_context_keep_args(payload)
-        if not ids and not last_block:
+        ids = _normalize_context_keep_args(payload)
+        if not ids:
             return None
         clean_args = {}
         if ids:
             clean_args["ids"] = ids
-        if last_block:
-            clean_args["last_block"] = True
-    elif normalized_name == "context_delete":
-        ids = _normalize_context_delete_ids(payload.get("ids", []))
-        if not ids:
-            return None
-        clean_args = {"ids": ids}
     else:
         return None
 
@@ -1030,33 +1037,9 @@ def _tool_calls_preview_text(calls: list[dict[str, Any]]) -> str:
             continue
         name = str(call.get("name") or "").strip()
         args = call.get("args") if isinstance(call.get("args"), dict) else {}
-        if name == "web_search":
-            query = str(args.get("query") or "").strip()
-            if query:
-                lines.append(f"[tool] web_search({query})")
-            continue
-        if name == "page_extract":
-            target = str(args.get("ref") or args.get("url") or "").strip()
-            query = str(args.get("query") or "").strip()
-            lines.append(f"[tool] page_extract({target}{', ' + query if query else ''})")
-            continue
-        if name == "context_update":
-            lines.append("[tool] context_update(...)")
-            continue
-        if name == "context_keep":
-            ids = args.get("ids") if isinstance(args, dict) else []
-            last_block = bool(args.get("last_block")) if isinstance(args, dict) else False
-            chunks: list[str] = []
-            if isinstance(ids, list) and ids:
-                chunks.append(", ".join(str(item) for item in ids))
-            if last_block:
-                chunks.append("last_block=true")
-            lines.append(f"[tool] context_keep({'; '.join(chunks) if chunks else '...'})")
-            continue
-        if name == "context_delete":
-            ids = args.get("ids") if isinstance(args, dict) else []
-            if isinstance(ids, list) and ids:
-                lines.append(f"[tool] context_delete({', '.join(str(item) for item in ids)})")
+        line = format_tool_view_text(name, args)
+        if line:
+            lines.append(line)
     return "\n".join(lines).strip()
 
 
@@ -1247,14 +1230,7 @@ def _append_page_evidence_items(call: dict[str, Any], payload: dict[str, Any], s
     return created_ids
 
 
-def _normalize_bool_flag(value: Any) -> bool:
-    if isinstance(value, bool):
-        return value
-    text = str(value or "").strip().lower()
-    return text in {"1", "true", "yes", "y", "on"}
-
-
-def _normalize_context_delete_ids(value: Any) -> list[int]:
+def _normalize_context_ids(value: Any) -> list[int]:
     raw_items: list[Any] = []
     if isinstance(value, list):
         raw_items = list(value)
@@ -1275,11 +1251,9 @@ def _normalize_context_delete_ids(value: Any) -> list[int]:
     return ids
 
 
-def _normalize_context_keep_args(args: dict[str, Any] | None) -> tuple[list[int], bool]:
+def _normalize_context_keep_args(args: dict[str, Any] | None) -> list[int]:
     payload = dict(args or {}) if isinstance(args, dict) else {}
-    ids = _normalize_context_delete_ids(payload.get("ids", []))
-    last_block = _normalize_bool_flag(payload.get("last_block"))
-    return ids, last_block
+    return _normalize_context_ids(payload.get("ids", []))
 
 
 def _context_keep_markdown(
@@ -1297,24 +1271,10 @@ def _context_keep_markdown(
     )
 
 
-def _context_delete_markdown(
-    *,
-    deleted_ids: list[int],
-    missing_ids: list[int],
-    reason: str = "",
-) -> str:
-    return format_context_delete_markdown(
-        deleted_ids=deleted_ids,
-        missing_ids=missing_ids,
-        reason=reason,
-    )
-
-
 def _keep_session_context_refs(
     state: "_PhaseRuntimeState",
     ids: list[int],
     *,
-    last_block: bool = False,
     reason: str = "",
 ) -> dict[str, Any]:
     requested_ids: list[int] = []
@@ -1324,16 +1284,6 @@ def _keep_session_context_refs(
             continue
         seen.add(item_id)
         requested_ids.append(item_id)
-    if last_block:
-        for raw_id in state.last_tool_block_ids:
-            try:
-                item_id = int(raw_id)
-            except Exception:
-                continue
-            if item_id in seen:
-                continue
-            seen.add(item_id)
-            requested_ids.append(item_id)
 
     if not requested_ids:
         return {
@@ -1398,54 +1348,6 @@ def _keep_session_context_refs(
     }
 
 
-def _delete_session_context_refs(
-    state: "_PhaseRuntimeState",
-    ids: list[int],
-    *,
-    reason: str = "",
-) -> dict[str, Any]:
-    normalized_ids = _normalize_context_delete_ids(ids)
-    if not normalized_ids:
-        return {
-            "ok": False,
-            "error": "no valid ids to delete",
-            "deleted_ids": [],
-            "missing_ids": [],
-            "_model_markdown": _context_delete_markdown(deleted_ids=[], missing_ids=[], reason=reason),
-        }
-
-    found_ids = {
-        int(item.item_id)
-        for item in [*state.items, *state.pending_items]
-        if item.item_type.startswith("evidence.")
-    }
-    deleted_ids: list[int] = [item_id for item_id in normalized_ids if item_id in found_ids]
-    missing_ids: list[int] = [item_id for item_id in normalized_ids if item_id not in found_ids]
-    deleted_id_set = set(deleted_ids)
-    state.items = [
-        item
-        for item in state.items
-        if not (item.item_type.startswith("evidence.") and int(item.item_id) in deleted_id_set)
-    ]
-    state.pending_items = [
-        item
-        for item in state.pending_items
-        if not (item.item_type.startswith("evidence.") and int(item.item_id) in deleted_id_set)
-    ]
-    return {
-        "ok": bool(deleted_ids),
-        "deleted_ids": deleted_ids,
-        "missing_ids": missing_ids,
-        "reason": reason,
-        "count": len(deleted_ids),
-        "_model_markdown": _context_delete_markdown(
-            deleted_ids=deleted_ids,
-            missing_ids=missing_ids,
-            reason=reason,
-        ),
-    }
-
-
 def _build_accumulated_context_message(state: "_PhaseRuntimeState") -> str:
     evidence_items = _evidence_items(state)
     candidate_items = _candidate_evidence_items(state)
@@ -1488,6 +1390,8 @@ def _build_accumulated_context_message(state: "_PhaseRuntimeState") -> str:
             parts.append("")
     if state.pending_user_note:
         parts.extend(["", state.pending_user_note])
+    if candidate_items:
+        parts.extend(["", CONTEXT_KEEP_FOLLOWUP_REMINDER_TEXT])
     return "\n".join(part for part in parts if str(part).strip()).strip()
 
 
@@ -1592,40 +1496,6 @@ def _build_loop_messages(
     if context_message:
         msgs.append({"role": "user", "content": context_message})
     return msgs
-
-
-def _estimate_messages_tokens(model: str, messages: list[dict[str, Any]]) -> int:
-    parts: list[str] = []
-    for item in messages:
-        if not isinstance(item, dict):
-            continue
-        role = str(item.get("role") or "").strip()
-        content = _format_log_message_content(item.get("content"))
-        if not content:
-            continue
-        parts.append(f"[{role}]\n{content}")
-    return _estimate_text_tokens(model, "\n\n".join(parts).strip())
-
-
-def _budget_warning_message(token_estimate: int) -> str:
-    return format_context_budget_message(token_estimate)
-
-
-def _apply_input_budget_message(
-    *,
-    cfg: dict[str, Any],
-    state: _PhaseRuntimeState,
-    messages: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
-    model = str(cfg.get("model") or DEFAULT_MODEL).strip()
-    estimate = _estimate_messages_tokens(model, messages)
-    state.last_input_token_estimate = estimate
-    if estimate <= 5000:
-        return messages
-    budget_message = _budget_warning_message(estimate)
-    patched = [*messages, {"role": "user", "content": budget_message}]
-    state.last_input_token_estimate = _estimate_messages_tokens(model, patched)
-    return patched
 
 
 def _format_model_error_message(exc: Exception) -> str:
@@ -1964,11 +1834,9 @@ class _PhaseRuntimeState:
     pending_items: list[_ContextItem] = field(default_factory=list)
     next_item_id: int = 0
     pending_user_note: str = ""
-    last_tool_block_ids: list[str] = field(default_factory=list)
     input_has_images: bool = False
     disclosure_step: int = 0
     disclosure_refine_consumed: bool = False
-    last_input_token_estimate: int = 0
 
 
 def _truncate_text(text: Any, limit: int = 240) -> str:
@@ -2099,13 +1967,13 @@ def _clean_context_item_data(item_type: str, payload: dict[str, Any]) -> dict[st
     return cleaned
 
 
-def _context_update_markdown(
+def _plan_update_markdown(
     *,
     created: list[int],
     updated: list[int],
     missing: list[int],
 ) -> str:
-    lines = ["# Context Update", ""]
+    lines = ["# Plan Update", ""]
     lines.append(f"Created: {', '.join(str(item) for item in created) if created else 'none'}")
     lines.append(f"Updated: {', '.join(str(item) for item in updated) if updated else 'none'}")
     if missing:
@@ -2113,7 +1981,7 @@ def _context_update_markdown(
     return "\n".join(lines).strip()
 
 
-def _apply_context_update(
+def _apply_plan_update(
     state: _PhaseRuntimeState,
     args: dict[str, Any],
 ) -> dict[str, Any]:
@@ -2125,7 +1993,7 @@ def _apply_context_update(
         if not isinstance(item, dict):
             continue
         item_type = _normalize_context_item_type(str(item.get("type") or "").strip())
-        if not item_type:
+        if not item_type or not item_type.startswith("skeleton."):
             continue
         data = _clean_context_item_data(item_type, item)
         if not data:
@@ -2141,7 +2009,7 @@ def _apply_context_update(
         except Exception:
             continue
         current = _find_context_item(state, item_id)
-        if current is None:
+        if current is None or not current.item_type.startswith("skeleton."):
             missing_ids.append(item_id)
             continue
         data = _clean_context_item_data(current.item_type, item)
@@ -2155,7 +2023,7 @@ def _apply_context_update(
         "created_ids": created_ids,
         "updated_ids": updated_ids,
         "missing_ids": missing_ids,
-        "_model_markdown": _context_update_markdown(
+        "_model_markdown": _plan_update_markdown(
             created=created_ids,
             updated=updated_ids,
             missing=missing_ids,
@@ -3043,9 +2911,8 @@ def _select_loop_calls(calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
     selected: list[dict[str, Any]] = []
     seen_search_queries: set[str] = set()
     seen_page_keys: set[tuple[str, str, str]] = set()
-    seen_keep_signatures: set[tuple[tuple[int, ...], bool]] = set()
-    seen_delete_ids: set[tuple[int, ...]] = set()
-    allowed_tools = {"web_search", "page_extract", "context_update", "context_keep", "context_delete"}
+    seen_keep_ids: set[tuple[int, ...]] = set()
+    allowed_tools = {"web_search", "page_extract", "plan_update", "context_keep"}
 
     for call in calls:
         if not isinstance(call, dict):
@@ -3087,18 +2954,14 @@ def _select_loop_calls(calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
             continue
 
         if name == "context_keep":
-            ids, last_block = _normalize_context_keep_args(args)
-            if not ids and not last_block:
+            ids = _normalize_context_keep_args(args)
+            if not ids:
                 continue
-            signature = (tuple(ids), last_block)
-            if signature in seen_keep_signatures:
+            signature = tuple(ids)
+            if signature in seen_keep_ids:
                 continue
-            seen_keep_signatures.add(signature)
-            payload: dict[str, Any] = {}
-            if ids:
-                payload["ids"] = ids
-            if last_block:
-                payload["last_block"] = True
+            seen_keep_ids.add(signature)
+            payload: dict[str, Any] = {"ids": ids}
             if str(args.get("_call_id") or "").strip():
                 payload["_call_id"] = str(args.get("_call_id") or "").strip()
             selected.append({"name": "context_keep", "args": payload})
@@ -3106,25 +2969,9 @@ def _select_loop_calls(calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 break
             continue
 
-        if name == "context_delete":
-            ids = _normalize_context_delete_ids(args.get("ids", []))
-            if not ids:
-                continue
-            signature = tuple(ids)
-            if signature in seen_delete_ids:
-                continue
-            seen_delete_ids.add(signature)
-            payload = {"ids": ids}
-            if str(args.get("_call_id") or "").strip():
-                payload["_call_id"] = str(args.get("_call_id") or "").strip()
-            selected.append({"name": "context_delete", "args": payload})
-            if len(selected) >= _TOOL_LIMIT:
-                break
-            continue
-
-        if name == "context_update":
+        if name == "plan_update":
             payload = dict(args)
-            selected.append({"name": "context_update", "args": payload})
+            selected.append({"name": "plan_update", "args": payload})
             if len(selected) >= _TOOL_LIMIT:
                 break
 
@@ -3169,6 +3016,7 @@ def _execute_loop_calls(
     started_at: float,
     on_tool: Any | None = None,
     progress_callback: Any | None = None,
+    stop_checker: Any | None = None,
 ) -> dict[int, dict[str, Any]]:
     payload_map: dict[int, dict[str, Any]] = {}
     note_parts: list[str] = []
@@ -3199,6 +3047,7 @@ def _execute_loop_calls(
             pass
 
     for index, call in enumerate(calls):
+        _raise_if_stop_requested(stop_checker)
         name = str(call.get("name") or "").strip()
         args = call.get("args") if isinstance(call.get("args"), dict) else {}
         if not isinstance(args, dict):
@@ -3206,19 +3055,13 @@ def _execute_loop_calls(
         call_started_at = time.perf_counter()
 
         if name == "context_keep":
-            ids, last_block = _normalize_context_keep_args(args)
+            ids = _normalize_context_keep_args(args)
             payload = _keep_session_context_refs(
                 context_state,
                 ids,
-                last_block=last_block,
             )
-        elif name == "context_delete":
-            payload = _delete_session_context_refs(
-                context_state,
-                args.get("ids", []),
-            )
-        elif name == "context_update":
-            payload = _apply_context_update(context_state, args)
+        elif name == "plan_update":
+            payload = _apply_plan_update(context_state, args)
         else:
             external_calls.append((index, call))
             continue
@@ -3228,7 +3071,7 @@ def _execute_loop_calls(
         _record_tool_stats(stats, payload)
         payload_map[index] = payload
         model_note = str(payload.get("_model_markdown") or "").strip()
-        if name in {"context_keep", "context_delete"} and model_note:
+        if name == "context_keep" and model_note:
             note_parts.append(model_note)
         if callable(on_tool):
             try:
@@ -3246,10 +3089,12 @@ def _execute_loop_calls(
                 pass
 
     if external_calls:
+        _raise_if_stop_requested(stop_checker)
         context_state.pending_items = []
         futures: dict[Any, tuple[int, dict[str, Any], float]] = {}
         with ThreadPoolExecutor(max_workers=len(external_calls)) as pool:
             for index, call in external_calls:
+                _raise_if_stop_requested(stop_checker)
                 name = str(call.get("name") or "").strip()
                 args = call.get("args") if isinstance(call.get("args"), dict) else {}
                 if not isinstance(args, dict):
@@ -3288,6 +3133,7 @@ def _execute_loop_calls(
                 external_payloads[index] = (payload, call_started_at, call)
 
         for index, call in external_calls:
+            _raise_if_stop_requested(stop_checker)
             payload, call_started_at, original_call = external_payloads.get(index, ({"ok": False, "error": "missing tool payload"}, time.perf_counter(), call))
             name = str(original_call.get("name") or "").strip()
             args = original_call.get("args") if isinstance(original_call.get("args"), dict) else {}
@@ -3301,9 +3147,6 @@ def _execute_loop_calls(
                 batch_created_ids.extend(created_ids)
             _record_tool_stats(stats, payload)
             payload_map[index] = payload
-            model_note = str(payload.get("_model_markdown") or "").strip()
-            if name == "context_delete" and model_note:
-                note_parts.append(model_note)
             if callable(on_tool):
                 try:
                     on_tool(
@@ -3318,8 +3161,6 @@ def _execute_loop_calls(
                     )
                 except Exception:
                     pass
-        context_state.last_tool_block_ids = [str(item_id) for item_id in batch_created_ids]
-
     context_state.pending_user_note = "\n\n".join(part for part in note_parts if part).strip()
     return payload_map
 
@@ -3328,53 +3169,24 @@ def _validate_progressive_tool_requirements(
     state: _PhaseRuntimeState,
     calls: list[dict[str, Any]],
 ) -> str:
-    tool_names = {str(call.get("name") or "").strip() for call in calls if isinstance(call, dict)}
-    if state.last_input_token_estimate > 5000 and calls:
-        if not tool_names.intersection({"context_keep", "context_delete", "context_update"}):
-            return (
-                f"系统提示：本轮输入 token 估算约为 {state.last_input_token_estimate}，已经超过 5000。"
-                "如果你还要继续调用工具，就必须先整理上下文。"
-                "如果当前有用信息还在 Candidate Evidence 里，请先调用 context_keep(ids=[...]) 或 context_keep(last_block=true)；"
-                "如果 kept evidence 太臃肿，请先调用 context_update(update=[...]) 压缩内容，或用 context_delete(ids=[...]) 清理误 keep 的 evidence，再继续搜索。"
-            )
-
-    if state.disclosure_step == 1:
-        missing: list[str] = []
-        has_skeleton_update = _calls_include_skeleton_update(state, calls)
-        if not has_skeleton_update:
-            missing.append("context_update")
-        if missing:
-            return (
-                "系统提示：你上一轮没有真正发出所需的工具调用。"
-                f"本轮必须直接调用 {', '.join(missing)}。"
-                "不要继续只写分析文字；先用 context_update(create=[...]) 建 skeleton。若上一轮候选里已有关键证据，再用 context_keep(ids=[...]) 保留它们。"
-            )
+    del state, calls
     return ""
 
 
-def _calls_include_skeleton_update(state: _PhaseRuntimeState, calls: list[dict[str, Any]]) -> bool:
+def _calls_include_plan_update(state: _PhaseRuntimeState, calls: list[dict[str, Any]]) -> bool:
+    del state
     for call in calls:
-        if not isinstance(call, dict) or str(call.get("name") or "").strip() != "context_update":
+        if not isinstance(call, dict) or str(call.get("name") or "").strip() != "plan_update":
             continue
         args = call.get("args") if isinstance(call.get("args"), dict) else {}
         if not isinstance(args, dict):
             continue
-        for item in args.get("create", []) if isinstance(args.get("create"), list) else []:
-            if not isinstance(item, dict):
-                continue
-            item_type = _normalize_context_item_type(str(item.get("type") or "").strip())
-            if item_type.startswith("skeleton."):
-                return True
-        for item in args.get("update", []) if isinstance(args.get("update"), list) else []:
-            if not isinstance(item, dict):
-                continue
-            try:
-                item_id = int(item.get("id"))
-            except Exception:
-                continue
-            current = _find_context_item(state, item_id)
-            if current is not None and current.item_type.startswith("skeleton."):
-                return True
+        create_items = args.get("create", []) if isinstance(args.get("create"), list) else []
+        if any(isinstance(item, dict) for item in create_items):
+            return True
+        update_items = args.get("update", []) if isinstance(args.get("update"), list) else []
+        if any(isinstance(item, dict) for item in update_items):
+            return True
     return False
 
 
@@ -3387,7 +3199,7 @@ def _advance_progressive_disclosure(
         state.disclosure_step = 1
         state.pending_user_note = ""
         return
-    if state.disclosure_step == 1 and _calls_include_skeleton_update(state, calls):
+    if state.disclosure_step == 1 and _calls_include_plan_update(state, calls):
         state.disclosure_step = 2
         state.disclosure_refine_consumed = False
         state.pending_user_note = ""
@@ -3405,6 +3217,7 @@ def run(
     on_reasoning: Any | None = None,
     images: list[str] | None = None,
     context: str | list[dict[str, Any]] | None = None,
+    stop_checker: Any | None = None,
 ) -> str:
     """单次问答: 正常多轮循环 + LiteLLM 原生工具调用 + 可删除的累积上下文."""
     image_paths = [str(path).strip() for path in (images or []) if str(path).strip()]
@@ -3435,17 +3248,13 @@ def run(
     last = ""
 
     for round_i in range(max_rounds):
+        _raise_if_stop_requested(stop_checker)
         msgs = _build_loop_messages(
             cfg=cfg,
             prompt_text=prompt_text,
             history=history,
             state=loop_state,
             context=context,
-        )
-        msgs = _apply_input_budget_message(
-            cfg=cfg,
-            state=loop_state,
-            messages=msgs,
         )
         loop_state.pending_user_note = ""
         try:
@@ -3503,9 +3312,11 @@ def run(
             history.append({"role": "assistant", "content": assistant_content})
 
         if not calls:
+            _raise_if_stop_requested(stop_checker)
             final_message = _clean_model_text(text) or last or _format_empty_output_message(cfg, round_i=round_i)
             return _prepend_runtime_warnings(final_message, warning_messages)
 
+        _raise_if_stop_requested(stop_checker)
         _execute_loop_calls(
             calls=calls,
             cfg=cfg,
@@ -3517,10 +3328,12 @@ def run(
             started_at=started_at,
             on_tool=on_tool,
             progress_callback=None,
+            stop_checker=stop_checker,
         )
         _advance_progressive_disclosure(loop_state, calls)
 
     final_message = _clean_model_text(last) or _format_empty_output_message(cfg, round_i=max_rounds - 1)
+    _raise_if_stop_requested(stop_checker)
     return _prepend_runtime_warnings(final_message, warning_messages)
 
 
@@ -3537,6 +3350,7 @@ def run_stream(
     on_rewind: Any | None = None,
     images: list[str] | None = None,
     context: str | list[dict[str, Any]] | None = None,
+    stop_checker: Any | None = None,
 ) -> str:
     """流式对话循环: 正常多轮循环 + LiteLLM 原生工具调用 + 可删除的累积上下文."""
     image_paths = [str(path).strip() for path in (images or []) if str(path).strip()]
@@ -3568,17 +3382,13 @@ def run_stream(
     last = ""
 
     for round_i in range(max_rounds):
+        _raise_if_stop_requested(stop_checker)
         msgs = _build_loop_messages(
             cfg=cfg,
             prompt_text=prompt_text,
             history=history,
             state=loop_state,
             context=context,
-        )
-        msgs = _apply_input_budget_message(
-            cfg=cfg,
-            state=loop_state,
-            messages=msgs,
         )
         loop_state.pending_user_note = ""
         if callable(on_status):
@@ -3594,16 +3404,21 @@ def run_stream(
         stream_tool_calls: dict[int, dict[str, Any]] = {}
         last_reasoning_emit_tokens = [0]
         if should_use_codex_mirror_transport(cfg):
+            def _handle_codex_text_delta(delta: str) -> None:
+                _raise_if_stop_requested(stop_checker)
+                content_parts.append(delta)
+                if callable(on_chunk):
+                    on_chunk(delta)
+
             try:
                 response_payload = codex_transport_stream_response(
                     cfg=cfg,
                     messages=msgs,
                     tools=tool_cfg.get("tools") if isinstance(tool_cfg.get("tools"), list) else [],
-                    on_text_delta=lambda delta: (
-                        content_parts.append(delta),
-                        callable(on_chunk) and on_chunk(delta),
-                    ),
+                    on_text_delta=_handle_codex_text_delta,
                 )
+            except StopRequestedError:
+                raise
             except Exception as e:
                 duration_ms = (time.perf_counter() - t0) * 1000
                 log_model_call(
@@ -3651,6 +3466,7 @@ def run_stream(
 
             try:
                 for chunk in stream:
+                    _raise_if_stop_requested(stop_checker)
                     u = getattr(chunk, "usage", None)
                     if u:
                         usage = _to_dict(u) if not isinstance(u, dict) else u
@@ -3686,12 +3502,15 @@ def run_stream(
 
                     c = getattr(delta, "content", None)
                     if c:
+                        _raise_if_stop_requested(stop_checker)
                         content_parts.append(c)
                         if callable(on_chunk):
                             try:
                                 on_chunk(c)
                             except Exception:
                                 pass
+            except StopRequestedError:
+                raise
             except Exception as e:
                 duration_ms = (time.perf_counter() - t0) * 1000
                 partial = "".join(content_parts)
@@ -3765,6 +3584,18 @@ def run_stream(
 
         progressive_error = _validate_progressive_tool_requirements(loop_state, calls)
         if progressive_error:
+            if callable(on_rewind) and calls:
+                rewind_tools = [
+                    (
+                        call["name"],
+                        _tool_preview_callback_args(call["name"], call["args"], config=cfg),
+                    )
+                    for call in calls
+                ]
+                try:
+                    on_rewind(assistant_content or full_text, rewind_tools)
+                except Exception:
+                    pass
             loop_state.pending_user_note = progressive_error
             continue
 
@@ -3772,6 +3603,7 @@ def run_stream(
             history.append({"role": "assistant", "content": assistant_content})
 
         if not calls:
+            _raise_if_stop_requested(stop_checker)
             final_message = _clean_model_text(full_text) or last or _format_empty_output_message(cfg, round_i=round_i)
             return _prepend_runtime_warnings(final_message, warning_messages)
 
@@ -3790,6 +3622,7 @@ def run_stream(
 
         if callable(on_status):
             on_status(STATUS_SEARCHING)
+        _raise_if_stop_requested(stop_checker)
         _execute_loop_calls(
             calls=calls,
             cfg=cfg,
@@ -3801,8 +3634,10 @@ def run_stream(
             started_at=started_at,
             on_tool=on_tool,
             progress_callback=None,
+            stop_checker=stop_checker,
         )
         _advance_progressive_disclosure(loop_state, calls)
 
     final_message = _clean_model_text(last) or _format_empty_output_message(cfg, round_i=max_rounds - 1)
+    _raise_if_stop_requested(stop_checker)
     return _prepend_runtime_warnings(final_message, warning_messages)

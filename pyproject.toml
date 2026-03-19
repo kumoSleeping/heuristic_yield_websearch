@@ -1,6 +1,6 @@
 [project]
 name = "hyw"
-version = "0.0.3"
+version = "0.0.4"
 description = "Heuristic Yield Websearch - LLM-powered web search assistant"
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -13,7 +13,7 @@ dependencies = [
     "prompt-toolkit",
     "ddgs",
     "httpx",
-    "md2png-lite>=0.1.1",
+    "md2png-lite>=0.2.0",
     "Pillow",
 ]
 
@@ -21,7 +21,7 @@ dependencies = [
 entari = [
     "arclet-alconna",
     "arclet-entari",
-    "md2png-lite>=0.1.1",
+    "md2png-lite>=0.1.3",
 ]
 notosans = [
     "md2png-lite[notosans]>=0.1.1",
@@ -32,7 +32,7 @@ dev = [
     "arclet.entari[yaml,cron,dotenv] >= 0.17.1",
     "entari-plugin-server>=0.6.2",
     "satori-python-adapter-onebot11>=0.4.2",
-    "md2png-lite[notosans]>=0.1.1",
+    "md2png-lite[notosans]>=0.2.0",
     "ddgs",
     "Pillow",
     "httpx",

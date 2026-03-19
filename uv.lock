@@ -746,7 +746,7 @@ wheels = [
 
 [[package]]
 name = "hyw"
-version = "0.0.2"
+version = "0.0.4"
 source = { editable = "." }
 dependencies = [
     { name = "ddgs" },
@@ -789,7 +789,7 @@ requires-dist = [
     { name = "httpx" },
     { name = "litellm" },
     { name = "loguru" },
-    { name = "md2png-lite", specifier = ">=0.1.1" },
+    { name = "md2png-lite", specifier = ">=0.1.2" },
     { name = "md2png-lite", marker = "extra == 'entari'", specifier = ">=0.1.1" },
     { name = "md2png-lite", extras = ["notosans"], marker = "extra == 'notosans'", specifier = ">=0.1.1" },
     { name = "pillow" },
@@ -1277,7 +1277,7 @@ wheels = [
 
 [[package]]
 name = "md2png-lite"
-version = "0.1.1"
+version = "0.1.2"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "fonttools" },
@@ -1288,9 +1288,9 @@ dependencies = [
     { name = "pillow" },
     { name = "pygments" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/3c/63/39a8f11b071e205b1c39efbd82ca7e69dc1fc174b6bceb7f9eb54864d133/md2png_lite-0.1.1.tar.gz", hash = "sha256:5f487694615fcda336dbfd60bb7e846389dc2d3532a65f55368e8a91b6d98790", size = 33440 }
+sdist = { url = "https://files.pythonhosted.org/packages/0e/e1/46c58c7469925a11c328da4e8fd4fe779766b46bcbf960a568bd26e1bedf/md2png_lite-0.1.2.tar.gz", hash = "sha256:20f8ca211ff6e40c2817bd6e8bc2138889a7ac69076851919513d0fc2ac16fbe", size = 33438 }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/46/20/4b1a15e31ecc4c1716b39b12ffb1b0a6064dcb097698cc184cc48afff530/md2png_lite-0.1.1-py3-none-any.whl", hash = "sha256:811d5539c323dd15c01749d2d8482d2a323d91188c4b1dd9bf0e6c8e9b757f96", size = 36519 },
+    { url = "https://files.pythonhosted.org/packages/05/8e/1704cde236d42707a82ccd80af4eff23a723d8bd9d4548f36446823d9b87/md2png_lite-0.1.2-py3-none-any.whl", hash = "sha256:5b56b057b57e9f327ac127a3e755918a6b0b8fb820d679ab883ceed5a7c7fe88", size = 36519 },
 ]
 
 [package.optional-dependencies]
