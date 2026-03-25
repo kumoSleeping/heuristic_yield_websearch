@@ -2,7 +2,7 @@
 
 # ==== Main model defaults ====
 # Shared provider defaults.
-# `models[*]` and `sub_agent.*` inherit these unless they override them.
+# `models[*]` inherit these unless they override them.
 api_key: sk-or-xxx
 api_base: https://openrouter.ai/api/v1
 
@@ -15,6 +15,13 @@ api_base: https://openrouter.ai/api/v1
 #     wire_api: responses
 #     requires_openai_auth: true
 #     custom_llm_provider: openai
+# models:
+#   - name: codex-fast
+#     model: gpt-5.4
+#     model_provider: mirror
+#     reasoning_effort: xhigh
+#     # `fast` is normalized to `priority` for Codex mirror on wire.
+#     service_tier: fast
 
 models:
   - name: gemini-lite
@@ -45,22 +52,17 @@ stream: true
 headless: false
 # Maximum main-loop rounds. Default is 8.
 max_rounds: 8
+# Optional provider hint, for example Codex mirror can be configured as `fast`
+# and will be normalized to the transport value it accepts on wire.
+# service_tier: fast
+# Per-search-provider timeout before falling back. Default is 4s.
+search_handler_timeout_s: 4
+# Model-call retries only. Search / page_extract tools are not retried here.
+model_retries: 2
+model_retry_base_delay_s: 1.0
+model_retry_max_delay_s: 8.0
 # Appended to the main controller system prompt.
 system_prompt: ""
-
-# ==== Legacy / compatibility child overrides ====
-# Kept for old configs; the current main flow does not dispatch these slots.
-sub_agent:
-  websearch:
-    # Legacy compatibility slot.
-    model: ""
-    api_key: ""
-    api_base: ""
-  page:
-    # Legacy compatibility slot.
-    model: ""
-    api_key: ""
-    api_base: ""
 
 # ==== Tool backend registry ====
 # Capability registry + default provider selection.
@@ -82,14 +84,10 @@ tools:
           Accept: application/json
           X-Respond-With: no-content
       page_extract:
-        # prefer_free defaults to true:
-        # use the free route first and only fall back to Authorization
-        # after the local counter crosses the free-rate threshold.
-        # prefer_free: true
         headers:
-          Accept: application/json
+          Accept: text/plain
           # Authorization: Bearer jina_xxx
-          X-Engine: direct
+          X-Engine: browser
           X-Return-Format: markdown
           X-Target-Selector: body, .class, #id
           X-Wait-For-Selector: body, .class, #id

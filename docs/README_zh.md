@@ -66,7 +66,7 @@ hyw -q "最近有什么科技新闻？"
 
 ```yaml
 # 共享 provider 默认值。
-# `models[*]` 和 `sub_agent.*` 没有单独覆写时都会继承这里。
+# `models[*]` 没有单独覆写时都会继承这里。
 api_key: sk-or-xxx
 api_base: https://openrouter.ai/api/v1
 
@@ -79,6 +79,13 @@ api_base: https://openrouter.ai/api/v1
 #     wire_api: responses
 #     requires_openai_auth: true
 #     custom_llm_provider: openai
+# models:
+#   - name: codex-fast
+#     model: gpt-5.4
+#     model_provider: mirror
+#     reasoning_effort: xhigh
+#     # Codex mirror 里 `fast` 会在请求时归一化为 `priority`。
+#     service_tier: fast
 
 models:
   - name: gemini-lite
@@ -97,15 +104,17 @@ stream: true
 headless: true
 # 主循环最大轮次，默认 8。
 max_rounds: 8
+# 可选的 provider 提示，例如 Codex mirror 可写 `fast`，
+# 发送请求时会自动归一化成它实际接受的值。
+# service_tier: fast
+# 单个 search provider 在回退前的超时时间，默认 4 秒。
+search_handler_timeout_s: 4
+# 仅对模型调用做重试；不会在这里重试 search / page_extract 工具。
+model_retries: 2
+model_retry_base_delay_s: 1.0
+model_retry_max_delay_s: 8.0
 # 追加到主控制模型系统提示词末尾。
 system_prompt: ""
-
-# 历史遗留子代理覆写；主流程不再读取这些位
-sub_agent:
-  websearch:
-    model: ""
-  page:
-    model: ""
 
 # 工具能力注册表 + 默认 provider 选择
 tools:
@@ -120,7 +129,9 @@ tools:
   config:
     jina_ai:
       page_extract:
-        prefer_free: true
+        headers:
+          # Authorization: Bearer jina_xxx
+          Accept: text/plain
   use:
     search: ddgs
     page_extract: jina_ai
@@ -133,17 +144,23 @@ tools:
 
 现在可以直接这样理解这些配置：
 
-- `api_key` / `api_base`：顶层默认值，给 `models[*]` 和 `sub_agent.*` 继承。
+- `api_key` / `api_base`：顶层默认值，给 `models[*]` 继承。
 - `model_provider` / `model_providers`：命名 transport 预设，会展开成 LiteLLM 能识别的 `api_base`、`custom_llm_provider`、`api_key_env` 等字段。
 - `models`：两阶段主模型候选列表。默认 `models[0]` 是 stage1，`models[1]` 是 stage2。
 - `language` / `stream` / `headless` / `system_prompt`：当前主流程真实生效。
 - `max_rounds`：主循环最大轮次，默认是 `8`。
+- `service_tier`：可选的 provider 提示；对 Codex mirror 而言，`fast` 会归一化成它实际接受的线上传输值 `priority`。
+- `search_handler_timeout_s`：单个 search provider 在回退前的超时时间，默认是 `4`。
+- `model_retries` / `model_retry_base_delay_s` / `model_retry_max_delay_s`：仅作用于模型调用的重试次数与指数退避；不影响 search / page_extract 工具。
 - CLI 快捷键：空输入时按左键轮换 stage1，按右键轮换 stage2。
-- `sub_agent.*`：历史兼容位；当前两阶段主流程不再读取。
 - `tools.index`：能力到实现的注册表。
-- `tools.config`：某个 provider 的附加配置，比如 header、免费优先策略。
+- `tools.config`：某个 provider 的附加配置，比如 header。
 - `tools.use`：每种能力默认选哪个 provider。
 - 图片策略：图片只在第一阶段直接发送给主模型；不会再经过独立视觉总结模型。
+
+当前上下文保留方式只剩 `Latest Round Raw`：
+
+- `Latest Round Raw`：上一轮的完整搜索/读页结果，会原样暴露给下一轮主模型。
 
 ## 工作原理
 
@@ -158,15 +175,10 @@ tools:
                │
                ▼
 ┌─────────────────────────────────┐
-│  websearch 子代理生成 2-6 条搜索词│
-│  并在内部完成多次搜索            │
-└──────────────┬──────────────────┘
-               │
-               ▼
 ┌─────────────────────────────────┐
 │  主模型挑选具体页面              │
-│  page 子代理负责压缩 / 找线索    │
-│  最后由主模型输出答案            │
+│  page_extract 返回带行号节选     │
+│  最后由主模型整合回答            │
 └─────────────────────────────────┘
 ```
 

@@ -33,8 +33,54 @@ def _short_host(url: str) -> str:
     return host
 
 
+def _short_page_target(url: str, *, max_segments: int = 4, max_chars: int = 72) -> str:
+    raw_url = str(url or "").strip()
+    if not raw_url:
+        return ""
+    parsed = urlparse(raw_url)
+    host = _short_host(raw_url)
+    path = str(parsed.path or "").strip("/")
+    if not host:
+        return _truncate_line(path, max_chars) if path else ""
+    if not path:
+        return host
+    segments = [segment for segment in path.split("/") if segment]
+    if len(segments) > max(1, int(max_segments)):
+        path = "/".join(segments[: max(1, int(max_segments))]) + "/…"
+    else:
+        path = "/".join(segments)
+    return _truncate_line(f"{host}/{path}", max_chars)
+
+
 def _clean_inline_text(value: Any) -> str:
     return re.sub(r"\s+", " ", str(value or "").strip())
+
+
+def _clean_inline_list(value: Any, *, limit: int = 2) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    items: list[str] = []
+    seen: set[str] = set()
+    for item in value:
+        text = _clean_inline_text(item)
+        normalized = text.casefold()
+        if not text or normalized in seen:
+            continue
+        seen.add(normalized)
+        items.append(text)
+        if len(items) >= max(1, int(limit)):
+            break
+    return items
+
+
+def _pattern_summary(value: Any) -> str:
+    if isinstance(value, list):
+        return " | ".join(_clean_inline_list(value, limit=8))
+    text = _clean_inline_text(value)
+    if not text:
+        return ""
+    parts = [part.strip() for part in text.split("|")]
+    return " | ".join(part for part in parts if part)
 
 
 def _truncate_line(text: str, max_chars: int) -> str:
@@ -71,6 +117,42 @@ def _list_count(value: Any) -> int:
     return len(value) if isinstance(value, list) else 0
 
 
+def _page_extract_mode_label(payload: dict[str, Any]) -> str:
+    mode = str(payload.get("mode") or "").strip().lower()
+    if mode == "range":
+        start_line = _numeric_value(payload.get("start_line"))
+        end_line = _numeric_value(payload.get("end_line"))
+        if start_line is not None and end_line is not None and start_line > 0 and end_line >= start_line:
+            return f"L{start_line}-L{end_line}"
+        return "range"
+    if mode == "sample":
+        return "sample"
+    return ""
+
+
+def _page_extract_sample_stats(payload: dict[str, Any]) -> str:
+    if str(payload.get("mode") or "").strip().lower() != "sample":
+        return ""
+    shown = _numeric_value(payload.get("count"))
+    if shown is None:
+        shown = _list_count(payload.get("_matched_lines"))
+    total_lines = _numeric_value(payload.get("total_lines"))
+    if shown is not None and shown > 0 and total_lines is not None and total_lines > 0:
+        return f"{shown}/{total_lines} lines"
+    if shown is not None and shown > 0:
+        return f"{shown} lines"
+    if total_lines is not None and total_lines > 0:
+        return f"{total_lines} lines"
+    return ""
+
+
+def _page_extract_title(payload: dict[str, Any], *, max_chars: int = 72) -> str:
+    title = _clean_inline_text(payload.get("title"))
+    if not title:
+        return ""
+    return _truncate_line(title, max_chars)
+
+
 def _plan_counts(payload: dict[str, Any]) -> tuple[int, int]:
     create_count = _numeric_value(payload.get("_created_count"))
     if create_count is None:
@@ -93,58 +175,17 @@ def format_tool_view_argument(name: str, arguments: Any, *, max_items: int = 12,
     if name == "page_extract":
         host = _short_host(str(payload.get("url") or "").strip())
         ref = str(payload.get("ref") or "").strip()
-        query = _clean_inline_text(payload.get("query"))
-        base = ""
-        if query:
-            base = f"\"{query}\""
+        search = _pattern_summary(payload.get("search"))
         target = host or ref
-        if target:
-            base = f"{base} in \"{target}\"".strip()
-        extras: list[str] = []
-        line_label = _window_label(payload.get("lines"))
-        if line_label:
-            extras.append(line_label)
-        if extras:
-            return f"{base} · {' · '.join(extras)}".strip()
-        return base
-
-    if name == "context_keep":
-        ids = payload.get("ids")
-        if isinstance(ids, list) and ids:
-            return f"Keep {len(ids)}"
-        return ""
+        if target and search:
+            return f"\"{search}\" in \"{target}\""
+        return f"\"{target}\"" if target else (f"\"{search}\"" if search else "")
 
     if name == "context_delete":
         ids = payload.get("ids")
         if isinstance(ids, list) and ids:
             return f"Delete {len(ids)}"
         return ""
-
-    if name == "plan_update":
-        create_count, update_count = _plan_counts(payload)
-        parts: list[str] = []
-        if create_count:
-            parts.append(f"Create {create_count}")
-        if update_count:
-            parts.append(f"Update {update_count}")
-        return ", ".join(parts)
-
-    if name == "sub_agent_task":
-        tools = str(payload.get("tools") or "").strip()
-        host = _short_host(str(payload.get("url") or "").strip())
-        task = _clean_inline_text(payload.get("task"))
-        if task:
-            task = task[:120]
-        binding = ""
-        if tools and host:
-            binding = f"{tools}({host})"
-        elif tools:
-            binding = tools
-        elif host:
-            binding = host
-        if binding and task:
-            return f"{binding}, {task}"
-        return binding or task
 
     if not payload:
         return ""
@@ -167,33 +208,28 @@ def format_tool_view_text(name: str, arguments: Any, *, max_chars: int = 160) ->
         return _truncate_line(line, max_chars)
 
     if tool_name == "page_extract":
-        query = _clean_inline_text(payload.get("query"))
-        host = _short_host(str(payload.get("url") or "").strip())
+        target = _short_page_target(str(payload.get("url") or "").strip())
         ref = str(payload.get("ref") or "").strip()
-        target = host or (f"#{ref}" if ref else "")
-        line = f"Read \"{query}\"" if query else "Read"
+        if not target and ref:
+            target = f"#{ref}"
+        mode_label = _page_extract_mode_label(payload)
+        sample_stats = _page_extract_sample_stats(payload)
+        title = _page_extract_title(payload)
+        line = "Read"
+        if mode_label:
+            line += f" {mode_label}"
         if target:
+            if sample_stats:
+                line += f" {sample_stats}"
+            if title:
+                line += f" \"{title}\""
             line += f" in \"{target}\""
-        extras: list[str] = []
-        window = _window_label(payload.get("lines") or payload.get("window"))
-        if window:
-            extras.append(window)
-        count = _numeric_value(payload.get("_count"), payload.get("count"))
-        if count is not None:
-            extras.append(str(count))
-        if extras:
-            line += " · " + " · ".join(extras)
+        else:
+            if sample_stats:
+                line += f" {sample_stats}"
+            if title:
+                line += f" \"{title}\""
         return _truncate_line(line, max_chars)
-
-    if tool_name == "context_keep":
-        count = _numeric_value(payload.get("_count"), payload.get("count"))
-        if count is None:
-            ids = payload.get("ids")
-            if isinstance(ids, list) and ids:
-                count = len(ids)
-        if count is not None:
-            return f"Context: Keep {count}"
-        return "Context: Keep"
 
     if tool_name == "context_delete":
         count = _numeric_value(payload.get("_count"), payload.get("count"))
@@ -204,29 +240,6 @@ def format_tool_view_text(name: str, arguments: Any, *, max_chars: int = 160) ->
         if count is not None:
             return f"Context: Delete {count}"
         return "Context: Delete"
-
-    if tool_name == "plan_update":
-        create_count, update_count = _plan_counts(payload)
-        actions: list[str] = []
-        if create_count:
-            actions.append(f"Create {create_count}")
-        if update_count:
-            actions.append(f"Update {update_count}")
-        if not actions:
-            actions.append("Update")
-        return _truncate_line("Plan: " + " · ".join(actions), max_chars)
-
-    if tool_name == "sub_agent_task":
-        tools = str(payload.get("tools") or "").strip().lower()
-        task = _clean_inline_text(payload.get("task"))
-        host = _short_host(str(payload.get("url") or "").strip())
-        if tools == "websearch" and task:
-            return _truncate_line(f"Web Search \"{task}\"", max_chars)
-        if tools == "page":
-            line = f"Read \"{task}\"" if task else "Read"
-            if host:
-                line += f" in \"{host}\""
-            return _truncate_line(line, max_chars)
 
     fallback = format_tool_view_argument(tool_name, payload, max_chars=max_chars)
     if fallback:

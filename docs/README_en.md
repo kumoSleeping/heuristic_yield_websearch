@@ -65,9 +65,26 @@ Legacy single-model fields (`model` / `api_key` / `api_base`) still work.
 
 ```yaml
 # Shared provider defaults.
-# `models[*]` and `sub_agent.*` inherit these unless they override them.
+# `models[*]` inherit these unless they override them.
 api_key: sk-or-xxx
 api_base: https://openrouter.ai/api/v1
+
+# Optional LiteLLM transport preset.
+# `requires_openai_auth: true` means "use OPENAI_API_KEY if api_key is omitted".
+# model_provider: mirror
+# model_providers:
+#   mirror:
+#     base_url: https://chat.soruxgpt.com/codex
+#     wire_api: responses
+#     requires_openai_auth: true
+#     custom_llm_provider: openai
+# models:
+#   - name: codex-fast
+#     model: gpt-5.4
+#     model_provider: mirror
+#     reasoning_effort: xhigh
+#     # `fast` is normalized to `priority` for Codex mirror on wire.
+#     service_tier: fast
 
 models:
   - name: gemini-lite
@@ -86,15 +103,13 @@ stream: true
 headless: true
 # Maximum main-loop rounds. Default is 8.
 max_rounds: 8
+# Optional provider hint, for example Codex mirror can be configured as `fast`
+# and will be normalized to the transport value it accepts on wire.
+# service_tier: fast
+# Per-search-provider timeout before falling back. Default is 4s.
+search_handler_timeout_s: 4
 # Custom system prompt appended to the main controller prompt.
 system_prompt: ""
-
-# Legacy child overrides. The current main flow no longer reads these slots.
-sub_agent:
-  websearch:
-    model: ""
-  page:
-    model: ""
 
 # Tool capability registry + default provider selection
 tools:
@@ -109,7 +124,9 @@ tools:
   config:
     jina_ai:
       page_extract:
-        prefer_free: true
+        headers:
+          # Authorization: Bearer jina_xxx
+          Accept: text/plain
   use:
     search: ddgs
     page_extract: jina_ai
@@ -122,16 +139,21 @@ tools:
 
 What each block does now:
 
-- `api_key` / `api_base`: shared defaults inherited by `models[*]` and `sub_agent.*`.
+- `api_key` / `api_base`: shared defaults inherited by `models[*]`.
 - `models`: the two-stage model pool. By default, `models[0]` is stage1 and `models[1]` is stage2.
 - `language` / `stream` / `headless` / `system_prompt`: active runtime options used by the current flow.
 - `max_rounds`: maximum main-loop rounds; default is `8`.
+- `service_tier`: optional provider hint. For Codex mirror, `fast` is normalized to the accepted wire value `priority`.
+- `search_handler_timeout_s`: per-search-provider timeout before fallback; default is `4`.
 - CLI shortcuts: with an empty buffer, `Left` cycles stage1 and `Right` cycles stage2.
-- `sub_agent.*`: compatibility-only legacy slots; not used by the current two-stage main loop.
 - `tools.index`: capability-to-provider registry.
-- `tools.config`: per-provider extra options such as headers or free-route preferences.
+- `tools.config`: per-provider extra options such as headers.
 - `tools.use`: which provider is selected by default for each capability.
 - Image strategy: images are sent directly to the stage-1 main model; there is no separate vision-summary pass anymore.
+
+Runtime carryover now keeps only `Latest Round Raw`:
+
+- `Latest Round Raw`: the previous round's full raw search/page results stay visible for the next round.
 
 ## How It Works
 
@@ -146,15 +168,10 @@ User Question
                │
                ▼
 ┌─────────────────────────────────────┐
-│  websearch sub-agent builds 2-6     │
-│  queries and runs internal search   │
-└──────────────┬──────────────────────┘
-               │
-               ▼
 ┌─────────────────────────────────────┐
 │  Main model chooses concrete pages  │
-│  page sub-agent compresses them     │
-│  then main model returns the answer │
+│  page_extract returns numbered lines│
+│  and the main model answers         │
 └─────────────────────────────────────┘
 ```
 

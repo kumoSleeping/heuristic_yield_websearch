@@ -66,7 +66,7 @@ You can also define named transport presets via `model_provider` / `model_provid
 
 ```yaml
 # Shared provider defaults.
-# `models[*]` and `sub_agent.*` inherit these unless they override them.
+# `models[*]` inherit these unless they override them.
 api_key: sk-or-xxx
 api_base: https://openrouter.ai/api/v1
 
@@ -79,6 +79,13 @@ api_base: https://openrouter.ai/api/v1
 #     wire_api: responses
 #     requires_openai_auth: true
 #     custom_llm_provider: openai
+# models:
+#   - name: codex-fast
+#     model: gpt-5.4
+#     model_provider: mirror
+#     reasoning_effort: xhigh
+#     # `fast` is normalized to `priority` for Codex mirror on wire.
+#     service_tier: fast
 
 # Main controller model used at startup / single-shot mode.
 # You can set this to either a profile `name` or a raw model id.
@@ -101,17 +108,17 @@ stream: true
 headless: true
 # Maximum main-loop rounds. Default is 8.
 max_rounds: 8
+# Optional provider hint, for example Codex mirror can be configured as `fast`
+# and will be normalized to the transport value it accepts on wire.
+# service_tier: fast
+# Per-search-provider timeout before falling back. Default is 4s.
+search_handler_timeout_s: 4
+# Model-call retries only; search / page_extract tools are not retried here.
+model_retries: 2
+model_retry_base_delay_s: 1.0
+model_retry_max_delay_s: 8.0
 # Custom system prompt appended to the main controller prompt.
 system_prompt: ""
-
-# Child model overrides. Leave empty to inherit the active main model config.
-sub_agent:
-  websearch:
-    model: ""
-  page:
-    model: ""
-  vision:
-    model: ""
 
 # Tool capability registry + default provider selection
 tools:
@@ -126,7 +133,9 @@ tools:
   config:
     jina_ai:
       page_extract:
-        prefer_free: true
+        headers:
+          # Authorization: Bearer jina_xxx
+          Accept: text/plain
   use:
     search: ddgs
     page_extract: jina_ai
@@ -145,19 +154,23 @@ stages:
 
 What each block does now:
 
-- `api_key` / `api_base`: shared defaults inherited by `models[*]` and `sub_agent.*`.
+- `api_key` / `api_base`: shared defaults inherited by `models[*]`.
 - `model_provider` / `model_providers`: named transport presets that expand into LiteLLM fields such as `api_base`, `custom_llm_provider`, and `api_key_env`.
 - `active_model`: the main controller model currently selected; can match either a profile `name` or a raw model id.
 - `models`: switchable main-model profiles for CLI left/right model selection.
 - `language` / `stream` / `headless` / `system_prompt`: active runtime options used by the current flow.
 - `max_rounds`: maximum main-loop rounds; default is `8`.
-- `sub_agent.websearch`: child model that generates 2-6 search terms and runs internal search.
-- `sub_agent.page`: child model that compresses pages and extracts evidence.
-- `sub_agent.vision`: image understanding helper kept for independent vision flows; not part of the main search loop.
+- `service_tier`: optional provider hint. For Codex mirror, `fast` is normalized to the accepted wire value `priority`.
+- `search_handler_timeout_s`: per-search-provider timeout before fallback; default is `4`.
+- `model_retries` / `model_retry_base_delay_s` / `model_retry_max_delay_s`: model-only retry budget and exponential backoff; tool providers are not retried here.
 - `tools.index`: capability-to-provider registry.
-- `tools.config`: per-provider extra options such as headers or free-route preferences.
+- `tools.config`: per-provider extra options such as headers.
 - `tools.use`: which provider is selected by default for each capability.
 - `stages.*`: legacy stage-specific model slots kept only for old configs; the current main loop does not use them.
+
+Runtime context carryover now keeps only `Latest Round Raw`:
+
+- `Latest Round Raw`: the previous round's full raw search/page results stay visible for the next round.
 
 ## How It Works
 
@@ -172,15 +185,10 @@ User Question
                │
                ▼
 ┌─────────────────────────────────────┐
-│  websearch sub-agent builds 2-6     │
-│  queries and runs internal search   │
-└──────────────┬──────────────────────┘
-               │
-               ▼
 ┌─────────────────────────────────────┐
 │  Main model chooses concrete pages  │
-│  page sub-agent compresses them     │
-│  then main model returns the answer │
+│  page_extract returns numbered lines│
+│  and the main model answers         │
 └─────────────────────────────────────┘
 ```
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import inspect
 import threading
 from typing import Any, Callable, Dict, List, Optional
@@ -12,6 +13,7 @@ from .search_ddgs import ddgs_search
 from .search_jina_ai import jina_ai_page_extract, jina_ai_search
 
 _VALID_SEARCH_MODES = {"text"}
+_DEFAULT_SEARCH_HANDLER_TIMEOUT_S = 4.0
 _suite_lock = threading.RLock()
 _suite: "WebToolSuite | None" = None
 _suite_signature: tuple[Any, ...] | None = None
@@ -35,6 +37,38 @@ def _normalize_reader_source_url(url: str) -> str:
     if not text.startswith(("http://", "https://")):
         text = "https://" + text
     return text
+
+
+def _provider_error_text(provider: str, exc: Exception) -> str:
+    text = str(exc or "").strip()
+    if text:
+        return f"{provider}: {text}"
+    return f"{provider}: {type(exc).__name__}"
+
+
+def _resolve_search_handler_timeout_s(config: dict[str, Any] | None = None) -> float:
+    raw = (config or {}).get("search_handler_timeout_s")
+    if raw in (None, "", False):
+        return float(_DEFAULT_SEARCH_HANDLER_TIMEOUT_S)
+    try:
+        value = float(str(raw).strip())
+    except Exception:
+        return float(_DEFAULT_SEARCH_HANDLER_TIMEOUT_S)
+    if value <= 0:
+        return float(_DEFAULT_SEARCH_HANDLER_TIMEOUT_S)
+    return max(1.0, min(value, 30.0))
+
+
+def _format_timeout_seconds(value: float) -> str:
+    try:
+        normalized = float(value)
+    except Exception:
+        normalized = 0.0
+    if 0.0 < normalized < 0.1:
+        return f"{normalized:.2f}"
+    if normalized.is_integer():
+        return str(int(normalized))
+    return f"{normalized:.1f}"
 
 
 def _normalize_search_row(row: Dict[str, Any], provider: str) -> Optional[Dict[str, Any]]:
@@ -94,11 +128,6 @@ def _extract_search_rows(payload: Any) -> list[dict[str, Any]]:
         if isinstance(value, list):
             return [item for item in value if isinstance(item, dict)]
     return []
-
-
-def _looks_like_payment_required_error(text: str) -> bool:
-    lowered = str(text or "").strip().lower()
-    return "402" in lowered and "payment required" in lowered
 
 
 class WebToolSuite:
@@ -162,18 +191,25 @@ class WebToolSuite:
         max_results: int,
         errors: list[str],
     ) -> tuple[List[Dict[str, Any]], dict[str, Any]] | None:
+        handler_timeout_s = _resolve_search_handler_timeout_s(self._config)
         for handler in handlers:
             try:
-                raw = await self._call_handler(
-                    handler,
-                    query=query,
-                    kl=kl,
-                    max_results=max_results,
-                    headless=self._headless,
-                    config=self._config,
+                raw = await asyncio.wait_for(
+                    self._call_handler(
+                        handler,
+                        query=query,
+                        kl=kl,
+                        max_results=max_results,
+                        headless=self._headless,
+                        config=self._config,
+                    ),
+                    timeout=handler_timeout_s,
                 )
+            except asyncio.TimeoutError:
+                errors.append(f"{handler.provider}: timed out after {_format_timeout_seconds(handler_timeout_s)}s")
+                continue
             except Exception as exc:
-                errors.append(f"{handler.provider}: {exc}")
+                errors.append(_provider_error_text(handler.provider, exc))
                 continue
 
             rows = _extract_search_rows(raw)
@@ -220,8 +256,12 @@ class WebToolSuite:
         if primary is not None:
             return primary
 
-        if self._emergency_search_handlers and any(_looks_like_payment_required_error(item) for item in errors):
-            logger.warning("WebToolSuite(search): configured provider hit 402, falling back to {}", [handler.provider for handler in self._emergency_search_handlers])
+        if self._emergency_search_handlers:
+            logger.warning(
+                "WebToolSuite(search): primary handlers failed ({}), falling back to {}",
+                "; ".join(errors) if errors else "unknown error",
+                [handler.provider for handler in self._emergency_search_handlers],
+            )
             fallback = await self._search_via_handlers(
                 self._emergency_search_handlers,
                 query=query,
@@ -340,7 +380,7 @@ class WebToolSuite:
                     config=self._config,
                 )
             except Exception as exc:
-                errors.append(f"{handler.provider}: {exc}")
+                errors.append(_provider_error_text(handler.provider, exc))
                 continue
 
             if not isinstance(payload, dict):

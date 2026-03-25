@@ -1178,49 +1178,17 @@ def _tool_text_line(name: str, args: dict) -> str:
     return line
 
 
-def _planned_tool_block(tools: list[tuple[str, dict]] | None) -> str:
-    if not tools:
-        return ""
-    rows: list[str] = []
-    for name, args in tools:
-        line = _tool_text_line(name, args)
-        if line:
-            rows.append(line)
-    return "\n".join(rows).strip()
-
-
 def _tool_line(name: str, args: dict) -> Text:
     jina_tokens = args.get("_jina_tokens")
     ok = args.get("_ok")
     elapsed_s = args.get("_elapsed_s")
     pending = bool(args.get("_pending"))
-    page_billing_mode = str(args.get("_page_billing_mode") or "").strip()
-    page_cost_usd = args.get("_page_cost_usd")
-    page_usage_requests = args.get("_page_usage_requests")
-    page_usage_tokens = args.get("_page_usage_tokens")
-    compression_cost_usd = args.get("_compression_cost_usd")
     level = max(0, int(args.get("_level") or 0))
     progress_status = str(args.get("_progress_status") or "").strip().lower()
 
     line = Text()
     line.append("  " + ("  " * level) + "> ", style=f"bold {ACCENT}")
     line.append_text(_gradient_title(format_tool_view_text(name, args, max_chars=200)))
-    if name == "sub_agent_task":
-        tools, host = _sub_agent_binding_parts(args)
-        task = re.sub(r"\s+", " ", str(args.get("task") or "").strip())
-        if task:
-            task = task[:120]
-        if tools or host or task:
-            line.append("(", style=TEXT_MUTED)
-            if tools:
-                line.append_text(_gradient_rich_text(tools))
-            if host:
-                line.append(f"({host})", style=TEXT_MUTED)
-            if task:
-                if tools or host:
-                    line.append(", ", style=TEXT_MUTED)
-                line.append(task, style=TEXT_MUTED)
-            line.append(")", style=TEXT_MUTED)
     if pending:
         if name == "page_extract":
             status_label = "reading"
@@ -1240,26 +1208,6 @@ def _tool_line(name: str, args: dict) -> Text:
     if jina_tokens not in (None, ""):
         line.append(" ", style=TEXT_MUTED)
         line.append(f"{jina_tokens}tok", style=TEXT_MUTED)
-    if name == "sub_agent_task" and str(args.get("tools") or "").strip().lower() == "page":
-        line.append(" ", style=TEXT_MUTED)
-        if page_billing_mode == "free":
-            line.append("page $0", style=TEXT_MUTED)
-            if page_usage_tokens not in (None, ""):
-                line.append(f" {page_usage_tokens}tok", style=TEXT_MUTED)
-        elif page_billing_mode == "paid":
-            if isinstance(page_cost_usd, (int, float)):
-                line.append(f"page ${float(page_cost_usd):.6f}", style=TEXT_MUTED)
-            else:
-                line.append("page paid", style=TEXT_MUTED)
-            if page_usage_tokens not in (None, ""):
-                line.append(f" {page_usage_tokens}tok", style=TEXT_MUTED)
-        elif page_billing_mode and page_billing_mode != "skipped":
-            line.append(f"page {page_billing_mode}", style=TEXT_MUTED)
-            if page_usage_tokens not in (None, ""):
-                line.append(f" {page_usage_tokens}tok", style=TEXT_MUTED)
-        if isinstance(compression_cost_usd, (int, float)):
-            line.append(" ", style=TEXT_MUTED)
-            line.append(f"compress ${float(compression_cost_usd):.6f}", style=TEXT_MUTED)
     if elapsed_s not in (None, ""):
         try:
             line.append(f" {float(elapsed_s):.1f}s", style=TEXT_MUTED)
@@ -2228,6 +2176,11 @@ def _run_non_streaming(
     t_start = time.monotonic()
     turn_stats_before = _stats_snapshot(stats)
     settled: list[object] = []
+    live_lock = threading.RLock()
+
+    def _safe_live_update(renderable: object, *, refresh: bool = True) -> None:
+        with live_lock:
+            live.update(renderable, refresh=refresh)
 
     def _finish_live(
         *,
@@ -2244,9 +2197,10 @@ def _run_non_streaming(
             note_style=note_style,
         )
         try:
-            live.update(final_block, refresh=True)
-            live.transient = False
-            live.stop()
+            with live_lock:
+                _safe_live_update(final_block, refresh=True)
+                live.transient = False
+                live.stop()
         except Exception:
             console.print(final_block)
 
@@ -2258,10 +2212,12 @@ def _run_non_streaming(
             turn_stats=_stats_delta(turn_stats_before, turn_stats_before, elapsed=0.0),
         ),
         console=console,
+        auto_refresh=False,
         refresh_per_second=12,
         transient=True,
     )
-    live.start()
+    with live_lock:
+        live.start()
     refresh_stop = threading.Event()
 
     def _live_refresh_loop() -> None:
@@ -2278,7 +2234,7 @@ def _run_non_streaming(
     def _on_reasoning(text: str, meta: dict[str, Any]) -> None:
         del text, meta
         try:
-            live.update(
+            _safe_live_update(
                 _render_live_request_block(
                     mode_state=mode_state,
                     settled=settled,
@@ -2293,7 +2249,7 @@ def _run_non_streaming(
     def _on_tool(name: str, args: dict) -> None:
         settled.append(_tool_line(name, args))
         try:
-            live.update(
+            _safe_live_update(
                 _render_live_request_block(
                     mode_state=mode_state,
                     settled=settled,
@@ -2349,7 +2305,7 @@ def _run_streaming(
     last_update = [0.0]
     tool_states: list[tuple[str, dict]] = []
     tool_state_lock = threading.RLock()
-    next_tool_done_index = [0]
+    live_lock = threading.RLock()
     thinking_meta = [None]
     t_start = time.monotonic()
     turn_stats_before = _stats_snapshot(stats)
@@ -2382,12 +2338,10 @@ def _run_streaming(
         with tool_state_lock:
             snapshot = [(name, dict(args)) for name, args in tool_states]
             if not snapshot:
-                next_tool_done_index[0] = 0
                 return None
             tool_renderable = Group(*(_tool_line(name, args) for name, args in snapshot))
             settled.append(tool_renderable)
             tool_states.clear()
-            next_tool_done_index[0] = 0
             return tool_renderable
 
     def _finish_live(
@@ -2401,7 +2355,6 @@ def _run_streaming(
         with tool_state_lock:
             tool_renderable = _snapshot_tool_status()
             tool_states.clear()
-            next_tool_done_index[0] = 0
         final_block = _render_turn_transcript(
             settled=settled,
             reply_text=reply_text,
@@ -2412,9 +2365,10 @@ def _run_streaming(
         )
         try:
             if live:
-                live.update(final_block, refresh=True)
-                live.transient = False
-                live.stop()
+                with live_lock:
+                    live.update(final_block, refresh=True)
+                    live.transient = False
+                    live.stop()
             else:
                 console.print(final_block)
         except Exception:
@@ -2444,7 +2398,8 @@ def _run_streaming(
         if live is None:
             return
         try:
-            live.update(_current_live_renderable(), refresh=True)
+            with live_lock:
+                live.update(_current_live_renderable(), refresh=True)
         except Exception:
             pass
 
@@ -2498,6 +2453,7 @@ def _run_streaming(
             last_update[0] = now
 
     def _on_rewind(thinking: str, tools: list[tuple[str, dict]] | None = None) -> None:
+        del tools
         rewind_source = str(thinking or "")
         if not rewind_source.strip():
             rewind_source = "".join(chunks)
@@ -2505,12 +2461,6 @@ def _run_streaming(
         clean = _clean_answer(rewind_source) if rewind_source else ""
         if clean.strip():
             settled.append(_render_reply_body(clean, preview=True))
-        with tool_state_lock:
-            for name, args in tools or []:
-                row_args = dict(args)
-                row_args["_pending"] = True
-                tool_states.append((name, row_args))
-            next_tool_done_index[0] = 0
         chunks.clear()
         last_update[0] = 0.0
         _refresh_live()
@@ -2529,29 +2479,33 @@ def _run_streaming(
                 _refresh_live()
             return
         call_id = str(args.get("_call_id") or "").strip()
-        if call_id:
-            with tool_state_lock:
-                idx = _find_tool_index(call_id)
-                if idx >= 0:
-                    existing_name, existing_args = tool_states[idx]
-                    merged_args = dict(existing_args)
-                    merged_args.update(args)
-                    if "_pending" not in args:
-                        merged_args["_pending"] = False
-                    tool_states[idx] = (name or existing_name, merged_args)
-                    _refresh_live()
-                    return
+        parent_call_id = str(args.get("_parent_call_id") or "").strip()
         with tool_state_lock:
-            if next_tool_done_index[0] < len(tool_states):
-                idx = next_tool_done_index[0]
-                planned_name, planned_args = tool_states[idx]
-                planned_args.update(args)
-                planned_args["_pending"] = False
-                tool_states[idx] = (planned_name, planned_args)
-                next_tool_done_index[0] += 1
-                _refresh_live()
-                return
-        settled.append(_tool_line(name, args))
+            idx = _find_tool_index(call_id) if call_id else -1
+            if idx >= 0:
+                existing_name, existing_args = tool_states[idx]
+                merged_args = dict(existing_args)
+                merged_args.update(args)
+                if "_pending" not in args:
+                    merged_args["_pending"] = False
+                tool_states[idx] = (name or existing_name, merged_args)
+            else:
+                row_args = dict(args)
+                row_args["_pending"] = bool(row_args.get("_pending", False))
+                if parent_call_id:
+                    parent_index = _find_tool_index(parent_call_id)
+                    if parent_index >= 0:
+                        insert_at = parent_index + 1
+                        while insert_at < len(tool_states):
+                            row_parent = str(tool_states[insert_at][1].get("_parent_call_id") or "").strip()
+                            if row_parent != parent_call_id:
+                                break
+                            insert_at += 1
+                        tool_states.insert(insert_at, (name, row_args))
+                    else:
+                        tool_states.append((name, row_args))
+                else:
+                    tool_states.append((name, row_args))
         _refresh_live()
 
     live = Live(
@@ -2562,10 +2516,12 @@ def _run_streaming(
             turn_stats=_current_turn_stats(),
         ),
         console=console,
+        auto_refresh=False,
         refresh_per_second=12,
         transient=True,
     )
-    live.start()
+    with live_lock:
+        live.start()
 
     def _live_refresh_loop() -> None:
         while not refresh_stop.is_set():
@@ -2689,7 +2645,87 @@ def main(argv: list[str] | None = None):
         mode_state["_runtime_label"] = lambda: get_runtime_prewarm_label(_active_stage1_config())
 
     spinner = _Spinner()
-    last_context: list[dict[str, str]] | None = None
+    turn_memory: list[dict[str, str]] = []
+
+    def _build_compact_context(
+        memory: list[dict[str, str]],
+        *,
+        current_user_text: str = "",
+        max_pairs: int = 3,
+    ) -> str | None:
+        rows = [dict(item) for item in memory if isinstance(item, dict)]
+        if not rows:
+            return None
+
+        def _trim(text: str, limit: int) -> str:
+            raw = _clean_answer(text)
+            cap = max(1, int(limit))
+            if len(raw) <= cap:
+                return raw
+            return raw[: cap - 1].rstrip() + "…"
+
+        def _looks_like_choice_reply(text: str) -> bool:
+            raw = _clean_answer(text)
+            if not raw:
+                return False
+            compact = re.sub(r"\s+", "", raw).casefold()
+            if compact in {
+                "1", "2", "3", "4", "5", "6", "7", "8", "9",
+                "a", "b", "c", "d", "e", "f",
+                "前者", "后者", "就这个",
+                "第1个", "第2个", "第3个", "第4个", "第5个",
+                "第一", "第二", "第三", "第四", "第五",
+                "第一个", "第二个", "第三个", "第四个", "第五个",
+            }:
+                return True
+            return re.fullmatch(r"(?:第)?\d+(?:个|项|步)?", compact) is not None
+
+        def _looks_like_option_menu(text: str) -> bool:
+            raw = _clean_answer(text)
+            if not raw:
+                return False
+            patterns = (
+                r"(?m)^\s*[1-9][\.\)．、]\s+\S+",
+                r"(?m)^\s*[A-Fa-f][\.\)]\s+\S+",
+                r"(?m)^\s*\d+\s+\S+",
+                r"(?m)^\s*选\s*[1-9A-Fa-f]",
+                r"(?m)^\s*你回复.*(?:1|2|3|4|5|A|B|C)",
+            )
+            return any(re.search(pattern, raw) for pattern in patterns)
+
+        pairs: list[tuple[str, str]] = []
+        pending_user = ""
+        for item in rows:
+            role = str(item.get("role") or "").strip().lower()
+            content = _clean_answer(str(item.get("content") or "").strip())
+            if not content:
+                continue
+            if role == "user":
+                pending_user = content
+                continue
+            if role == "assistant":
+                if pending_user:
+                    pairs.append((pending_user, content))
+                    pending_user = ""
+                else:
+                    pairs.append(("", content))
+        if not pairs:
+            return None
+        lines = [
+            "Previous Turns Summary",
+            "Use the summary below only as background. This turn is still a fresh tool/runtime session, so do not reuse prior search history, cached pages, or stale assumptions unless the user repeats them.",
+        ]
+        preserve_last_menu = _looks_like_choice_reply(current_user_text)
+        last_index = len(pairs) - 1
+        for idx, (user_text, assistant_text) in enumerate(pairs[-max(1, int(max_pairs)):], start=max(0, len(pairs) - max(1, int(max_pairs)))):
+            if user_text:
+                lines.append(f"User: {_trim(user_text, 160)}")
+            if preserve_last_menu and idx == last_index and _looks_like_option_menu(assistant_text):
+                lines.append("Assistant (full because current user reply looks like an option selection):")
+                lines.append(assistant_text)
+            else:
+                lines.append(f"Assistant: {_trim(assistant_text, 220)}")
+        return "\n".join(lines).strip()
 
     if config_issue:
         console.print(f"  [{TEXT_MUTED}]{config_issue}[/{TEXT_MUTED}]")
@@ -2765,7 +2801,7 @@ def main(argv: list[str] | None = None):
                 continue
 
             multi = mode_state["multi_turn"]
-            ctx = last_context if multi else None
+            ctx = _build_compact_context(turn_memory, current_user_text=question) if multi else None
 
             try:
                 answer = ""
@@ -2813,11 +2849,8 @@ def main(argv: list[str] | None = None):
 
             # Build context for next round
             if answer:
-                base_context = last_context if multi and isinstance(last_context, list) else []
-                if not isinstance(base_context, list):
-                    base_context = []
-                last_context = [
-                    *base_context,
+                turn_memory = [
+                    *turn_memory,
                     {"role": "user", "content": question},
                     {"role": "assistant", "content": answer},
                 ][-12:]

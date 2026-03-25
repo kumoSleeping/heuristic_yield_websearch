@@ -41,6 +41,13 @@ def _normalized_reasoning_effort(cfg: dict[str, Any]) -> str:
     return value if value in ("minimal", "low", "medium", "high", "xhigh", "none") else ""
 
 
+def _normalized_service_tier(cfg: dict[str, Any]) -> str:
+    value = str(cfg.get("service_tier") or "").strip().lower()
+    if value == "fast":
+        return "priority"
+    return value if value in ("auto", "default", "flex", "scale", "priority") else ""
+
+
 def should_use_codex_mirror_transport(cfg: dict[str, Any]) -> bool:
     provider_name = str(cfg.get("model_provider") or "").strip().lower()
     api_base = str(cfg.get("api_base") or "").strip().lower()
@@ -198,8 +205,10 @@ def _messages_to_input(messages: list[dict[str, Any]]) -> tuple[list[dict[str, A
                     instructions.append(text)
             else:
                 parts = _convert_content(content, "system")
-                if parts:
-                    input_items.append({"type": "message", "role": "system", "content": parts})
+                text_parts = [str(part.get("text") or "").strip() for part in parts if isinstance(part, dict)]
+                text = "\n\n".join(part for part in text_parts if part).strip()
+                if text:
+                    instructions.append(text)
             continue
         if role == "tool":
             output_parts = _convert_content(content, "user")
@@ -224,14 +233,28 @@ def _messages_to_input(messages: list[dict[str, Any]]) -> tuple[list[dict[str, A
                         "call_id": str(tool_call.get("id") or "").strip(),
                         "name": str(function.get("name") or "").strip(),
                         "arguments": str(function.get("arguments") or ""),
-                    }
-                )
+                }
+            )
+            continue
+        if isinstance(content, str):
+            text = content.strip()
+            input_items.append({"role": role or "user", "content": text})
+            continue
+        converted_parts = _convert_content(content, role or "user")
+        text_parts = [str(part.get("text") or "").strip() for part in converted_parts if isinstance(part, dict)]
+        non_text_parts = [
+            part
+            for part in converted_parts
+            if isinstance(part, dict) and str(part.get("type") or "").strip() not in {"input_text", "output_text"}
+        ]
+        if text_parts and not non_text_parts:
+            input_items.append({"role": role or "user", "content": "\n\n".join(part for part in text_parts if part).strip()})
             continue
         input_items.append(
             {
                 "type": "message",
                 "role": role or "user",
-                "content": _convert_content(content, role or "user"),
+                "content": converted_parts,
             }
         )
     return input_items, "\n\n".join(part for part in instructions if part).strip()
@@ -263,6 +286,9 @@ def build_request_body(
     effort = _normalized_reasoning_effort(cfg)
     if effort:
         body["reasoning"] = {"effort": effort}
+    service_tier = _normalized_service_tier(cfg)
+    if service_tier:
+        body["service_tier"] = service_tier
     return body
 
 

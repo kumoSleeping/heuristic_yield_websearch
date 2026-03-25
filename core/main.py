@@ -19,7 +19,7 @@ import os
 import re
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -32,7 +32,6 @@ from .codex_transport import (
     should_use_codex_mirror_transport,
     stream_response as codex_transport_stream_response,
 )
-from .tool_view import format_tool_view_text
 from .config import (
     CONFIG_PATH,
     DEFAULT_MODEL,
@@ -45,35 +44,22 @@ from .config import (
 )
 from .prompt import (
     BASE_SYSTEM_PROMPT,
-    CANDIDATE_EVIDENCE_HEADING,
-    CANDIDATE_EVIDENCE_REPLACEMENT_TEXT,
-    CANDIDATE_EVIDENCE_TEXT,
-    CONTEXT_KEEP_FOLLOWUP_REMINDER_TEXT,
-    CONTEXT_MANAGEMENT_TOOL_PROMPT,
     DEFAULT_NO_RESULTS_TEXT,
     DEFAULT_NO_TITLE_TEXT,
     DEFAULT_PAGE_NO_MATCHING_CACHED_TEXT,
     DEFAULT_PAGE_NO_MATCHING_TEXT,
     DUPLICATE_QUERY_SKIPPED_TEXT,
-    EVIDENCE_CONTEXT_EMPTY_TEXT,
-    EVIDENCE_CONTEXT_HEADING,
-    EVIDENCE_CONTEXT_ID_TEXT,
-    EVIDENCE_CONTEXT_KEPT_TEXT,
     FIRST_SEARCH_PROMPT,
-    NORMAL_LOOP_PROMPT,
-    POST_SEARCH_SKELETON_PROMPT,
-    POST_SKELETON_REFINE_PROMPT,
+    LATEST_RAW_EMPTY_TEXT,
+    LATEST_RAW_HEADING,
     PAGE_MARKDOWN_CACHE_HIT_TEXT,
     PAGE_MARKDOWN_CACHE_MISS_TEXT,
     PAGE_MARKDOWN_CACHE_PREFIX,
     PAGE_MARKDOWN_EMPTY_TITLE,
-    PAGE_MARKDOWN_KEYWORDS_PREFIX,
+    PAGE_MARKDOWN_SCOPE_PREFIX,
     PAGE_MARKDOWN_MATCHED_LINES_TEXT,
     PAGE_MARKDOWN_TITLE_PREFIX,
-    PAGE_MARKDOWN_WINDOW_ALL_TEXT,
-    PAGE_MARKDOWN_WINDOW_PREFIX,
-    PAGE_MARKDOWN_WINDOW_SUFFIX,
-    format_context_keep_markdown,
+    POST_SEARCH_PROMPT,
     litellm_tool_config_for_phase,
 )
 
@@ -133,6 +119,28 @@ class _LazyLiteLLM:
 
 
 litellm = _LazyLiteLLM()
+
+
+def _strip_model_routing_suffix(value: str) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    head, sep, tail = text.rpartition("/")
+    if not sep:
+        return text.partition(":")[0].strip()
+    clean_tail = tail.partition(":")[0].strip()
+    if not clean_tail:
+        return head
+    return f"{head}/{clean_tail}"
+
+
+def _strip_openrouter_model_prefix(value: str) -> str:
+    text = _strip_model_routing_suffix(value)
+    if not text.startswith("openrouter/"):
+        return text
+    stripped = text[len("openrouter/"):].strip()
+    return stripped or text
+
 
 STATUS_PREPARING = "Preparing..."
 STATUS_THINKING = "Thinking..."
@@ -525,6 +533,78 @@ def log_model_call(
         pass  # 日志不应影响主流程
 
 
+def log_tool_call(
+    *,
+    name: str,
+    args: dict[str, Any],
+    payload: dict[str, Any],
+    duration_ms: float | None = None,
+    config: dict[str, Any] | None = None,
+    log_id: str | None = None,
+):
+    """记录真实工具执行，不写模型预演结果。"""
+    try:
+        d = _log_dir(config)
+        fname = log_id or _make_log_id("unknown")
+        path = d / fname
+
+        ts = datetime.now().strftime("%H:%M:%S")
+        lines = [
+            f"## [{ts}] tool `{name}`",
+        ]
+        if duration_ms is not None:
+            lines.append(f"- duration: {duration_ms:.0f}ms")
+
+        lines.append("")
+        lines.append("### Args")
+        lines.append(f"```json\n{json.dumps(args or {}, ensure_ascii=False, indent=2, default=str)}\n```")
+        lines.append("")
+        lines.append("### Result")
+        lines.append(f"```json\n{json.dumps(payload or {}, ensure_ascii=False, indent=2, default=str)}\n```")
+        lines.append("")
+        lines.append("---")
+        lines.append("")
+
+        with _log_lock:
+            with open(path, "a", encoding="utf-8") as f:
+                f.write("\n".join(lines))
+    except Exception:
+        pass
+
+
+def log_tool_selection(
+    *,
+    round_i: int,
+    calls: list[dict[str, Any]],
+    config: dict[str, Any] | None = None,
+    log_id: str | None = None,
+):
+    try:
+        if not calls:
+            return
+        d = _log_dir(config)
+        fname = log_id or _make_log_id("unknown")
+        path = d / fname
+
+        ts = datetime.now().strftime("%H:%M:%S")
+        lines = [
+            f"## [{ts}] round {int(round_i) + 1} selected tools",
+            "",
+            "### Calls",
+            "```json",
+            json.dumps(calls, ensure_ascii=False, indent=2, default=str),
+            "```",
+            "",
+            "---",
+            "",
+        ]
+        with _log_lock:
+            with open(path, "a", encoding="utf-8") as f:
+                f.write("\n".join(lines))
+    except Exception:
+        pass
+
+
 # ── 工具: web_search (hyw 内置) ──────────────────────────
 
 
@@ -537,6 +617,7 @@ def get_web_search_backend(config: dict[str, Any] | None = None) -> str:
 
 _DIRECT_SEARCH_TIMEOUT_S = 12.0
 _DIRECT_PAGE_TIMEOUT_S = 60.0
+_EXTERNAL_TOOL_TIMEOUT_S = 45.0
 
 
 def _run_async(coro):
@@ -620,7 +701,18 @@ async def _web_search_async(
             progress_callback=progress_callback,
         )
     except Exception as e:
-        return {"ok": False, "error": str(e)}
+        return {"ok": False, "error": f"web_search provider failed: {str(e).strip() or type(e).__name__}", "query": query, "results": []}
+
+    if not isinstance(payload, dict):
+        return {"ok": False, "error": "web_search provider failed: invalid payload type", "query": query, "results": []}
+    if not bool(payload.get("ok", True)):
+        provider = str(payload.get("provider") or "").strip()
+        raw_error = str(payload.get("error") or "").strip() or "unknown provider error"
+        error_text = raw_error if not provider or raw_error.startswith(f"{provider}:") else f"{provider}: {raw_error}"
+        result = {"ok": False, "error": error_text, "query": query, "results": []}
+        if isinstance(payload.get("_meta"), dict):
+            result["_meta"] = dict(payload.get("_meta") or {})
+        return result
 
     rows = payload.get("results", []) if isinstance(payload, dict) else []
     results = [
@@ -676,7 +768,7 @@ def _page_extract(
         "provider": str(payload.get("provider") or "").strip(),
         "title": str(payload.get("title") or "")[:200],
         "url": str(payload.get("url") or url)[:400],
-        "content": str(payload.get("content") or "")[:8000],
+        "content": str(payload.get("content") or "")[: max(1, int(max_chars))],
         "_meta": dict(payload.get("_meta") or {}) if isinstance(payload.get("_meta"), dict) else {},
     }
 
@@ -703,7 +795,6 @@ def _public_search_results(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return public_rows
 
 
-
 def execute_tool_payload(
     name: str,
     args: dict[str, Any],
@@ -720,15 +811,21 @@ def execute_tool_payload(
         r = _run_direct_web_search(
             query=args.get("query", ""),
             cfg=cfg,
+            stats=stats,
+            log_id=log_id,
             runtime_state=runtime_state,
             progress_callback=progress_callback,
         )
     elif name == "page_extract":
         r = _run_page_probe(
             url=args.get("url", ""),
-            query=args.get("query", ""),
-            lines=args.get("lines", ""),
+            mode=str(args.get("mode") or "sample").strip().lower() or "sample",
+            start_line=_coerce_page_extract_line_number(args.get("start_line")),
+            end_line=_coerce_page_extract_line_number(args.get("end_line")),
+            question=user_question,
             cfg=cfg,
+            stats=stats,
+            log_id=log_id,
             runtime_state=runtime_state,
             progress_callback=progress_callback,
         )
@@ -748,10 +845,6 @@ def _tool_capability(name: str) -> str:
         return "search"
     if name == "page_extract":
         return "page_extract"
-    if name == "plan_update":
-        return "plan"
-    if name == "context_keep":
-        return "context"
     return ""
 
 
@@ -761,8 +854,6 @@ def _tool_display_name(name: str, *, provider: str = "") -> str:
         "web_search": "Web Search",
         "web_search_wiki": "Web Search",
         "page_extract": "Read",
-        "plan_update": "Plan",
-        "context_keep": "Context",
     }.get(name, str(name or "").strip())
 
 
@@ -805,16 +896,6 @@ def _tool_provider_from_config(name: str, config: dict[str, Any] | None = None) 
     return str(handlers[0].provider or "").strip()
 
 
-def _tool_preview_callback_args(name: str, args: dict[str, Any], *, config: dict[str, Any] | None = None) -> dict[str, Any]:
-    merged = dict(args)
-    provider = _tool_provider_from_config(name, config)
-    if provider:
-        merged["_provider"] = provider
-    merged["_display_name"] = _tool_display_name(name, provider=provider)
-    merged["_planned"] = True
-    return merged
-
-
 def _tool_callback_args(
     name: str,
     args: dict[str, Any],
@@ -831,9 +912,6 @@ def _tool_callback_args(
             merged["_count"] = payload.get("count")
         if "ok" in payload:
             merged["_ok"] = payload.get("ok")
-        if name == "plan_update":
-            merged["_created_count"] = len(payload.get("created_ids") or []) if isinstance(payload.get("created_ids"), list) else 0
-            merged["_updated_count"] = len(payload.get("updated_ids") or []) if isinstance(payload.get("updated_ids"), list) else 0
         if payload.get("from_cache"):
             merged["_from_cache"] = True
         meta = _tool_meta(payload)
@@ -881,6 +959,35 @@ def _tool_arguments_to_dict(raw: Any) -> dict[str, Any]:
     return {}
 
 
+def _coerce_page_extract_search_arg(payload: dict[str, Any]) -> list[str]:
+    if not isinstance(payload, dict):
+        return []
+
+    raw_search = payload.get("search")
+    if not isinstance(raw_search, list):
+        return []
+    return _split_page_extract_search_terms(raw_search)
+
+
+def _coerce_page_extract_mode(payload: dict[str, Any]) -> str:
+    raw_mode = str((payload or {}).get("mode") or "").strip().lower()
+    if raw_mode in {"sample", "range"}:
+        return raw_mode
+    start_line = _coerce_page_extract_line_number((payload or {}).get("start_line"))
+    end_line = _coerce_page_extract_line_number((payload or {}).get("end_line"))
+    if start_line or end_line:
+        return "range"
+    return "sample"
+
+
+def _coerce_page_extract_line_number(value: Any) -> int:
+    try:
+        parsed = int(value)
+    except Exception:
+        return 0
+    return max(0, parsed)
+
+
 def _sanitize_native_tool_call(name: str, args: dict[str, Any], *, call_id: str = "") -> dict[str, Any] | None:
     normalized_name = _normalize_native_tool_name(name)
     payload = dict(args or {})
@@ -892,47 +999,30 @@ def _sanitize_native_tool_call(name: str, args: dict[str, Any], *, call_id: str 
     elif normalized_name == "page_extract":
         url = str(payload.get("url") or payload.get("target") or "").strip()
         ref = _normalize_context_ref(str(payload.get("ref") or "").strip())
-        query = str(payload.get("query") or payload.get("keyword") or payload.get("keywords") or "").strip()
-        lines = str(payload.get("lines") or "").strip()
+        if any(str(payload.get(key) or "").strip() for key in ("task", "lines", "line_ranges")):
+            return None
+        if "stride" in payload and payload.get("stride") not in (None, ""):
+            return None
+        if "search" in payload and payload.get("search") not in (None, [], ""):
+            return None
         if not url and not ref:
             return None
+        mode = _coerce_page_extract_mode(payload)
         clean_args = {}
         if url:
             clean_args["url"] = url
         if ref:
             clean_args["ref"] = ref
-        if query:
-            clean_args["query"] = query
-        if lines:
-            clean_args["lines"] = lines
-    elif normalized_name == "plan_update":
-        clean_args = {}
-        create = payload.get("create")
-        update = payload.get("update")
-        if isinstance(create, list):
-            create_items: list[dict[str, Any]] = []
-            for item in create:
-                if not isinstance(item, dict):
-                    continue
-                normalized_type = _normalize_context_item_type(str(item.get("type") or "").strip())
-                if not normalized_type.startswith("skeleton."):
-                    continue
-                create_items.append({**dict(item), "type": normalized_type})
-            if create_items:
-                clean_args["create"] = create_items
-        if isinstance(update, list):
-            update_items = [dict(item) for item in update if isinstance(item, dict) and item.get("id") not in (None, "")]
-            if update_items:
-                clean_args["update"] = update_items
-        if not clean_args:
-            return None
-    elif normalized_name == "context_keep":
-        ids = _normalize_context_keep_args(payload)
-        if not ids:
-            return None
-        clean_args = {}
-        if ids:
-            clean_args["ids"] = ids
+        clean_args["mode"] = mode
+        if mode == "range":
+            start_line = _coerce_page_extract_line_number(payload.get("start_line"))
+            end_line = _coerce_page_extract_line_number(payload.get("end_line"))
+            if not start_line or not end_line:
+                return None
+            if end_line < start_line:
+                start_line, end_line = end_line, start_line
+            clean_args["start_line"] = start_line
+            clean_args["end_line"] = end_line
     else:
         return None
 
@@ -941,14 +1031,50 @@ def _sanitize_native_tool_call(name: str, args: dict[str, Any], *, call_id: str 
     return {"name": normalized_name, "args": clean_args}
 
 
-def _parse_native_tool_calls(payload: dict[str, Any] | None) -> list[dict[str, Any]]:
+def _invalid_tool_call_reason(name: str, args: dict[str, Any]) -> str:
+    normalized_name = _normalize_native_tool_name(name)
+    payload = dict(args or {})
+    if normalized_name == "web_search":
+        return "web_search requires a non-empty `query` string."
+    if normalized_name == "page_extract":
+        if any(str(payload.get(key) or "").strip() for key in ("task", "lines", "line_ranges")):
+            return "page_extract accepts `url` or `ref`, plus `mode=sample|range`; do not pass `task`, `lines`, or `line_ranges`."
+        if "stride" in payload and payload.get("stride") not in (None, ""):
+            return "page_extract sampling is automatic now; do not pass `stride`."
+        url = str(payload.get("url") or payload.get("target") or "").strip()
+        ref = _normalize_context_ref(str(payload.get("ref") or "").strip())
+        if not url and not ref:
+            return "page_extract requires `url` or `ref`."
+        if "search" in payload and payload.get("search") not in (None, [], ""):
+            return "page_extract no longer supports `search`; use `mode=sample` preview, then `mode=range` with exact lines."
+        mode = _coerce_page_extract_mode(payload)
+        if mode == "range":
+            start_line = _coerce_page_extract_line_number(payload.get("start_line"))
+            end_line = _coerce_page_extract_line_number(payload.get("end_line"))
+            if not start_line or not end_line:
+                return "page_extract `mode=range` requires `start_line` and `end_line`."
+        return "page_extract arguments are invalid."
+    return f"unknown tool `{str(name or '').strip() or '<empty>'}`."
+
+
+def _format_invalid_tool_call_message(errors: list[str]) -> str:
+    clean = [str(item or "").strip() for item in errors if str(item or "").strip()]
+    if not clean:
+        return ""
+    rows = ["Tool call rejected:"]
+    rows.extend(f"- {item}" for item in clean[:4])
+    return "\n".join(rows).strip()
+
+
+def _parse_native_tool_calls_detailed(payload: dict[str, Any] | None) -> tuple[list[dict[str, Any]], list[str]]:
     if not isinstance(payload, dict):
-        return []
+        return [], []
     raw_tool_calls = payload.get("tool_calls")
     if not isinstance(raw_tool_calls, list):
-        return []
+        return [], []
 
     calls: list[dict[str, Any]] = []
+    errors: list[str] = []
     seen: set[tuple[str, tuple[tuple[str, str], ...]]] = set()
     for raw_call in raw_tool_calls:
         call_payload = _to_dict(raw_call)
@@ -965,6 +1091,9 @@ def _parse_native_tool_calls(payload: dict[str, Any] | None) -> list[dict[str, A
         arguments = _tool_arguments_to_dict(function_payload.get("arguments") or call_payload.get("arguments"))
         call = _sanitize_native_tool_call(name, arguments, call_id=call_id)
         if not isinstance(call, dict):
+            reason = _invalid_tool_call_reason(name, arguments)
+            if reason:
+                errors.append(f"`{str(name or '').strip() or '<empty>'}`: {reason}")
             continue
         signature = (
             str(call.get("name") or "").strip(),
@@ -980,6 +1109,11 @@ def _parse_native_tool_calls(payload: dict[str, Any] | None) -> list[dict[str, A
             continue
         seen.add(signature)
         calls.append(call)
+    return calls, errors
+
+
+def _parse_native_tool_calls(payload: dict[str, Any] | None) -> list[dict[str, Any]]:
+    calls, _ = _parse_native_tool_calls_detailed(payload)
     return calls
 
 
@@ -1028,19 +1162,6 @@ def _finalize_stream_tool_calls(state: dict[int, dict[str, Any]]) -> list[dict[s
         return []
     ordered = [state[index] for index in sorted(state)]
     return _parse_native_tool_calls({"tool_calls": ordered})
-
-
-def _tool_calls_preview_text(calls: list[dict[str, Any]]) -> str:
-    lines: list[str] = []
-    for call in calls:
-        if not isinstance(call, dict):
-            continue
-        name = str(call.get("name") or "").strip()
-        args = call.get("args") if isinstance(call.get("args"), dict) else {}
-        line = format_tool_view_text(name, args)
-        if line:
-            lines.append(line)
-    return "\n".join(lines).strip()
 
 
 def _normalize_context_ref(value: str) -> str:
@@ -1129,19 +1250,28 @@ def _append_context_messages(msgs: list[dict[str, Any]], context: Any) -> None:
             continue
         msgs.append({"role": role, "content": content})
 
-def _append_search_evidence_items(call: dict[str, Any], payload: dict[str, Any], state: _PhaseRuntimeState) -> list[int]:
+def _append_search_memory_items(
+    call: dict[str, Any],
+    payload: dict[str, Any],
+    state: _PhaseRuntimeState,
+    *,
+    round_no: int,
+) -> list[int]:
     args = call.get("args") if isinstance(call.get("args"), dict) else {}
     query = str(args.get("query") or payload.get("query") or "").strip()
+    call_id = str(args.get("_call_id") or "").strip()
     rows = payload.get("results") if isinstance(payload.get("results"), list) else []
     created_ids: list[int] = []
     if not rows:
         item = _add_context_item(
             state,
-            "evidence.search",
+            "memory.search",
             {
                 "query": query,
                 "text": str(payload.get("error") or DEFAULT_NO_RESULTS_TEXT).strip() or DEFAULT_NO_RESULTS_TEXT,
                 "snippet": str(payload.get("error") or DEFAULT_NO_RESULTS_TEXT).strip() or DEFAULT_NO_RESULTS_TEXT,
+                "round": round_no,
+                "call_id": call_id,
             },
             pending=True,
         )
@@ -1151,14 +1281,18 @@ def _append_search_evidence_items(call: dict[str, Any], payload: dict[str, Any],
     for row in rows:
         if not isinstance(row, dict):
             continue
+        snippet = re.sub(r"\s+", " ", str(row.get("snippet") or row.get("intro") or "").strip())
         item = _add_context_item(
             state,
-            "evidence.search",
+            "memory.search",
             {
                 "query": query,
                 "title": str(row.get("title") or DEFAULT_NO_TITLE_TEXT).strip() or DEFAULT_NO_TITLE_TEXT,
                 "url": str(row.get("url") or "").strip(),
-                "snippet": re.sub(r"\s+", " ", str(row.get("snippet") or row.get("intro") or "").strip()),
+                "snippet": snippet,
+                "text": snippet,
+                "round": round_no,
+                "call_id": call_id,
             },
             pending=True,
         )
@@ -1167,7 +1301,7 @@ def _append_search_evidence_items(call: dict[str, Any], payload: dict[str, Any],
 
 
 def _group_page_matches(matches: list[dict[str, Any]]) -> list[tuple[str, str]]:
-    groups: list[tuple[int, int, list[str]]] = []
+    groups: list[tuple[int, int, list[tuple[int, str]]]] = []
     for item in matches:
         if not isinstance(item, dict):
             continue
@@ -1180,33 +1314,111 @@ def _group_page_matches(matches: list[dict[str, Any]]) -> list[tuple[str, str]]:
             continue
         if groups and line_no <= groups[-1][1] + 1:
             start, _, texts = groups[-1]
-            groups[-1] = (start, line_no, [*texts, text])
+            groups[-1] = (start, line_no, [*texts, (line_no, text)])
         else:
-            groups.append((line_no, line_no, [text]))
+            groups.append((line_no, line_no, [(line_no, text)]))
     rendered: list[tuple[str, str]] = []
+    width = max(2, len(str(max((int(item.get("line") or 0) for item in matches if isinstance(item, dict)), default=1))))
     for start, end, texts in groups:
         line_span = f"{start}" if start == end else f"{start}-{end}"
-        rendered.append((line_span, "\n".join(texts)))
+        rendered.append((line_span, "\n".join(f"L{line_no:0{width}d} | {text}" for line_no, text in texts)))
     return rendered
 
 
-def _append_page_evidence_items(call: dict[str, Any], payload: dict[str, Any], state: _PhaseRuntimeState) -> list[int]:
+_SAMPLE_ACTION_LINK_TEXTS = (
+    "skip to content",
+    "see faq",
+    "see faqs",
+    "see checklist",
+    "see list of endorsements",
+    "endorse the osaid",
+    "add your name",
+)
+
+
+def _normalize_sample_preview_text(value: str) -> str:
+    return re.sub(r"\s+", " ", str(value or "").strip())
+
+
+def _extract_markdown_link_texts(value: str) -> list[str]:
+    return [match.group(1).strip() for match in re.finditer(r"\[([^\]]+)\]\([^)]+\)", str(value or ""))]
+
+
+def _looks_like_sample_noise_line(text: str, *, line_no: int = 0, total_lines: int = 0) -> bool:
+    clean = _normalize_sample_preview_text(text)
+    if not clean:
+        return True
+    if re.fullmatch(r"(?:[\*\-=_#.`~]\s*){2,}", clean):
+        return True
+    if re.fullmatch(r"#+\s*\[\]\([^)]+\)", clean):
+        return True
+
+    markdown_links = _extract_markdown_link_texts(clean)
+    link_only = bool(markdown_links) and re.fullmatch(
+        r"(?:[*\-+]\s+|\d+\.\s+|#+\s+)?(?:\[[^\]]+\]\([^)]+\)\s*)+",
+        clean,
+    ) is not None
+    if not link_only:
+        return False
+
+    plain = re.sub(r"(?:[*\-+]\s+|\d+\.\s+|#+\s+)", "", clean)
+    plain = re.sub(r"\[[^\]]+\]\([^)]+\)", " ", plain)
+    plain = _normalize_sample_preview_text(plain)
+    if plain:
+        return False
+
+    link_text = _normalize_sample_preview_text(" ".join(markdown_links)).casefold()
+    if any(link_text.startswith(prefix) for prefix in _SAMPLE_ACTION_LINK_TEXTS):
+        return True
+    if total_lines > 0 and line_no >= max(1, int(total_lines * 0.7)):
+        return True
+    return len(link_text) <= 32
+
+
+def _append_page_memory_items(
+    call: dict[str, Any],
+    payload: dict[str, Any],
+    state: _PhaseRuntimeState,
+    *,
+    round_no: int,
+    question_text: str,
+) -> list[int]:
     args = call.get("args") if isinstance(call.get("args"), dict) else {}
     url = str(payload.get("url") or args.get("url") or "").strip()
     title = str(payload.get("title") or "").strip()
-    query = str(payload.get("query") or args.get("query") or "").strip()
-    matches = payload.get("matched_lines") if isinstance(payload.get("matched_lines"), list) else []
+    question = str(payload.get("question") or question_text or "").strip()
+    search = payload.get("search")
+    if search in (None, ""):
+        search = args.get("search")
+    call_id = str(args.get("_call_id") or "").strip()
+    matches = payload.get("_matched_lines") if isinstance(payload.get("_matched_lines"), list) else []
+    mode = str(payload.get("mode") or args.get("mode") or "").strip().lower()
+    if mode == "sample":
+        total_lines = int(payload.get("total_lines") or 0)
+        matches = [
+            item
+            for item in matches
+            if isinstance(item, dict)
+            and not _looks_like_sample_noise_line(
+                str(item.get("text") or ""),
+                line_no=int(item.get("line") or 0),
+                total_lines=total_lines,
+            )
+        ]
     created_ids: list[int] = []
     grouped = _group_page_matches(matches)
     if not grouped:
         item = _add_context_item(
             state,
-            "evidence.page",
+            "memory.page",
             {
                 "title": title,
                 "url": url,
-                "query": query,
                 "text": str(payload.get("page_error") or payload.get("error") or DEFAULT_PAGE_NO_MATCHING_TEXT).strip() or DEFAULT_PAGE_NO_MATCHING_TEXT,
+                "question": question,
+                "search": search,
+                "round": round_no,
+                "call_id": call_id,
             },
             pending=True,
         )
@@ -1216,13 +1428,16 @@ def _append_page_evidence_items(call: dict[str, Any], payload: dict[str, Any], s
     for source_lines, text in grouped:
         item = _add_context_item(
             state,
-            "evidence.page",
+            "memory.page",
             {
                 "title": title,
                 "url": url,
-                "query": query,
-                "source_lines": source_lines,
+                "question": question,
+                "search": search,
+                "window": source_lines,
                 "text": text,
+                "round": round_no,
+                "call_id": call_id,
             },
             pending=True,
         )
@@ -1230,200 +1445,20 @@ def _append_page_evidence_items(call: dict[str, Any], payload: dict[str, Any], s
     return created_ids
 
 
-def _normalize_context_ids(value: Any) -> list[int]:
-    raw_items: list[Any] = []
-    if isinstance(value, list):
-        raw_items = list(value)
-    elif isinstance(value, str):
-        raw_items = [chunk.strip() for chunk in re.split(r"[,\n|]+", value)]
-
-    ids: list[int] = []
-    seen: set[int] = set()
-    for item in raw_items:
-        try:
-            normalized = int(item)
-        except Exception:
-            continue
-        if normalized in seen or normalized < 0:
-            continue
-        seen.add(normalized)
-        ids.append(normalized)
-    return ids
-
-
-def _normalize_context_keep_args(args: dict[str, Any] | None) -> list[int]:
-    payload = dict(args or {}) if isinstance(args, dict) else {}
-    return _normalize_context_ids(payload.get("ids", []))
-
-
-def _context_keep_markdown(
-    *,
-    kept_ids: list[int],
-    already_kept_ids: list[int],
-    missing_ids: list[int],
-    reason: str = "",
-) -> str:
-    return format_context_keep_markdown(
-        kept_ids=kept_ids,
-        already_kept_ids=already_kept_ids,
-        missing_ids=missing_ids,
-        reason=reason,
+def _build_latest_raw_message(state: "_PhaseRuntimeState") -> str:
+    return _build_context_items_message(
+        heading=LATEST_RAW_HEADING,
+        empty_text=LATEST_RAW_EMPTY_TEXT,
+        items=_latest_raw_items(state),
     )
-
-
-def _keep_session_context_refs(
-    state: "_PhaseRuntimeState",
-    ids: list[int],
-    *,
-    reason: str = "",
-) -> dict[str, Any]:
-    requested_ids: list[int] = []
-    seen: set[int] = set()
-    for item_id in ids:
-        if item_id in seen:
-            continue
-        seen.add(item_id)
-        requested_ids.append(item_id)
-
-    if not requested_ids:
-        return {
-            "ok": False,
-            "error": "no valid ids to keep",
-            "kept_ids": [],
-            "already_kept_ids": [],
-            "missing_ids": [],
-            "_model_markdown": _context_keep_markdown(
-                kept_ids=[],
-                already_kept_ids=[],
-                missing_ids=[],
-                reason=reason,
-            ),
-        }
-
-    kept_map = {
-        int(item.item_id): item
-        for item in state.items
-        if item.item_type.startswith("evidence.")
-    }
-    pending_map = {
-        int(item.item_id): item
-        for item in state.pending_items
-        if item.item_type.startswith("evidence.")
-    }
-
-    kept_ids: list[int] = []
-    already_kept_ids: list[int] = []
-    missing_ids: list[int] = []
-    moved_items: list[_ContextItem] = []
-
-    for item_id in requested_ids:
-        if item_id in kept_map:
-            already_kept_ids.append(item_id)
-            continue
-        item = pending_map.get(item_id)
-        if item is None:
-            missing_ids.append(item_id)
-            continue
-        kept_ids.append(item_id)
-        moved_items.append(item)
-
-    if moved_items:
-        moved_id_set = {int(item.item_id) for item in moved_items}
-        state.pending_items = [item for item in state.pending_items if int(item.item_id) not in moved_id_set]
-        state.items.extend(moved_items)
-
-    return {
-        "ok": bool(kept_ids),
-        "kept_ids": kept_ids,
-        "already_kept_ids": already_kept_ids,
-        "missing_ids": missing_ids,
-        "reason": reason,
-        "count": len(kept_ids),
-        "_model_markdown": _context_keep_markdown(
-            kept_ids=kept_ids,
-            already_kept_ids=already_kept_ids,
-            missing_ids=missing_ids,
-            reason=reason,
-        ),
-    }
-
-
-def _build_accumulated_context_message(state: "_PhaseRuntimeState") -> str:
-    evidence_items = _evidence_items(state)
-    candidate_items = _candidate_evidence_items(state)
-    if not evidence_items and not candidate_items and not state.pending_user_note:
-        return ""
-    parts = [EVIDENCE_CONTEXT_HEADING]
-    if evidence_items:
-        parts.extend(
-            [
-                EVIDENCE_CONTEXT_KEPT_TEXT,
-                EVIDENCE_CONTEXT_ID_TEXT,
-            ]
-        )
-    else:
-        parts.append(EVIDENCE_CONTEXT_EMPTY_TEXT)
-    for item in evidence_items:
-        data = dict(item.data)
-        parts.append(f"[{item.item_id}] {item.item_type}")
-        for key in ("query", "title", "url", "snippet", "source_lines", "text"):
-            value = str(data.get(key) or "").strip()
-            if value:
-                parts.append(f"{key}: {value}")
-        parts.append("")
-    if candidate_items:
-        parts.extend(
-            [
-                "",
-                CANDIDATE_EVIDENCE_HEADING,
-                CANDIDATE_EVIDENCE_TEXT,
-                CANDIDATE_EVIDENCE_REPLACEMENT_TEXT,
-            ]
-        )
-        for item in candidate_items:
-            data = dict(item.data)
-            parts.append(f"[{item.item_id}] {item.item_type}")
-            for key in ("query", "title", "url", "snippet", "source_lines", "text"):
-                value = str(data.get(key) or "").strip()
-                if value:
-                    parts.append(f"{key}: {value}")
-            parts.append("")
-    if state.pending_user_note:
-        parts.extend(["", state.pending_user_note])
-    if candidate_items:
-        parts.extend(["", CONTEXT_KEEP_FOLLOWUP_REMINDER_TEXT])
-    return "\n".join(part for part in parts if str(part).strip()).strip()
-
-
-def _render_skeleton_markdown(state: "_PhaseRuntimeState") -> str:
-    lines = ["# Skeleton Context"]
-    skeleton_items = _skeleton_items(state)
-    if not skeleton_items:
-        lines.extend(["", "- Skeleton not built yet."])
-        return "\n".join(lines).strip()
-    for item in skeleton_items:
-        data = dict(item.data)
-        lines.extend(["", f"[{item.item_id}] {item.item_type}"])
-        if str(data.get("claim_id") or "").strip():
-            lines.append(f"claim_id: {str(data.get('claim_id') or '').strip()}")
-        text = str(data.get("text") or "").strip()
-        if text:
-            lines.append(f"text: {text}")
-    return "\n".join(lines).strip()
-
-
-def _build_skeleton_context_message(state: "_PhaseRuntimeState") -> str:
-    return _render_skeleton_markdown(state)
 
 
 def _build_round_brief_message(state: "_PhaseRuntimeState") -> str:
     prompts: list[str] = []
     if state.disclosure_step <= 0:
         prompts.append(FIRST_SEARCH_PROMPT.strip())
-    elif state.disclosure_step == 1:
-        prompts.append(POST_SEARCH_SKELETON_PROMPT.strip())
-    elif state.disclosure_step == 2 and not state.disclosure_refine_consumed:
-        prompts.append(POST_SKELETON_REFINE_PROMPT.strip())
+    elif state.disclosure_step == 1 and not state.disclosure_refine_consumed:
+        prompts.append(POST_SEARCH_PROMPT.strip())
     return "\n\n".join(part for part in prompts if str(part).strip()).strip()
 
 
@@ -1433,25 +1468,15 @@ def _build_loop_system_prompt(
     *,
     disclosure_step: int = 0,
 ) -> str:
+    del disclosure_step
     custom = str(cfg.get("system_prompt") or "").strip()
     name = str(cfg.get("name") or DEFAULT_NAME).strip()
-    context_management_tool_prompt = ""
-    if int(disclosure_step) > 0:
-        context_management_tool_prompt = CONTEXT_MANAGEMENT_TOOL_PROMPT.strip()
-    return "\n\n".join(
-        part
-        for part in (
-            BASE_SYSTEM_PROMPT.format(
-                name=name,
-                language=cfg.get("language") or "zh-CN",
-                time=datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z"),
-                custom=(custom + "\n") if custom else "",
-                context_management_tool_prompt=(context_management_tool_prompt + "\n") if context_management_tool_prompt else "",
-                user_message=user_message,
-            ).strip(),
-            NORMAL_LOOP_PROMPT.strip(),
-        )
-        if part
+    return BASE_SYSTEM_PROMPT.format(
+        name=name,
+        language=cfg.get("language") or "zh-CN",
+        time=datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z"),
+        custom=(custom + "\n") if custom else "",
+        user_message=user_message,
     ).strip()
 
 
@@ -1487,14 +1512,13 @@ def _build_loop_messages(
     round_brief = _build_round_brief_message(state)
     if round_brief:
         msgs.append({"role": "user", "content": round_brief})
-        if state.disclosure_step == 2:
+        if state.disclosure_step == 1:
             state.disclosure_refine_consumed = True
-    skeleton_message = _build_skeleton_context_message(state)
-    if skeleton_message:
-        msgs.append({"role": "user", "content": skeleton_message})
-    context_message = _build_accumulated_context_message(state)
-    if context_message:
-        msgs.append({"role": "user", "content": context_message})
+    latest_raw_message = _build_latest_raw_message(state)
+    if latest_raw_message:
+        msgs.append({"role": "user", "content": latest_raw_message})
+    if state.pending_user_note:
+        msgs.append({"role": "user", "content": state.pending_user_note})
     return msgs
 
 
@@ -1539,6 +1563,148 @@ def _format_model_error_message(exc: Exception) -> str:
             "请切换到支持图片输入的阶段一模型后重试。"
         )
     return f"[模型调用失败] {err}"
+
+
+_RETRYABLE_MODEL_ERROR_FRAGMENTS = (
+    "unexpected_eof_while_reading",
+    "eof occurred in violation of protocol",
+    "server disconnected",
+    "remote end closed connection",
+    "connection reset",
+    "connection aborted",
+    "connection timed out",
+    "connect timeout",
+    "read timed out",
+    "timed out",
+    "timeout",
+    "temporarily unavailable",
+    "service unavailable",
+    "bad gateway",
+    "gateway timeout",
+    "internal server error",
+    "too many requests",
+    "rate limit",
+    "provider_unavailable",
+    "apiconnectionerror",
+    "remoteprotocolerror",
+    "stream error",
+    "ssl:",
+)
+
+_NON_RETRYABLE_MODEL_ERROR_FRAGMENTS = (
+    "invalid api key",
+    "incorrect api key",
+    "authentication",
+    "unauthorized",
+    "permission denied",
+    "context_length_exceeded",
+    "maximum context length",
+    "invalid_request_error",
+    "unsupported parameter",
+    "tool choice is none, but model called a tool",
+    "guardrail",
+    "safeguard",
+    "content policy",
+    "safety system",
+    "does not support",
+)
+
+
+def _model_retry_count(cfg: dict[str, Any]) -> int:
+    value = cfg.get("model_retries")
+    if value is None:
+        value = cfg.get("llm_retries")
+    try:
+        parsed = int(value)
+    except Exception:
+        parsed = 2
+    return max(0, min(parsed, 5))
+
+
+def _model_retry_base_delay_s(cfg: dict[str, Any]) -> float:
+    value = cfg.get("model_retry_base_delay_s")
+    try:
+        parsed = float(value)
+    except Exception:
+        parsed = 1.0
+    return max(0.1, min(parsed, 30.0))
+
+
+def _model_retry_max_delay_s(cfg: dict[str, Any]) -> float:
+    value = cfg.get("model_retry_max_delay_s")
+    try:
+        parsed = float(value)
+    except Exception:
+        parsed = 8.0
+    return max(_model_retry_base_delay_s(cfg), min(parsed, 120.0))
+
+
+def _model_retry_delay_s(cfg: dict[str, Any], retry_index: int) -> float:
+    retry_no = max(1, int(retry_index))
+    base = _model_retry_base_delay_s(cfg)
+    cap = _model_retry_max_delay_s(cfg)
+    return min(cap, base * (2 ** (retry_no - 1)))
+
+
+def _is_retryable_model_error(exc: Exception) -> bool:
+    text = str(exc or "").strip().lower()
+    if not text:
+        return False
+    if any(token in text for token in _NON_RETRYABLE_MODEL_ERROR_FRAGMENTS):
+        return False
+    return any(token in text for token in _RETRYABLE_MODEL_ERROR_FRAGMENTS)
+
+
+def _model_retry_status_text(retry_index: int, retry_count: int, delay_s: float) -> str:
+    total = max(1, int(retry_count))
+    current = max(1, min(int(retry_index), total))
+    return f"模型重试({current}/{total}) · {delay_s:.1f}s"
+
+
+def _call_model_with_retries(
+    invoke: Any,
+    *,
+    cfg: dict[str, Any],
+    model: str,
+    messages: list[dict[str, Any]],
+    trace_label: str,
+    log_id: str | None = None,
+    on_status: Any | None = None,
+) -> Any:
+    retry_count = _model_retry_count(cfg)
+    for retry_index in range(retry_count + 1):
+        attempt_started_at = time.perf_counter()
+        try:
+            return invoke()
+        except StopRequestedError:
+            raise
+        except Exception as e:
+            duration_ms = (time.perf_counter() - attempt_started_at) * 1000
+            log_model_call(
+                label=trace_label,
+                model=model,
+                messages=messages,
+                output="",
+                error=str(e)[:300],
+                duration_ms=duration_ms,
+                config=cfg,
+                log_id=log_id,
+            )
+            if retry_index >= retry_count or not _is_retryable_model_error(e):
+                raise
+            delay_s = _model_retry_delay_s(cfg, retry_index + 1)
+            logging.warning(
+                "Retrying model call %s (%s) after error: %s",
+                trace_label,
+                model,
+                str(e).strip() or type(e).__name__,
+            )
+            if callable(on_status):
+                try:
+                    on_status(_model_retry_status_text(retry_index + 1, retry_count, delay_s))
+                except Exception:
+                    pass
+            time.sleep(delay_s)
 
 
 def _looks_like_guardrail_model(model: str) -> bool:
@@ -1610,6 +1776,29 @@ def _resolve_max_rounds(cfg: dict[str, Any]) -> int:
     return max(2, min(value or 15, 32))
 
 
+def _resolve_external_tool_timeout_s(cfg: dict[str, Any]) -> float:
+    raw = cfg.get("external_tool_timeout_s")
+    if raw in (None, "", False):
+        return float(_EXTERNAL_TOOL_TIMEOUT_S)
+    try:
+        value = float(str(raw).strip())
+    except Exception:
+        return float(_EXTERNAL_TOOL_TIMEOUT_S)
+    if value <= 0:
+        return float(_EXTERNAL_TOOL_TIMEOUT_S)
+    return max(5.0, min(value, 300.0))
+
+
+def _format_timeout_seconds(value: float) -> str:
+    try:
+        normalized = float(value)
+    except Exception:
+        normalized = 0.0
+    if normalized.is_integer():
+        return str(int(normalized))
+    return f"{normalized:.1f}"
+
+
 _INLINE_IMAGE_BASE64_PREFIXES = (
     "/9j/",  # jpeg
     "iVBORw0KGgo",  # png
@@ -1675,111 +1864,6 @@ def _build_multimodal_content(question: str, image_paths: list[str] | None = Non
     return content
 
 
-def _block_has_model_overrides(block: Any) -> bool:
-    if not isinstance(block, dict):
-        return False
-    for key in (
-        "model",
-        "model_provider",
-        "custom_llm_provider",
-        "api_key",
-        "api_key_env",
-        "api_base",
-        "wire_api",
-        "reasoning_effort",
-        "max_tokens",
-        "max_completion_tokens",
-    ):
-        if block.get(key) not in (None, ""):
-            return True
-    return isinstance(block.get("extra_body"), dict)
-
-
-def _build_override_model_config(cfg: dict[str, Any], *paths: str) -> dict[str, Any]:
-    child_cfg = deepcopy(cfg)
-    block: dict[str, Any] | None = None
-    for path in paths:
-        candidate = cfg_get(cfg, path, {})
-        if _block_has_model_overrides(candidate):
-            block = candidate
-            break
-    if not isinstance(block, dict):
-        return child_cfg
-
-    has_override = False
-    explicit_transport_override = False
-    explicit_reasoning_override = False
-    explicit_limit_override = False
-    for key in (
-        "model",
-        "model_provider",
-        "custom_llm_provider",
-        "api_key",
-        "api_key_env",
-        "api_base",
-        "wire_api",
-        "reasoning_effort",
-        "max_tokens",
-        "max_completion_tokens",
-    ):
-        value = block.get(key)
-        if value in (None, ""):
-            continue
-        child_cfg[key] = deepcopy(value)
-        has_override = True
-        if key in {"model", "model_provider", "custom_llm_provider", "api_key", "api_key_env", "api_base", "wire_api"}:
-            explicit_transport_override = True
-        if key == "reasoning_effort":
-            explicit_reasoning_override = True
-        if key in {"max_tokens", "max_completion_tokens"}:
-            explicit_limit_override = True
-    extra_body = block.get("extra_body")
-    if isinstance(extra_body, dict):
-        child_cfg["extra_body"] = deepcopy(extra_body)
-        has_override = True
-    elif explicit_transport_override:
-        # Do not leak the parent model's provider routing/body overrides into a child
-        # that explicitly switched model/provider credentials unless it asked for them.
-        child_cfg.pop("extra_body", None)
-    if explicit_transport_override and not explicit_reasoning_override:
-        child_cfg.pop("reasoning_effort", None)
-    if explicit_transport_override and not explicit_limit_override:
-        child_cfg.pop("max_tokens", None)
-        child_cfg.pop("max_completion_tokens", None)
-    if not has_override:
-        return child_cfg
-
-    child_profile: dict[str, Any] = {
-        "model": str(child_cfg.get("model") or cfg.get("model") or DEFAULT_MODEL).strip() or DEFAULT_MODEL,
-    }
-    for key in (
-        "model_provider",
-        "custom_llm_provider",
-        "api_key",
-        "api_key_env",
-        "api_base",
-        "wire_api",
-        "reasoning_effort",
-        "max_tokens",
-        "max_completion_tokens",
-    ):
-        value = child_cfg.get(key)
-        if value in (None, ""):
-            continue
-        child_profile[key] = deepcopy(value)
-    if isinstance(child_cfg.get("extra_body"), dict):
-        child_profile["extra_body"] = deepcopy(child_cfg["extra_body"])
-
-    child_cfg["models"] = [child_profile]
-    child_cfg["stage1_model_index"] = 0
-    child_cfg["stage2_model_index"] = 0
-    return child_cfg
-
-
-def _build_sub_agent_model_config(cfg: dict[str, Any], path: str) -> dict[str, Any]:
-    return _build_override_model_config(cfg, path)
-
-
 def build_stage_model_config(
     config: dict[str, Any] | None,
     stage: str,
@@ -1831,8 +1915,9 @@ class _ContextItem:
 @dataclass
 class _PhaseRuntimeState:
     items: list[_ContextItem] = field(default_factory=list)
-    pending_items: list[_ContextItem] = field(default_factory=list)
     next_item_id: int = 0
+    latest_raw_ids: list[int] = field(default_factory=list)
+    latest_raw_round: int = 0
     pending_user_note: str = ""
     input_has_images: bool = False
     disclosure_step: int = 0
@@ -1900,14 +1985,14 @@ def _add_context_item(
     *,
     pending: bool = False,
 ) -> _ContextItem:
+    del pending
     item = _ContextItem(item_id=_next_context_item_id(state), item_type=str(item_type).strip(), data=dict(data))
-    target = state.pending_items if pending else state.items
-    target.append(item)
+    state.items.append(item)
     return item
 
 
 def _find_context_item(state: _PhaseRuntimeState, item_id: int) -> _ContextItem | None:
-    for item in [*state.items, *state.pending_items]:
+    for item in state.items:
         if int(item.item_id) == int(item_id):
             return item
     return None
@@ -1919,116 +2004,80 @@ def _iter_context_items(
     *,
     include_pending: bool = False,
 ) -> list[_ContextItem]:
-    source = [*state.items, *state.pending_items] if include_pending else state.items
+    del include_pending
+    source = state.items
     items = sorted(source, key=lambda item: int(item.item_id))
     if not prefix:
         return items
     return [item for item in items if item.item_type.startswith(prefix)]
 
 
-def _skeleton_items(state: _PhaseRuntimeState) -> list[_ContextItem]:
-    return _iter_context_items(state, "skeleton.")
+def _memory_items(state: _PhaseRuntimeState) -> list[_ContextItem]:
+    return _iter_context_items(state, "memory.")
 
 
-def _evidence_items(state: _PhaseRuntimeState) -> list[_ContextItem]:
-    return _iter_context_items(state, "evidence.")
+def _items_for_ids(state: _PhaseRuntimeState, ids: list[int]) -> list[_ContextItem]:
+    if not ids:
+        return []
+    by_id = {int(item.item_id): item for item in _memory_items(state)}
+    selected: list[_ContextItem] = []
+    for item_id in ids:
+        item = by_id.get(int(item_id))
+        if item is not None:
+            selected.append(item)
+    return selected
 
 
-def _candidate_evidence_items(state: _PhaseRuntimeState) -> list[_ContextItem]:
-    return sorted(
-        [item for item in state.pending_items if item.item_type.startswith("evidence.")],
-        key=lambda item: int(item.item_id),
-    )
+def _latest_raw_items(state: _PhaseRuntimeState) -> list[_ContextItem]:
+    return _items_for_ids(state, state.latest_raw_ids)
 
 
-def _normalize_context_item_type(value: str) -> str:
-    text = str(value or "").strip().lower()
-    aliases = {
-        "project_language": "skeleton.project_language",
-        "keyword": "skeleton.keyword",
-        "user_need": "skeleton.user_need",
-        "claim": "skeleton.claim",
-        "search": "evidence.search",
-        "page": "evidence.page",
-    }
-    return aliases.get(text, text)
+def _context_value_text(value: Any) -> str:
+    if isinstance(value, list):
+        parts = [str(item or "").strip() for item in value]
+        filtered = [item for item in parts if item]
+        return " | ".join(filtered)
+    return str(value or "").strip()
 
 
-def _clean_context_item_data(item_type: str, payload: dict[str, Any]) -> dict[str, Any]:
-    cleaned: dict[str, Any] = {}
-    for key in ("text", "title", "url", "snippet", "source_lines", "claim_id", "query"):
-        value = str(payload.get(key) or "").strip()
-        if value:
-            cleaned[key] = value
-    if item_type == "skeleton.project_language" and "text" not in cleaned:
-        value = str(payload.get("project_language") or "").strip()
-        if value:
-            cleaned["text"] = value
-    return cleaned
+def _context_item_label(item: _ContextItem) -> str:
+    label = str(item.item_type or "").split(".", 1)[-1] or str(item.item_type or "").strip()
+    round_no = int(item.data.get("round") or 0)
+    if round_no > 0:
+        return f"{label} | round {round_no}"
+    return label
 
 
-def _plan_update_markdown(
+def _append_context_item_lines(
+    lines: list[str],
+    item: _ContextItem,
     *,
-    created: list[int],
-    updated: list[int],
-    missing: list[int],
+    text_limit: int = 800,
+) -> None:
+    data = dict(item.data)
+    lines.append(f"[{item.item_id}] {_context_item_label(item)}")
+    for key in ("query", "question", "title", "url", "search"):
+        value = _context_value_text(data.get(key))
+        if value:
+            lines.append(f"{key}: {value}")
+    text = _context_value_text(data.get("text") or data.get("snippet"))
+    if text:
+        lines.append(f"text: {_truncate_text(text, text_limit)}")
+    lines.append("")
+
+
+def _build_context_items_message(
+    *,
+    heading: str,
+    empty_text: str,
+    items: list[_ContextItem],
 ) -> str:
-    lines = ["# Plan Update", ""]
-    lines.append(f"Created: {', '.join(str(item) for item in created) if created else 'none'}")
-    lines.append(f"Updated: {', '.join(str(item) for item in updated) if updated else 'none'}")
-    if missing:
-        lines.append(f"Missing: {', '.join(str(item) for item in missing)}")
-    return "\n".join(lines).strip()
-
-
-def _apply_plan_update(
-    state: _PhaseRuntimeState,
-    args: dict[str, Any],
-) -> dict[str, Any]:
-    created_ids: list[int] = []
-    updated_ids: list[int] = []
-    missing_ids: list[int] = []
-
-    for item in args.get("create", []) if isinstance(args.get("create"), list) else []:
-        if not isinstance(item, dict):
-            continue
-        item_type = _normalize_context_item_type(str(item.get("type") or "").strip())
-        if not item_type or not item_type.startswith("skeleton."):
-            continue
-        data = _clean_context_item_data(item_type, item)
-        if not data:
-            continue
-        created = _add_context_item(state, item_type, data)
-        created_ids.append(created.item_id)
-
-    for item in args.get("update", []) if isinstance(args.get("update"), list) else []:
-        if not isinstance(item, dict):
-            continue
-        try:
-            item_id = int(item.get("id"))
-        except Exception:
-            continue
-        current = _find_context_item(state, item_id)
-        if current is None or not current.item_type.startswith("skeleton."):
-            missing_ids.append(item_id)
-            continue
-        data = _clean_context_item_data(current.item_type, item)
-        if not data:
-            continue
-        current.data.update(data)
-        updated_ids.append(item_id)
-
-    return {
-        "ok": bool(created_ids or updated_ids),
-        "created_ids": created_ids,
-        "updated_ids": updated_ids,
-        "missing_ids": missing_ids,
-        "_model_markdown": _plan_update_markdown(
-            created=created_ids,
-            updated=updated_ids,
-            missing=missing_ids,
-        ),
-    }
+    if not items:
+        return ""
+    lines = [heading, ""]
+    for item in items:
+        _append_context_item_lines(lines, item)
+    return "\n".join(line for line in lines if str(line).strip()).strip()
 
 
 def _merge_search_results(
@@ -2122,21 +2171,49 @@ def _build_search_payload_markdown(
     query: str,
     public_results: list[dict[str, Any]],
     skipped_duplicate: bool,
+    direction_brief: str = "",
+    expanded_queries: list[str] | None = None,
+    duplicate_queries: list[str] | None = None,
+    summary_text: str = "",
     error: str = "",
 ) -> str:
+    reminder = "- `web_search` 摘要与 `page_extract` 具有同等可信度, 若需阅读摘要中不存在的内容,才使用 `page_extract` 工具."
+
+    def _finalize(lines: list[str]) -> str:
+        if lines and str(lines[-1]).strip():
+            lines.append("")
+        lines.append(reminder)
+        return "\n".join(lines).strip()
+
     lines = [
         f"# Search: {query}",
         "",
     ]
-    if skipped_duplicate:
+    clean_direction = str(direction_brief or "").strip()
+    clean_queries = [str(item or "").strip() for item in expanded_queries or [] if str(item or "").strip()]
+    clean_duplicates = [str(item or "").strip() for item in duplicate_queries or [] if str(item or "").strip()]
+    clean_summary = str(summary_text or "").strip()
+
+    if clean_direction:
+        lines.extend(["## Direction", clean_direction, ""])
+    if clean_queries:
+        lines.extend(["## Executed Queries", ", ".join(clean_queries), ""])
+    if clean_duplicates:
+        lines.extend(["## Skipped Duplicate Queries", ", ".join(clean_duplicates), ""])
+    if clean_summary:
+        lines.extend(["## Search Summary", clean_summary, ""])
+
+    if skipped_duplicate and not public_results and not error:
         lines.append(DUPLICATE_QUERY_SKIPPED_TEXT)
-        return "\n".join(lines).strip()
+        return _finalize(lines)
     if error:
         lines.append(error)
-        return "\n".join(lines).strip()
+        return _finalize(lines)
     if not public_results:
         lines.append(DEFAULT_NO_RESULTS_TEXT)
-        return "\n".join(lines).strip()
+        return _finalize(lines)
+    if clean_direction or clean_queries or clean_duplicates or clean_summary:
+        lines.extend(["## Results", ""])
     for index, item in enumerate(public_results, start=1):
         title = str(item.get("title") or DEFAULT_NO_TITLE_TEXT).strip() or DEFAULT_NO_TITLE_TEXT
         url = str(item.get("url") or "").strip()
@@ -2155,13 +2232,15 @@ def _build_search_payload_markdown(
         if snippet:
             lines.append(f"   {snippet}")
         lines.append("")
-    return "\n".join(lines).strip()
+    return _finalize(lines)
 
 
 def _run_direct_web_search(
     *,
     query: str,
     cfg: dict[str, Any],
+    stats: Stats | None = None,
+    log_id: str | None = None,
     runtime_state: "_SessionRuntimeState | None",
     progress_callback: Any | None = None,
 ) -> dict[str, Any]:
@@ -2186,6 +2265,7 @@ def _run_direct_web_search(
             ),
         }
 
+    del stats, log_id
     payload = _web_search(
         query_text,
         config=cfg,
@@ -2239,42 +2319,220 @@ def _normalize_page_window(value: Any, default: int = 20) -> int | str:
     return max(10, min(parsed, 80))
 
 
-def _clean_page_probe_keyword(value: str) -> str:
+def _clean_page_probe_pattern(value: str) -> str:
     text = str(value or "").strip().strip("`'\"")
     text = re.sub(r"\s+", " ", text)
     return text
 
 
-def _parse_page_probe(task: str, *, lines: Any = None) -> tuple[list[str], int | str]:
-    raw_task = str(task or "").strip()
-    window = _normalize_page_window(lines, default=20)
+def _normalize_page_probe_task(value: Any) -> str:
+    return _clean_page_probe_pattern(str(value or ""))
 
-    if window == "all":
-        return [], "all"
 
-    line_match = re.search(r"(\d+)\s*line", raw_task, flags=re.IGNORECASE)
-    if line_match:
-        window = _normalize_page_window(line_match.group(1), default=window)
+_PAGE_PROBE_QUOTED_SEGMENT_RE = re.compile(r"[\"“”'‘’「『《〈（【]([^\"“”'‘’」』》〉）】]{1,48})[\"“”'‘’」』》〉）】]")
+_PAGE_PROBE_NUMBER_RE = re.compile(r"\b\d[\d,]*(?:\.\d+)?(?:円|日元|%|人|年)?")
+_PAGE_PROBE_TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z0-9._/:+-]{1,31}|[0-9][0-9,./:+-]{0,31}(?:円|日元|%|人|年)?|[一-龥ぁ-ゟ゠-ヿー・]{2,24}[!！]?")
+_PAGE_PROBE_GENERIC_ANCHORS = {
+    "html",
+    "body",
+    "div",
+    "span",
+    "img",
+    "svg",
+    "href",
+    "src",
+    "alt",
+    "p",
+    "h1",
+    "h2",
+    "h3",
+    "li",
+    "ul",
+    "ol",
+    "a",
+    "main",
+    "article",
+    "section",
+    "header",
+    "footer",
+    "nav",
+    "menu",
+    "sidebar",
+    "button",
+    "link",
+    "links",
+    "image",
+    "images",
+    "script",
+    "style",
+    "class",
+    "id",
+    "title",
+    "task",
+    "page",
+    "summary",
+    "explanation",
+    "提取",
+    "确认",
+    "说明",
+    "重点",
+    "明确",
+    "如果",
+    "请",
+    "页面",
+    "页",
+    "段落",
+    "行",
+    "关键词",
+    "搜索",
+    "搜索词",
+    "页面结构",
+    "网页结构",
+    "个人转述",
+    "本页",
+    "该页",
+    "任务",
+    "support",
+    "evidence",
+}
+_PAGE_PROBE_GENERIC_FRAGMENTS = (
+    "html",
+    "body",
+    "div",
+    "span",
+    "img",
+    "svg",
+    "href",
+    "src",
+    "header",
+    "footer",
+    "button",
+    "script",
+    "style",
+    "header",
+    "提取",
+    "确认",
+    "说明",
+    "重点",
+    "明确",
+    "页面",
+    "关键词",
+    "搜索",
+    "结构",
+    "本页",
+    "该页",
+    "任务",
+)
 
-    cleaned = re.sub(r"\b\d+\s*line\b", "", raw_task, flags=re.IGNORECASE)
-    cleaned = re.sub(r"\bin\s*page\b", "", cleaned, flags=re.IGNORECASE)
-    cleaned = cleaned.replace("，", "|").replace(",", "|").replace("、", "|")
 
-    keywords: list[str] = []
+def _page_probe_anchor_key(value: str) -> str:
+    text = _clean_page_probe_pattern(value).strip("[](){}<>\"'`“”‘’「」『』《》〈〉（）。，、；：！？")
+    return text.casefold()
+
+
+def _looks_like_page_probe_anchor(value: str) -> bool:
+    clean = _clean_page_probe_pattern(value).strip("[](){}<>\"'`“”‘’「」『』《》〈〉（）。，、；：！？")
+    if not clean or len(clean) < 2 or len(clean) > 32:
+        return False
+    if clean.count(" ") > 2:
+        return False
+    normalized = clean.casefold()
+    if normalized in _PAGE_PROBE_GENERIC_ANCHORS:
+        return False
+    if not re.search(r"[A-Za-z0-9一-龥ぁ-ゟ゠-ヿ]", clean):
+        return False
+    if not re.search(r"[A-Za-z0-9ぁ-ゟ゠-ヿ]", clean):
+        pure_han = re.fullmatch(r"[一-龥]+", clean) is not None
+        if pure_han and any(fragment in clean for fragment in _PAGE_PROBE_GENERIC_FRAGMENTS):
+            return False
+    return True
+
+
+def _extract_page_probe_anchors(text: str, *, max_items: int = 4) -> list[str]:
+    source = _normalize_page_probe_task(text)
+    if not source:
+        return []
+
+    anchors: list[str] = []
     seen: set[str] = set()
-    for chunk in re.split(r"[|\n]+", cleaned):
-        keyword = _clean_page_probe_keyword(chunk)
-        normalized = keyword.lower()
-        if not keyword or normalized in seen:
-            continue
-        seen.add(normalized)
-        keywords.append(keyword)
 
-    if not keywords and raw_task:
-        fallback = _clean_page_probe_keyword(raw_task)
-        if fallback:
-            keywords.append(fallback)
-    return keywords[:8], window
+    def _push(candidate: str) -> None:
+        clean = _clean_page_probe_pattern(candidate).strip("[](){}<>\"'`“”‘’「」『』《》〈〉（）。，、；：！？")
+        key = _page_probe_anchor_key(clean)
+        if not _looks_like_page_probe_anchor(clean) or not key or key in seen:
+            return
+        seen.add(key)
+        anchors.append(clean)
+
+    for match in _PAGE_PROBE_QUOTED_SEGMENT_RE.finditer(source):
+        _push(match.group(1))
+        if len(anchors) >= max_items:
+            return anchors
+
+    for match in _PAGE_PROBE_NUMBER_RE.finditer(source):
+        _push(match.group(0))
+        if len(anchors) >= max_items:
+            return anchors
+
+    for match in _PAGE_PROBE_TOKEN_RE.finditer(source):
+        _push(match.group(0))
+        if len(anchors) >= max_items:
+            return anchors
+
+    return anchors
+
+
+def _derive_page_probe_patterns(task: str) -> list[str]:
+    return _extract_page_probe_anchors(task, max_items=4)
+
+
+def _normalize_page_extract_search(value: Any) -> str:
+    parts: list[str] = []
+    if isinstance(value, list):
+        for item in value:
+            text = str(item or "").strip()
+            if text:
+                parts.append(text)
+    else:
+        text = str(value or "").strip()
+        if text:
+            parts.append(text)
+    if not parts:
+        return ""
+    text = " | ".join(parts)
+    text = text.replace("\n", " | ")
+    text = re.sub(r"\s*\|\s*", " | ", text)
+    text = re.sub(r"\s+", " ", text).strip(" |")
+    return text
+
+
+def _split_page_extract_search_terms(value: Any, *, max_items: int = 8) -> list[str]:
+    terms: list[str] = []
+    seen: set[str] = set()
+    chunks: list[str] = []
+    if isinstance(value, list):
+        for item in value:
+            text = str(item or "").strip()
+            if not text:
+                continue
+            if "|" in text:
+                chunks.extend(segment.strip() for segment in text.split("|"))
+            else:
+                chunks.append(text)
+    else:
+        raw = _normalize_page_extract_search(value)
+        if raw:
+            chunks.extend(segment.strip() for segment in raw.split("|"))
+    for chunk in chunks:
+        clean = _clean_page_probe_pattern(chunk)
+        key = _page_probe_anchor_key(clean)
+        if not key or key in seen or not _looks_like_page_probe_anchor(clean):
+            continue
+        seen.add(key)
+        terms.append(clean)
+        if len(terms) >= max(1, int(max_items)):
+            break
+    return terms
 
 
 def _page_cache_lookup(
@@ -2331,8 +2589,9 @@ def _load_page_payload(
 def _extract_page_line_matches(
     content: str,
     *,
-    keywords: list[str],
+    patterns: list[str],
     window: int | str,
+    per_pattern_limit: int = 5,
 ) -> list[dict[str, Any]]:
     raw_lines = str(content or "").splitlines()
     if not raw_lines:
@@ -2347,32 +2606,37 @@ def _extract_page_line_matches(
             matched.append({"line": line_no, "text": text})
         return matched
 
-    lowered_keywords = [keyword.lower() for keyword in keywords if keyword]
-    if not lowered_keywords:
-        lowered_keywords = [""]
-
-    hit_lines: list[int] = []
-    for index, raw_line in enumerate(raw_lines, start=1):
-        lowered_line = raw_line.lower()
-        if any(keyword and keyword in lowered_line for keyword in lowered_keywords):
-            hit_lines.append(index)
-
-    if not hit_lines:
+    lowered_patterns = [pattern.casefold() for pattern in patterns if pattern]
+    if not lowered_patterns:
         return []
 
-    radius = max(5, window // 2)
     ranges: list[tuple[int, int]] = []
-    for line_no in hit_lines:
-        start = max(1, line_no - radius)
-        end = min(len(raw_lines), line_no + radius)
-        if ranges and start <= ranges[-1][1] + 1:
-            ranges[-1] = (ranges[-1][0], max(ranges[-1][1], end))
-        else:
+    radius = max(1, int(window))
+    for pattern in lowered_patterns:
+        hits = 0
+        for index, raw_line in enumerate(raw_lines, start=1):
+            if pattern not in raw_line.casefold():
+                continue
+            start = max(1, index - radius)
+            end = min(len(raw_lines), index + radius)
             ranges.append((start, end))
+            hits += 1
+            if hits >= max(1, int(per_pattern_limit)):
+                break
+
+    if not ranges:
+        return []
+
+    merged_ranges: list[tuple[int, int]] = []
+    for start, end in ranges:
+        if merged_ranges and start <= merged_ranges[-1][1] + 1:
+            merged_ranges[-1] = (merged_ranges[-1][0], max(merged_ranges[-1][1], end))
+        else:
+            merged_ranges.append((start, end))
 
     matched: list[dict[str, Any]] = []
     seen_lines: set[int] = set()
-    for start, end in ranges:
+    for start, end in merged_ranges:
         for line_no in range(start, end + 1):
             if line_no in seen_lines:
                 continue
@@ -2386,26 +2650,109 @@ def _extract_page_line_matches(
     return matched
 
 
+def _sample_page_lines(
+    content: str,
+    *,
+    max_lines: int = 30,
+) -> tuple[list[dict[str, Any]], int, int, int]:
+    raw_lines = str(content or "").splitlines()
+    if not raw_lines:
+        return [], 0, 0, 1
+    total_lines = len(raw_lines)
+    total_chars = len(str(content or ""))
+    candidates = [
+        (index, raw_line.rstrip())
+        for index, raw_line in enumerate(raw_lines)
+        if not _looks_like_sample_noise_line(raw_line, line_no=index + 1, total_lines=total_lines)
+    ]
+    if not candidates:
+        return [], total_lines, total_chars, max(1, total_lines)
+    preview_count = max(1, min(int(max_lines), len(candidates)))
+    if preview_count <= 1:
+        picked_indexes = [0]
+    else:
+        picked_indexes = []
+        seen_indexes: set[int] = set()
+        last_index = len(candidates) - 1
+        for i in range(preview_count):
+            index = round((last_index * i) / (preview_count - 1))
+            if index in seen_indexes:
+                continue
+            seen_indexes.add(index)
+            picked_indexes.append(index)
+        if len(picked_indexes) < preview_count:
+            for index in range(len(candidates)):
+                if index in seen_indexes:
+                    continue
+                picked_indexes.append(index)
+                if len(picked_indexes) >= preview_count:
+                    break
+        picked_indexes.sort()
+    sample_step = max(1, (total_lines + preview_count - 1) // preview_count)
+    sampled: list[dict[str, Any]] = []
+    for index in picked_indexes:
+        source_index, source_text = candidates[index]
+        line_no = source_index + 1
+        text = _truncate_text(str(source_text).rstrip(), 30)
+        sampled.append({"line": line_no, "text": text})
+    return sampled, total_lines, total_chars, sample_step
+
+
+def _extract_page_line_range(
+    content: str,
+    *,
+    start_line: int,
+    end_line: int,
+    max_lines: int = 240,
+) -> list[dict[str, Any]]:
+    raw_lines = str(content or "").splitlines()
+    if not raw_lines:
+        return []
+    start = max(1, int(start_line))
+    end = max(start, int(end_line))
+    end = min(end, len(raw_lines))
+    matched: list[dict[str, Any]] = []
+    for line_no in range(start, end + 1):
+        text = str(raw_lines[line_no - 1]).rstrip()
+        if not text.strip():
+            continue
+        matched.append({"line": line_no, "text": text})
+        if len(matched) >= max(1, int(max_lines)):
+            break
+    return matched
+
+
 def _build_page_probe_markdown(
     *,
     url: str,
     title: str,
-    keywords: list[str],
-    window: int | str,
+    scope: str,
     matches: list[dict[str, Any]],
+    preview_meta: dict[str, Any] | None = None,
     page_error: str = "",
     from_cache: bool = False,
 ) -> str:
     lines = [f"# Page: {url}" if url else PAGE_MARKDOWN_EMPTY_TITLE, ""]
     if title:
         lines.append(f"{PAGE_MARKDOWN_TITLE_PREFIX}{title}")
-    if keywords and window != "all":
-        lines.append(f"{PAGE_MARKDOWN_KEYWORDS_PREFIX}{' | '.join(keywords)}")
-    lines.append(
-        PAGE_MARKDOWN_WINDOW_ALL_TEXT
-        if window == "all"
-        else f"{PAGE_MARKDOWN_WINDOW_PREFIX}{window}{PAGE_MARKDOWN_WINDOW_SUFFIX}"
-    )
+    if scope:
+        lines.append(f"{PAGE_MARKDOWN_SCOPE_PREFIX}{scope}")
+    if isinstance(preview_meta, dict) and preview_meta:
+        meta_parts: list[str] = []
+        total_lines = int(preview_meta.get("total_lines") or 0)
+        total_chars = int(preview_meta.get("total_chars") or 0)
+        shown = int(preview_meta.get("shown_lines") or 0)
+        sample_step = int(preview_meta.get("sample_step") or 0)
+        if total_chars > 0:
+            meta_parts.append(f"chars={total_chars}")
+        if total_lines > 0:
+            meta_parts.append(f"lines={total_lines}")
+        if shown > 0:
+            meta_parts.append(f"shown={shown}")
+        if sample_step > 0:
+            meta_parts.append(f"step~={sample_step}")
+        if meta_parts:
+            lines.append("Preview: " + " ".join(meta_parts))
     lines.append(
         f"{PAGE_MARKDOWN_CACHE_PREFIX}{PAGE_MARKDOWN_CACHE_HIT_TEXT if from_cache else PAGE_MARKDOWN_CACHE_MISS_TEXT}"
     )
@@ -2413,39 +2760,62 @@ def _build_page_probe_markdown(
         lines.extend(["", page_error])
         return "\n".join(lines).strip()
     if not matches:
-        lines.extend(["", DEFAULT_PAGE_NO_MATCHING_CACHED_TEXT])
+        lines.extend(["", DEFAULT_PAGE_NO_MATCHING_CACHED_TEXT if from_cache else DEFAULT_PAGE_NO_MATCHING_TEXT])
         return "\n".join(lines).strip()
     lines.extend(["", PAGE_MARKDOWN_MATCHED_LINES_TEXT])
+    width = max(2, len(str(max(int(item.get("line") or 0) for item in matches if isinstance(item, dict)) or 1)))
     for item in matches:
         if not isinstance(item, dict):
             continue
-        line_no = int(item.get("line") or 0)
+        try:
+            line_no = int(item.get("line") or 0)
+        except Exception:
+            line_no = 0
         text = str(item.get("text") or "").rstrip()
-        if not text:
+        if not line_no or not text:
             continue
-        lines.append(f"{line_no} | {text}")
+        lines.append(f"L{line_no:0{width}d} | {text}")
     return "\n".join(lines).strip()
 
 
 def _run_page_probe(
     *,
     url: str,
-    query: str,
-    lines: Any,
+    mode: str,
+    start_line: int,
+    end_line: int,
+    question: Any,
     cfg: dict[str, Any],
+    stats: Stats | None = None,
+    log_id: str | None = None,
     runtime_state: "_SessionRuntimeState | None",
     progress_callback: Any | None = None,
 ) -> dict[str, Any]:
     source_url = str(url or "").strip()
     if not source_url:
-        return {"ok": False, "error": "page url is empty", "url": "", "query": str(query or "").strip()}
+        return {
+            "ok": False,
+            "error": "page url is empty",
+            "url": "",
+            "question": _normalize_page_probe_task(question),
+            "mode": str(mode or "sample").strip() or "sample",
+        }
 
     normalized_url = _normalize_state_url(source_url) or source_url
     if runtime_state is not None and normalized_url:
         with runtime_state.lock:
             runtime_state.visited_page_urls.add(normalized_url)
 
-    keywords, window = _parse_page_probe(query, lines=lines)
+    normalized_question = _normalize_page_probe_task(question)
+    normalized_mode = str(mode or "sample").strip().lower()
+    if normalized_mode not in {"sample", "range"}:
+        normalized_mode = "sample"
+    preview_meta: dict[str, Any] = {}
+    normalized_scope = ""
+    range_start = max(1, int(start_line))
+    range_end = max(range_start, int(end_line))
+    if normalized_mode == "range":
+        normalized_scope = f"lines={range_start}-{range_end}"
     page_payload, from_cache = _load_page_payload(
         url=source_url,
         cfg=cfg,
@@ -2455,26 +2825,50 @@ def _run_page_probe(
     title = str(page_payload.get("title") or "").strip()
     content = str(page_payload.get("content") or "").strip()
     page_error = str(page_payload.get("error") or "").strip()
-    matches = _extract_page_line_matches(content, keywords=keywords, window=window) if content else []
+    matches = []
+    if content and not page_error:
+        if normalized_mode == "range":
+            matches = _extract_page_line_range(
+                content,
+                start_line=range_start,
+                end_line=range_end,
+            )
+        else:
+            matches, total_lines, total_chars, sample_step = _sample_page_lines(
+                content,
+                max_lines=30,
+            )
+            preview_meta = {
+                "total_lines": total_lines,
+                "total_chars": total_chars,
+                "shown_lines": len(matches),
+                "sample_step": sample_step,
+            }
 
     payload = {
-        "ok": bool(page_payload.get("ok")) and bool(matches),
+        "ok": bool(page_payload.get("ok")) and not page_error and bool(matches),
         "provider": str(page_payload.get("provider") or _tool_provider_from_config("page_extract", cfg)).strip(),
         "url": str(page_payload.get("url") or normalized_url).strip(),
         "title": title,
-        "query": str(query or "").strip(),
-        "keywords": keywords,
-        "window": window,
-        "matched_lines": matches,
+        "question": normalized_question,
+        "mode": normalized_mode,
+        "sample_step": int(preview_meta.get("sample_step") or 0) if normalized_mode == "sample" else 0,
+        "start_line": range_start if normalized_mode == "range" else 0,
+        "end_line": range_end if normalized_mode == "range" else 0,
+        "total_lines": int(preview_meta.get("total_lines") or 0),
+        "total_chars": int(preview_meta.get("total_chars") or 0),
+        "search": normalized_scope,
+        "_matched_lines": matches,
         "count": len(matches),
         "page_error": page_error,
+        "error": page_error,
         "from_cache": from_cache,
         "_model_markdown": _build_page_probe_markdown(
             url=str(page_payload.get("url") or normalized_url).strip(),
             title=title,
-            keywords=keywords,
-            window=window,
+            scope=normalized_scope,
             matches=matches,
+            preview_meta=preview_meta,
             page_error=page_error,
             from_cache=from_cache,
         ),
@@ -2485,6 +2879,71 @@ def _run_page_probe(
     if page_error and not page_payload.get("ok"):
         payload["error"] = page_error
     return payload
+
+
+def _tool_timeout_payload(
+    *,
+    name: str,
+    args: dict[str, Any],
+    cfg: dict[str, Any],
+    elapsed_s: float,
+) -> dict[str, Any]:
+    timeout_text = _format_timeout_seconds(elapsed_s)
+    provider = _tool_provider_from_config(name, cfg)
+    error = f"{name} batch timed out after {timeout_text}s"
+    if name in ("web_search", "web_search_wiki"):
+        query = str(args.get("query") or "").strip()
+        return {
+            "ok": False,
+            "provider": provider,
+            "query": query,
+            "count": 0,
+            "results": [],
+            "error": error,
+            "timed_out": True,
+            "_model_markdown": _build_search_payload_markdown(
+                query=query,
+                public_results=[],
+                skipped_duplicate=False,
+                error=error,
+            ),
+        }
+    if name == "page_extract":
+        url = str(args.get("url") or "").strip()
+        mode = str(args.get("mode") or "sample").strip().lower() or "sample"
+        start_line = _coerce_page_extract_line_number(args.get("start_line"))
+        end_line = _coerce_page_extract_line_number(args.get("end_line"))
+        normalized_scope = "" if mode != "range" else f"lines={start_line}-{end_line}"
+        return {
+            "ok": False,
+            "provider": provider,
+            "url": url,
+            "mode": mode,
+            "sample_step": 0,
+            "start_line": start_line if mode == "range" else 0,
+            "end_line": end_line if mode == "range" else 0,
+            "search": normalized_scope,
+            "question": "",
+            "title": "",
+            "_matched_lines": [],
+            "count": 0,
+            "page_error": error,
+            "error": error,
+            "timed_out": True,
+            "_model_markdown": _build_page_probe_markdown(
+                url=url,
+                title="",
+                scope=normalized_scope,
+                matches=[],
+                page_error=error,
+                from_cache=False,
+            ),
+        }
+    return {
+        "ok": False,
+        "error": error,
+        "timed_out": True,
+    }
 
 
 def _record_runtime_warning(
@@ -2812,10 +3271,11 @@ def llm_call(
     log_id=None,
     phase: str = "loop",
     disclosure_step: int | None = None,
+    on_status: Any | None = None,
 ):
     cfg = build_model_config(config)
     model = str(cfg.get("model") or DEFAULT_MODEL).strip()
-    # Fail fast on provider throttling instead of waiting through SDK retries.
+    # SDK retries stay disabled; the app performs model-only retries outside tool execution.
     kw: dict[str, Any] = {"model": model, "messages": messages, "temperature": 0.2, "drop_params": True, "max_retries": 0}
     tool_cfg = litellm_tool_config_for_phase(phase, disclosure_step=disclosure_step)
     _apply_completion_transport_options(cfg, kw)
@@ -2831,7 +3291,7 @@ def llm_call(
 
     t0 = time.perf_counter()
     if should_use_codex_mirror_transport(cfg):
-        try:
+        def _invoke() -> Any:
             resp = codex_transport_model_response(
                 codex_transport_stream_response(
                     cfg=cfg,
@@ -2839,26 +3299,26 @@ def llm_call(
                     tools=tool_cfg.get("tools") if isinstance(tool_cfg.get("tools"), list) else [],
                 )
             )
-        except Exception as e:
-            duration_ms = (time.perf_counter() - t0) * 1000
-            log_model_call(
-                label=trace_label, model=model, messages=messages,
-                output="", error=str(e)[:300], duration_ms=duration_ms, config=cfg,
-                log_id=log_id,
-            )
-            raise
+        resp = _call_model_with_retries(
+            _invoke,
+            cfg=cfg,
+            model=model,
+            messages=messages,
+            trace_label=trace_label,
+            log_id=log_id,
+            on_status=on_status,
+        )
     else:
         litellm_mod = _get_litellm()
-        try:
-            resp = litellm_mod.completion(**kw)
-        except Exception as e:
-            duration_ms = (time.perf_counter() - t0) * 1000
-            log_model_call(
-                label=trace_label, model=model, messages=messages,
-                output="", error=str(e)[:300], duration_ms=duration_ms, config=cfg,
-                log_id=log_id,
-            )
-            raise
+        resp = _call_model_with_retries(
+            lambda: litellm_mod.completion(**kw),
+            cfg=cfg,
+            model=model,
+            messages=messages,
+            trace_label=trace_label,
+            log_id=log_id,
+            on_status=on_status,
+        )
     duration_ms = (time.perf_counter() - t0) * 1000
 
     # 提取 usage / cost
@@ -2880,12 +3340,6 @@ def llm_call(
     msg = choices[0].message if choices else None
     output_text = _text(msg) if msg else ""
     native_calls = _parse_native_tool_calls(_to_dict(msg) if msg is not None else {})
-    if native_calls:
-        tool_preview = _tool_calls_preview_text(native_calls)
-        if output_text and tool_preview:
-            output_text = f"{output_text}\n\n{tool_preview}".strip()
-        elif tool_preview:
-            output_text = tool_preview
 
     # 写日志
     log_model_call(
@@ -2895,6 +3349,190 @@ def llm_call(
         log_id=log_id,
     )
 
+    return resp
+
+
+def llm_text_call(
+    messages,
+    *,
+    config,
+    stats=None,
+    trace_label="Sub-agent Text",
+    log_id=None,
+    temperature: float = 0.1,
+    on_status: Any | None = None,
+):
+    cfg = build_model_config(config)
+    model = str(cfg.get("model") or DEFAULT_MODEL).strip()
+    kw: dict[str, Any] = {
+        "model": model,
+        "messages": messages,
+        "temperature": float(temperature),
+        "drop_params": True,
+        "max_retries": 0,
+    }
+    _apply_completion_transport_options(cfg, kw)
+    _apply_completion_limits(cfg, kw)
+    extra_body = _completion_extra_body(cfg)
+    if extra_body:
+        kw["extra_body"] = extra_body
+    _apply_reasoning_options(cfg, kw)
+
+    t0 = time.perf_counter()
+    if should_use_codex_mirror_transport(cfg):
+        def _invoke() -> Any:
+            resp = codex_transport_model_response(
+                codex_transport_stream_response(
+                    cfg=cfg,
+                    messages=messages,
+                    tools=[],
+                )
+            )
+        resp = _call_model_with_retries(
+            _invoke,
+            cfg=cfg,
+            model=model,
+            messages=messages,
+            trace_label=trace_label,
+            log_id=log_id,
+            on_status=on_status,
+        )
+    else:
+        litellm_mod = _get_litellm()
+        resp = _call_model_with_retries(
+            lambda: litellm_mod.completion(**kw),
+            cfg=cfg,
+            model=model,
+            messages=messages,
+            trace_label=trace_label,
+            log_id=log_id,
+            on_status=on_status,
+        )
+    duration_ms = (time.perf_counter() - t0) * 1000
+
+    usage: dict[str, Any] = {}
+    cost: float | None = None
+    u_raw = getattr(resp, "usage", None)
+    usage = _to_dict(u_raw) if u_raw else {}
+    if not isinstance(usage, dict):
+        usage = {}
+    pt = int(usage.get("prompt_tokens") or usage.get("input_tokens") or 0)
+    ct = int(usage.get("completion_tokens") or usage.get("output_tokens") or 0)
+    cost = _usage_cost(usage)
+    if cost is None and (pt or ct or _usage_reasoning_tokens(usage)):
+        cost = _estimated_usage_cost(model, usage)
+    if stats:
+        stats.record(usage, cost)
+
+    choices = getattr(resp, "choices", None) or []
+    msg = choices[0].message if choices else None
+    output_text = _text(msg) if msg else ""
+    log_model_call(
+        label=trace_label,
+        model=model,
+        messages=messages,
+        output=output_text,
+        usage=usage,
+        cost=cost,
+        duration_ms=duration_ms,
+        config=cfg,
+        log_id=log_id,
+    )
+    return resp
+
+
+def llm_custom_tool_call(
+    messages,
+    *,
+    config,
+    tools: list[dict[str, Any]],
+    stats=None,
+    trace_label="Sub-agent Tool",
+    log_id=None,
+    temperature: float = 0.1,
+    tool_choice: str = "auto",
+    parallel_tool_calls: bool = False,
+    on_status: Any | None = None,
+):
+    cfg = build_model_config(config)
+    model = str(cfg.get("model") or DEFAULT_MODEL).strip()
+    kw: dict[str, Any] = {
+        "model": model,
+        "messages": messages,
+        "temperature": float(temperature),
+        "drop_params": True,
+        "max_retries": 0,
+        "tools": deepcopy(tools),
+        "tool_choice": tool_choice,
+        "parallel_tool_calls": bool(parallel_tool_calls),
+    }
+    _apply_completion_transport_options(cfg, kw)
+    _apply_completion_limits(cfg, kw)
+    extra_body = _completion_extra_body(cfg)
+    if extra_body:
+        kw["extra_body"] = extra_body
+    _apply_reasoning_options(cfg, kw)
+
+    t0 = time.perf_counter()
+    if should_use_codex_mirror_transport(cfg):
+        def _invoke() -> Any:
+            resp = codex_transport_model_response(
+                codex_transport_stream_response(
+                    cfg=cfg,
+                    messages=messages,
+                    tools=tools,
+                )
+            )
+        resp = _call_model_with_retries(
+            _invoke,
+            cfg=cfg,
+            model=model,
+            messages=messages,
+            trace_label=trace_label,
+            log_id=log_id,
+            on_status=on_status,
+        )
+    else:
+        litellm_mod = _get_litellm()
+        resp = _call_model_with_retries(
+            lambda: litellm_mod.completion(**kw),
+            cfg=cfg,
+            model=model,
+            messages=messages,
+            trace_label=trace_label,
+            log_id=log_id,
+            on_status=on_status,
+        )
+    duration_ms = (time.perf_counter() - t0) * 1000
+
+    usage: dict[str, Any] = {}
+    cost: float | None = None
+    u_raw = getattr(resp, "usage", None)
+    usage = _to_dict(u_raw) if u_raw else {}
+    if not isinstance(usage, dict):
+        usage = {}
+    pt = int(usage.get("prompt_tokens") or usage.get("input_tokens") or 0)
+    ct = int(usage.get("completion_tokens") or usage.get("output_tokens") or 0)
+    cost = _usage_cost(usage)
+    if cost is None and (pt or ct or _usage_reasoning_tokens(usage)):
+        cost = _estimated_usage_cost(model, usage)
+    if stats:
+        stats.record(usage, cost)
+
+    choices = getattr(resp, "choices", None) or []
+    msg = choices[0].message if choices else None
+    output_text = _text(msg) if msg else ""
+    log_model_call(
+        label=trace_label,
+        model=model,
+        messages=messages,
+        output=output_text,
+        usage=usage,
+        cost=cost,
+        duration_ms=duration_ms,
+        config=cfg,
+        log_id=log_id,
+    )
     return resp
 
 
@@ -2910,9 +3548,8 @@ def _text(msg) -> str:
 def _select_loop_calls(calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
     selected: list[dict[str, Any]] = []
     seen_search_queries: set[str] = set()
-    seen_page_keys: set[tuple[str, str, str]] = set()
-    seen_keep_ids: set[tuple[int, ...]] = set()
-    allowed_tools = {"web_search", "page_extract", "plan_update", "context_keep"}
+    seen_page_keys: set[tuple[str, str]] = set()
+    allowed_tools = {"web_search", "page_extract"}
 
     for call in calls:
         if not isinstance(call, dict):
@@ -2935,43 +3572,27 @@ def _select_loop_calls(calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
         if name == "page_extract":
             normalized_url = _normalize_state_url(str(args.get("url") or "").strip())
-            query = str(args.get("query") or "").strip()
-            lines = str(args.get("lines") or "").strip()
-            page_key = (normalized_url, _normalize_search_query(query), str(_normalize_page_window(lines)))
+            mode = str(args.get("mode") or "sample").strip().lower() or "sample"
+            if mode == "range":
+                page_key = (
+                    normalized_url,
+                    f"range:{_coerce_page_extract_line_number(args.get('start_line'))}:{_coerce_page_extract_line_number(args.get('end_line'))}",
+                )
+            else:
+                page_key = (normalized_url, "sample")
             if not normalized_url or page_key in seen_page_keys:
                 continue
             seen_page_keys.add(page_key)
             payload = {
                 "url": normalized_url,
-                "query": query,
-                "lines": str(_normalize_page_window(lines)),
+                "mode": mode,
             }
+            if mode == "range":
+                payload["start_line"] = _coerce_page_extract_line_number(args.get("start_line"))
+                payload["end_line"] = _coerce_page_extract_line_number(args.get("end_line"))
             if str(args.get("_call_id") or "").strip():
                 payload["_call_id"] = str(args.get("_call_id") or "").strip()
             selected.append({"name": "page_extract", "args": payload})
-            if len(selected) >= _TOOL_LIMIT:
-                break
-            continue
-
-        if name == "context_keep":
-            ids = _normalize_context_keep_args(args)
-            if not ids:
-                continue
-            signature = tuple(ids)
-            if signature in seen_keep_ids:
-                continue
-            seen_keep_ids.add(signature)
-            payload: dict[str, Any] = {"ids": ids}
-            if str(args.get("_call_id") or "").strip():
-                payload["_call_id"] = str(args.get("_call_id") or "").strip()
-            selected.append({"name": "context_keep", "args": payload})
-            if len(selected) >= _TOOL_LIMIT:
-                break
-            continue
-
-        if name == "plan_update":
-            payload = dict(args)
-            selected.append({"name": "plan_update", "args": payload})
             if len(selected) >= _TOOL_LIMIT:
                 break
 
@@ -2984,12 +3605,12 @@ def _collect_loop_calls(
     message_payload: dict[str, Any],
     state: _PhaseRuntimeState,
     round_i: int,
-) -> list[dict[str, Any]]:
-    raw_calls = _parse_native_tool_calls(message_payload)
+) -> tuple[list[dict[str, Any]], list[str]]:
+    raw_calls, invalid_errors = _parse_native_tool_calls_detailed(message_payload)
     _resolve_page_call_refs(raw_calls, state)
     calls = _select_loop_calls(raw_calls)
     _ensure_call_ids(calls, round_i=round_i)
-    return calls
+    return calls, invalid_errors
 
 
 def _ensure_call_ids(calls: list[dict[str, Any]], *, round_i: int) -> None:
@@ -3007,6 +3628,7 @@ def _ensure_call_ids(calls: list[dict[str, Any]], *, round_i: int) -> None:
 def _execute_loop_calls(
     *,
     calls: list[dict[str, Any]],
+    round_i: int,
     cfg: dict[str, Any],
     stats: Stats | None,
     prompt_text: str,
@@ -3031,9 +3653,9 @@ def _execute_loop_calls(
             status = str(event.get("status") or "").strip().lower()
             if status:
                 merged["_progress_status"] = status
-                merged["_pending"] = status not in {"done", "failed"}
-            if "count" in event:
-                merged["_count"] = event.get("count")
+                # Progress events come from nested provider work; the outer tool is
+                # still running until the final payload is emitted below.
+                merged["_pending"] = True
             if "query" in event and not merged.get("query"):
                 merged["query"] = event.get("query")
             if "url" in event and not merged.get("url"):
@@ -3048,51 +3670,15 @@ def _execute_loop_calls(
 
     for index, call in enumerate(calls):
         _raise_if_stop_requested(stop_checker)
-        name = str(call.get("name") or "").strip()
-        args = call.get("args") if isinstance(call.get("args"), dict) else {}
-        if not isinstance(args, dict):
-            args = {}
-        call_started_at = time.perf_counter()
-
-        if name == "context_keep":
-            ids = _normalize_context_keep_args(args)
-            payload = _keep_session_context_refs(
-                context_state,
-                ids,
-            )
-        elif name == "plan_update":
-            payload = _apply_plan_update(context_state, args)
-        else:
-            external_calls.append((index, call))
-            continue
-
-        if not isinstance(payload, dict):
-            payload = {"ok": False, "error": "invalid tool payload"}
-        _record_tool_stats(stats, payload)
-        payload_map[index] = payload
-        model_note = str(payload.get("_model_markdown") or "").strip()
-        if name == "context_keep" and model_note:
-            note_parts.append(model_note)
-        if callable(on_tool):
-            try:
-                on_tool(
-                    name,
-                    _tool_callback_args(
-                        name,
-                        args,
-                        payload,
-                        elapsed_s=time.perf_counter() - call_started_at,
-                        config=cfg,
-                    ),
-                )
-            except Exception:
-                pass
+        external_calls.append((index, call))
 
     if external_calls:
         _raise_if_stop_requested(stop_checker)
-        context_state.pending_items = []
         futures: dict[Any, tuple[int, dict[str, Any], float]] = {}
-        with ThreadPoolExecutor(max_workers=len(external_calls)) as pool:
+        external_payloads: dict[int, tuple[dict[str, Any], float, float, dict[str, Any]]] = {}
+        tool_timeout_s = _resolve_external_tool_timeout_s(cfg)
+        pool = ThreadPoolExecutor(max_workers=len(external_calls))
+        try:
             for index, call in external_calls:
                 _raise_if_stop_requested(stop_checker)
                 name = str(call.get("name") or "").strip()
@@ -3123,30 +3709,87 @@ def _execute_loop_calls(
                         progress_callback=wrapped_progress,
                     )
                 ] = (index, call, call_started_at)
+            pending = set(futures)
+            while pending:
+                _raise_if_stop_requested(stop_checker)
+                done, not_done = wait(pending, timeout=0.2, return_when=FIRST_COMPLETED)
+                now = time.perf_counter()
 
-            external_payloads: dict[int, tuple[dict[str, Any], float, dict[str, Any]]] = {}
-            for future in as_completed(futures):
-                index, call, call_started_at = futures[future]
-                payload = future.result()
-                if not isinstance(payload, dict):
-                    payload = {"ok": False, "error": "invalid tool payload"}
-                external_payloads[index] = (payload, call_started_at, call)
+                for future in done:
+                    pending.discard(future)
+                    index, call, call_started_at = futures[future]
+                    try:
+                        payload = future.result()
+                    except StopRequestedError:
+                        raise
+                    except Exception as e:
+                        payload = {
+                            "ok": False,
+                            "error": f"tool execution failed: {str(e).strip() or type(e).__name__}",
+                        }
+                    if not isinstance(payload, dict):
+                        payload = {"ok": False, "error": "invalid tool payload"}
+                    completed_elapsed_s = max(0.0, now - call_started_at)
+                    external_payloads[index] = (payload, call_started_at, completed_elapsed_s, call)
+
+                for future in list(not_done):
+                    index, call, call_started_at = futures[future]
+                    elapsed_s = max(0.0, now - call_started_at)
+                    if elapsed_s < tool_timeout_s:
+                        continue
+                    pending.discard(future)
+                    future.cancel()
+                    name = str(call.get("name") or "").strip()
+                    args = call.get("args") if isinstance(call.get("args"), dict) else {}
+                    if not isinstance(args, dict):
+                        args = {}
+                    payload = _tool_timeout_payload(
+                        name=name,
+                        args=args,
+                        cfg=cfg,
+                        elapsed_s=elapsed_s,
+                    )
+                    external_payloads[index] = (payload, call_started_at, elapsed_s, call)
+        finally:
+            pool.shutdown(wait=False, cancel_futures=True)
 
         for index, call in external_calls:
             _raise_if_stop_requested(stop_checker)
-            payload, call_started_at, original_call = external_payloads.get(index, ({"ok": False, "error": "missing tool payload"}, time.perf_counter(), call))
+            payload, call_started_at, completed_elapsed_s, original_call = external_payloads.get(
+                index,
+                ({"ok": False, "error": "missing tool payload"}, time.perf_counter(), 0.0, call),
+            )
             name = str(original_call.get("name") or "").strip()
             args = original_call.get("args") if isinstance(original_call.get("args"), dict) else {}
             if not isinstance(args, dict):
                 args = {}
             if name == "web_search":
-                created_ids = _append_search_evidence_items(original_call, payload, context_state)
+                created_ids = _append_search_memory_items(
+                    original_call,
+                    payload,
+                    context_state,
+                    round_no=round_i + 1,
+                )
                 batch_created_ids.extend(created_ids)
             elif name == "page_extract":
-                created_ids = _append_page_evidence_items(original_call, payload, context_state)
+                created_ids = _append_page_memory_items(
+                    original_call,
+                    payload,
+                    context_state,
+                    round_no=round_i + 1,
+                    question_text=prompt_text,
+                )
                 batch_created_ids.extend(created_ids)
             _record_tool_stats(stats, payload)
             payload_map[index] = payload
+            log_tool_call(
+                name=name,
+                args=args,
+                payload=payload,
+                duration_ms=completed_elapsed_s * 1000.0,
+                config=cfg,
+                log_id=log_id,
+            )
             if callable(on_tool):
                 try:
                     on_tool(
@@ -3155,12 +3798,14 @@ def _execute_loop_calls(
                             name,
                             args,
                             payload,
-                            elapsed_s=time.perf_counter() - call_started_at,
+                            elapsed_s=completed_elapsed_s,
                             config=cfg,
                         ),
                     )
                 except Exception:
                     pass
+        context_state.latest_raw_ids = list(batch_created_ids)
+        context_state.latest_raw_round = int(round_i + 1) if batch_created_ids else 0
     context_state.pending_user_note = "\n\n".join(part for part in note_parts if part).strip()
     return payload_map
 
@@ -3173,23 +3818,6 @@ def _validate_progressive_tool_requirements(
     return ""
 
 
-def _calls_include_plan_update(state: _PhaseRuntimeState, calls: list[dict[str, Any]]) -> bool:
-    del state
-    for call in calls:
-        if not isinstance(call, dict) or str(call.get("name") or "").strip() != "plan_update":
-            continue
-        args = call.get("args") if isinstance(call.get("args"), dict) else {}
-        if not isinstance(args, dict):
-            continue
-        create_items = args.get("create", []) if isinstance(args.get("create"), list) else []
-        if any(isinstance(item, dict) for item in create_items):
-            return True
-        update_items = args.get("update", []) if isinstance(args.get("update"), list) else []
-        if any(isinstance(item, dict) for item in update_items):
-            return True
-    return False
-
-
 def _advance_progressive_disclosure(
     state: _PhaseRuntimeState,
     calls: list[dict[str, Any]],
@@ -3197,15 +3825,11 @@ def _advance_progressive_disclosure(
     tool_names = {str(call.get("name") or "").strip() for call in calls if isinstance(call, dict)}
     if state.disclosure_step <= 0 and tool_names.intersection({"web_search", "page_extract"}):
         state.disclosure_step = 1
-        state.pending_user_note = ""
-        return
-    if state.disclosure_step == 1 and _calls_include_plan_update(state, calls):
-        state.disclosure_step = 2
         state.disclosure_refine_consumed = False
         state.pending_user_note = ""
         return
-    if state.disclosure_step == 2 and state.disclosure_refine_consumed:
-        state.disclosure_step = 3
+    if state.disclosure_step == 1 and state.disclosure_refine_consumed:
+        state.disclosure_step = 2
 
 
 def run(
@@ -3295,13 +3919,17 @@ def run(
             except Exception:
                 pass
 
-        calls = _collect_loop_calls(
+        calls, invalid_tool_errors = _collect_loop_calls(
             text=text,
             message_payload=msg_payload,
             state=loop_state,
             round_i=round_i,
         )
         assistant_content = _normalize_tool_turn_message(text, calls) if calls else _clean_model_text(text)
+        invalid_tool_message = _format_invalid_tool_call_message(invalid_tool_errors)
+        if invalid_tool_message:
+            loop_state.pending_user_note = invalid_tool_message
+            continue
 
         progressive_error = _validate_progressive_tool_requirements(loop_state, calls)
         if progressive_error:
@@ -3316,9 +3944,16 @@ def run(
             final_message = _clean_model_text(text) or last or _format_empty_output_message(cfg, round_i=round_i)
             return _prepend_runtime_warnings(final_message, warning_messages)
 
+        log_tool_selection(
+            round_i=round_i,
+            calls=calls,
+            config=cfg,
+            log_id=lid,
+        )
         _raise_if_stop_requested(stop_checker)
         _execute_loop_calls(
             calls=calls,
+            round_i=round_i,
             cfg=cfg,
             stats=st,
             prompt_text=prompt_text,
@@ -3397,122 +4032,115 @@ def run_stream(
         model = str(cfg.get("model") or DEFAULT_MODEL).strip()
         tool_cfg = litellm_tool_config_for_phase("loop", disclosure_step=loop_state.disclosure_step)
         t0 = time.perf_counter()
+        retry_count = _model_retry_count(cfg)
+        retry_index = 0
         content_parts: list[str] = []
         usage: dict[str, Any] = {}
         reasoning_text_parts: list[str] = []
         reasoning_details: list[dict[str, Any]] = []
         stream_tool_calls: dict[int, dict[str, Any]] = {}
-        last_reasoning_emit_tokens = [0]
-        if should_use_codex_mirror_transport(cfg):
-            def _handle_codex_text_delta(delta: str) -> None:
-                _raise_if_stop_requested(stop_checker)
-                content_parts.append(delta)
-                if callable(on_chunk):
-                    on_chunk(delta)
+        msg_payload: dict[str, Any] = {}
 
+        while True:
+            content_parts = []
+            usage = {}
+            reasoning_text_parts = []
+            reasoning_details = []
+            stream_tool_calls = {}
+            msg_payload = {}
+            last_reasoning_emit_tokens = [0]
+            attempt_started_at = time.perf_counter()
             try:
-                response_payload = codex_transport_stream_response(
-                    cfg=cfg,
-                    messages=msgs,
-                    tools=tool_cfg.get("tools") if isinstance(tool_cfg.get("tools"), list) else [],
-                    on_text_delta=_handle_codex_text_delta,
-                )
-            except StopRequestedError:
-                raise
-            except Exception as e:
-                duration_ms = (time.perf_counter() - t0) * 1000
-                log_model_call(
-                    label=f"round {round_i + 1}", model=model, messages=msgs,
-                    output="", error=str(e)[:300], duration_ms=duration_ms, config=cfg,
-                    log_id=lid,
-                )
-                return _prepend_runtime_warnings(_format_model_error_message(e), warning_messages)
-            usage = _to_dict(response_payload.get("usage") or {})
-            msg_payload = codex_transport_message_payload(response_payload)
-            reasoning_details = [
-                dict(item)
-                for item in response_payload.get("output") or []
-                if isinstance(item, dict) and str(item.get("type") or "").strip() == "reasoning"
-            ]
-        else:
-            litellm_mod = _get_litellm(on_status=on_status)
-            kw: dict[str, Any] = {
-                "model": model, "messages": msgs, "temperature": 0.2,
-                "stream": True, "drop_params": True,
-                "stream_options": {"include_usage": True},
-                "max_retries": 0,
-            }
-            _apply_completion_transport_options(cfg, kw)
-            _apply_completion_limits(cfg, kw)
-            for key, value in tool_cfg.items():
-                if key == "tools" and not value:
-                    continue
-                kw[key] = deepcopy(value) if isinstance(value, (dict, list)) else value
-            extra_body = _completion_extra_body(cfg)
-            if extra_body:
-                kw["extra_body"] = extra_body
-            _apply_reasoning_options(cfg, kw)
-
-            try:
-                stream = litellm_mod.completion(**kw)
-            except Exception as e:
-                duration_ms = (time.perf_counter() - t0) * 1000
-                log_model_call(
-                    label=f"round {round_i + 1}", model=model, messages=msgs,
-                    output="", error=str(e)[:300], duration_ms=duration_ms, config=cfg,
-                    log_id=lid,
-                )
-                return _prepend_runtime_warnings(_format_model_error_message(e), warning_messages)
-
-            try:
-                for chunk in stream:
-                    _raise_if_stop_requested(stop_checker)
-                    u = getattr(chunk, "usage", None)
-                    if u:
-                        usage = _to_dict(u) if not isinstance(u, dict) else u
-
-                    choices = getattr(chunk, "choices", None) or []
-                    if not choices:
-                        continue
-                    delta = getattr(choices[0], "delta", None)
-                    if not delta:
-                        continue
-                    delta_payload = _to_dict(delta)
-                    if isinstance(delta_payload, dict):
-                        _merge_stream_tool_call_deltas(stream_tool_calls, delta_payload)
-                        delta_reasoning_text, _ = _render_reasoning_display(payload=delta_payload)
-                        if delta_reasoning_text:
-                            reasoning_text_parts.append(delta_reasoning_text)
-                            if callable(on_reasoning):
-                                estimated_tokens = _estimate_text_tokens(model, "\n\n".join(reasoning_text_parts))
-                                if estimated_tokens > last_reasoning_emit_tokens[0]:
-                                    last_reasoning_emit_tokens[0] = estimated_tokens
-                                    try:
-                                        on_reasoning(
-                                            "",
-                                            {
-                                                "reasoning_tokens": estimated_tokens,
-                                                "streaming": True,
-                                            },
-                                        )
-                                    except Exception:
-                                        pass
-                        for detail in _reasoning_details_from_payload(delta_payload):
-                            reasoning_details.append(detail)
-
-                    c = getattr(delta, "content", None)
-                    if c:
+                if should_use_codex_mirror_transport(cfg):
+                    def _handle_codex_text_delta(delta: str) -> None:
                         _raise_if_stop_requested(stop_checker)
-                        content_parts.append(c)
+                        content_parts.append(delta)
                         if callable(on_chunk):
-                            try:
-                                on_chunk(c)
-                            except Exception:
-                                pass
+                            on_chunk(delta)
+
+                    response_payload = codex_transport_stream_response(
+                        cfg=cfg,
+                        messages=msgs,
+                        tools=tool_cfg.get("tools") if isinstance(tool_cfg.get("tools"), list) else [],
+                        on_text_delta=_handle_codex_text_delta,
+                    )
+                    usage = _to_dict(response_payload.get("usage") or {})
+                    msg_payload = codex_transport_message_payload(response_payload)
+                    reasoning_details = [
+                        dict(item)
+                        for item in response_payload.get("output") or []
+                        if isinstance(item, dict) and str(item.get("type") or "").strip() == "reasoning"
+                    ]
+                else:
+                    litellm_mod = _get_litellm(on_status=on_status)
+                    kw: dict[str, Any] = {
+                        "model": model, "messages": msgs, "temperature": 0.2,
+                        "stream": True, "drop_params": True,
+                        "stream_options": {"include_usage": True},
+                        "max_retries": 0,
+                    }
+                    _apply_completion_transport_options(cfg, kw)
+                    _apply_completion_limits(cfg, kw)
+                    for key, value in tool_cfg.items():
+                        if key == "tools" and not value:
+                            continue
+                        kw[key] = deepcopy(value) if isinstance(value, (dict, list)) else value
+                    extra_body = _completion_extra_body(cfg)
+                    if extra_body:
+                        kw["extra_body"] = extra_body
+                    _apply_reasoning_options(cfg, kw)
+
+                    stream = litellm_mod.completion(**kw)
+                    for chunk in stream:
+                        _raise_if_stop_requested(stop_checker)
+                        u = getattr(chunk, "usage", None)
+                        if u:
+                            usage = _to_dict(u) if not isinstance(u, dict) else u
+
+                        choices = getattr(chunk, "choices", None) or []
+                        if not choices:
+                            continue
+                        delta = getattr(choices[0], "delta", None)
+                        if not delta:
+                            continue
+                        delta_payload = _to_dict(delta)
+                        if isinstance(delta_payload, dict):
+                            _merge_stream_tool_call_deltas(stream_tool_calls, delta_payload)
+                            delta_reasoning_text, _ = _render_reasoning_display(payload=delta_payload)
+                            if delta_reasoning_text:
+                                reasoning_text_parts.append(delta_reasoning_text)
+                                if callable(on_reasoning):
+                                    estimated_tokens = _estimate_text_tokens(model, "\n\n".join(reasoning_text_parts))
+                                    if estimated_tokens > last_reasoning_emit_tokens[0]:
+                                        last_reasoning_emit_tokens[0] = estimated_tokens
+                                        try:
+                                            on_reasoning(
+                                                "",
+                                                {
+                                                    "reasoning_tokens": estimated_tokens,
+                                                    "streaming": True,
+                                                },
+                                            )
+                                        except Exception:
+                                            pass
+                            for detail in _reasoning_details_from_payload(delta_payload):
+                                reasoning_details.append(detail)
+
+                        c = getattr(delta, "content", None)
+                        if c:
+                            _raise_if_stop_requested(stop_checker)
+                            content_parts.append(c)
+                            if callable(on_chunk):
+                                try:
+                                    on_chunk(c)
+                                except Exception:
+                                    pass
+                    msg_payload = {"tool_calls": [stream_tool_calls[index] for index in sorted(stream_tool_calls)]} if stream_tool_calls else {}
+                break
             except StopRequestedError:
                 raise
             except Exception as e:
-                duration_ms = (time.perf_counter() - t0) * 1000
+                duration_ms = (time.perf_counter() - attempt_started_at) * 1000
                 partial = "".join(content_parts)
                 log_model_call(
                     label=f"round {round_i + 1}",
@@ -3524,13 +4152,29 @@ def run_stream(
                     config=cfg,
                     log_id=lid,
                 )
-                return _prepend_runtime_warnings(_format_model_error_message(e), warning_messages)
-            msg_payload = {"tool_calls": [stream_tool_calls[index] for index in sorted(stream_tool_calls)]} if stream_tool_calls else {}
+                can_retry = (
+                    retry_index < retry_count
+                    and _is_retryable_model_error(e)
+                    and not partial.strip()
+                    and not stream_tool_calls
+                )
+                if not can_retry:
+                    return _prepend_runtime_warnings(_format_model_error_message(e), warning_messages)
+                retry_index += 1
+                delay_s = _model_retry_delay_s(cfg, retry_index)
+                if callable(on_status):
+                    on_status(_model_retry_status_text(retry_index, retry_count, delay_s))
+                time.sleep(delay_s)
+                if callable(on_status):
+                    on_status(STATUS_THINKING)
+                continue
 
         duration_ms = (time.perf_counter() - t0) * 1000
         full_text = "".join(content_parts)
-        if full_text:
-            last = full_text
+        payload_text = _text(msg_payload) if isinstance(msg_payload, dict) else ""
+        effective_text = full_text or payload_text
+        if effective_text:
+            last = effective_text
 
         # Stats & cost
         if not isinstance(usage, dict):
@@ -3546,14 +4190,8 @@ def run_stream(
         native_calls = _finalize_stream_tool_calls(stream_tool_calls)
         if not native_calls and isinstance(msg_payload, dict):
             native_calls = _parse_native_tool_calls(msg_payload)
-        logged_text = full_text or (_text(msg_payload) if isinstance(msg_payload, dict) else "")
-        tool_preview = _tool_calls_preview_text(native_calls)
-        if logged_text and tool_preview:
-            log_output = f"{logged_text}\n\n{tool_preview}".strip()
-        elif tool_preview:
-            log_output = tool_preview
-        else:
-            log_output = logged_text
+        logged_text = effective_text
+        log_output = logged_text
 
         # Log
         log_model_call(
@@ -3574,26 +4212,28 @@ def run_stream(
             except Exception:
                 pass
 
-        calls = _collect_loop_calls(
-            text=full_text,
+        calls, invalid_tool_errors = _collect_loop_calls(
+            text=effective_text,
             message_payload=msg_payload,
             state=loop_state,
             round_i=round_i,
         )
-        assistant_content = _normalize_tool_turn_message(full_text, calls) if calls else _clean_model_text(full_text)
+        assistant_content = _normalize_tool_turn_message(effective_text, calls) if calls else _clean_model_text(effective_text)
+        invalid_tool_message = _format_invalid_tool_call_message(invalid_tool_errors)
+        if invalid_tool_message:
+            if callable(on_rewind):
+                try:
+                    on_rewind(assistant_content or effective_text, None)
+                except Exception:
+                    pass
+            loop_state.pending_user_note = invalid_tool_message
+            continue
 
         progressive_error = _validate_progressive_tool_requirements(loop_state, calls)
         if progressive_error:
-            if callable(on_rewind) and calls:
-                rewind_tools = [
-                    (
-                        call["name"],
-                        _tool_preview_callback_args(call["name"], call["args"], config=cfg),
-                    )
-                    for call in calls
-                ]
+            if callable(on_rewind):
                 try:
-                    on_rewind(assistant_content or full_text, rewind_tools)
+                    on_rewind(assistant_content or effective_text, None)
                 except Exception:
                     pass
             loop_state.pending_user_note = progressive_error
@@ -3604,27 +4244,27 @@ def run_stream(
 
         if not calls:
             _raise_if_stop_requested(stop_checker)
-            final_message = _clean_model_text(full_text) or last or _format_empty_output_message(cfg, round_i=round_i)
+            final_message = _clean_model_text(effective_text) or last or _format_empty_output_message(cfg, round_i=round_i)
             return _prepend_runtime_warnings(final_message, warning_messages)
 
         if callable(on_rewind):
-            rewind_tools = [
-                (
-                    call["name"],
-                    _tool_preview_callback_args(call["name"], call["args"], config=cfg),
-                )
-                for call in calls
-            ]
             try:
-                on_rewind(assistant_content or full_text, rewind_tools)
+                on_rewind(assistant_content or effective_text, None)
             except Exception:
                 pass
 
         if callable(on_status):
             on_status(STATUS_SEARCHING)
+        log_tool_selection(
+            round_i=round_i,
+            calls=calls,
+            config=cfg,
+            log_id=lid,
+        )
         _raise_if_stop_requested(stop_checker)
         _execute_loop_calls(
             calls=calls,
+            round_i=round_i,
             cfg=cfg,
             stats=st,
             prompt_text=prompt_text,

@@ -1,20 +1,14 @@
 from __future__ import annotations
 
-from collections import deque
 import os
 import re
-import threading
-import time
 from typing import Any, Dict, List
+from urllib.parse import quote
 
 from .config import cfg_get
 
 _JINA_CONFIG_RESERVED_KEYS = {"headers", "search", "page_extract", "prefer_free"}
 _JINA_CAPABILITY_RESERVED_KEYS = {"headers", "prefer_free"}
-_JINA_PAGE_EXTRACT_FREE_RPM = 20
-_JINA_PAGE_EXTRACT_WINDOW_S = 60.0
-_PAGE_EXTRACT_CALL_TIMES: deque[float] = deque()
-_PAGE_EXTRACT_CALL_LOCK = threading.Lock()
 
 
 def _load_httpx_module() -> Any:
@@ -65,37 +59,12 @@ def _to_int(value: Any) -> int:
         return 0
 
 
-def _config_bool(value: Any, default: bool = False) -> bool:
-    if isinstance(value, bool):
-        return value
-    if value is None:
-        return default
-    text = str(value).strip().lower()
-    if text in {"1", "true", "yes", "on"}:
-        return True
-    if text in {"0", "false", "no", "off"}:
-        return False
-    return default
-
-
 def _jina_config_roots(config: dict[str, Any] | None) -> list[dict[str, Any]]:
     roots = [
         cfg_get(config or {}, "jina_ai", {}),
         cfg_get(config or {}, "tools.config.jina_ai", {}),
     ]
     return [root for root in roots if isinstance(root, dict)]
-
-
-def _jina_prefer_free(config: dict[str, Any] | None, capability: str) -> bool:
-    if capability != "page_extract":
-        return False
-    for root in _jina_config_roots(config):
-        capability_block = root.get(capability)
-        if isinstance(capability_block, dict) and "prefer_free" in capability_block:
-            return _config_bool(capability_block.get("prefer_free"))
-        if "prefer_free" in root:
-            return _config_bool(root.get("prefer_free"))
-    return True
 
 
 def _get_header_key(headers: dict[str, str], name: str) -> str | None:
@@ -108,17 +77,6 @@ def _get_header_key(headers: dict[str, str], name: str) -> str | None:
 
 def _has_auth_header(headers: dict[str, str]) -> bool:
     return _get_header_key(headers, "Authorization") is not None
-
-
-def _use_page_extract_api_key(config: dict[str, Any] | None = None) -> bool:
-    del config
-    now = time.monotonic()
-    with _PAGE_EXTRACT_CALL_LOCK:
-        while _PAGE_EXTRACT_CALL_TIMES and (now - _PAGE_EXTRACT_CALL_TIMES[0]) >= _JINA_PAGE_EXTRACT_WINDOW_S:
-            _PAGE_EXTRACT_CALL_TIMES.popleft()
-        use_api_key = len(_PAGE_EXTRACT_CALL_TIMES) >= _JINA_PAGE_EXTRACT_FREE_RPM
-        _PAGE_EXTRACT_CALL_TIMES.append(now)
-        return use_api_key
 
 
 def _jina_headers(
@@ -143,11 +101,7 @@ def _jina_headers(
     if capability == "search":
         headers.setdefault("X-Respond-With", "no-content")
     if capability == "page_extract":
-        headers.setdefault("X-Engine", "direct")
-        if _jina_prefer_free(config, capability) and _has_auth_header(headers) and not _use_page_extract_api_key(config):
-            auth_key = _get_header_key(headers, "Authorization")
-            if auth_key:
-                headers.pop(auth_key, None)
+        headers.setdefault("X-Engine", "browser")
     return headers
 
 
@@ -294,11 +248,11 @@ async def jina_ai_search(
 ) -> Dict[str, Any]:
     del kl
     httpx = _load_httpx_module()
-    url = "https://s.jina.ai/"
+    encoded_query = quote(str(query or "").strip(), safe="")
+    url = f"https://s.jina.ai/{encoded_query}"
     async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as client:
         response = await client.get(
             url,
-            params={"q": query},
             headers=_jina_headers(
                 config=config,
                 capability="search",
