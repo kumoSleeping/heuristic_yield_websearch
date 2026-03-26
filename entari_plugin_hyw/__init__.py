@@ -1,7 +1,5 @@
-"""Thin package entrypoint that re-exports the core entari plugin implementation."""
+"""Entari plugin package entrypoint."""
 
-from core import entari_plugin_hyw as _impl
-from core.entari_plugin_hyw import *  # noqa: F401,F403
+import core.entari_plugin_hyw as _impl  # entari: plugin
 
 __version__ = _impl.__version__
-__plugin__ = _impl.__plugin__

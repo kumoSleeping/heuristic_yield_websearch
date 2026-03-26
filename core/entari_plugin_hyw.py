@@ -17,9 +17,11 @@ import base64
 import json
 import re
 import threading
+import tomllib
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Dict, List
 from urllib.parse import urlparse
 
@@ -49,19 +51,33 @@ from .main import Stats, StopRequestedError, build_compact_context, run, run_str
 from .render import render_markdown_result
 from .tool_view import format_tool_view_argument, format_tool_view_text
 
-try:
-    from importlib.metadata import version as get_version
+def _resolve_plugin_version(default: str = "0.0.0") -> str:
+    try:
+        from importlib.metadata import version as get_version
 
-    for _dist_name in ("hyw", "entari-plugin-hyw-ai"):
-        try:
-            __version__ = get_version(_dist_name)
-            break
-        except Exception:
-            continue
-    else:
-        __version__ = "6.0.0"
-except Exception:
-    __version__ = "6.0.0"
+        for dist_name in ("hyw", "entari-plugin-hyw-ai"):
+            try:
+                resolved = str(get_version(dist_name) or "").strip()
+            except Exception:
+                continue
+            if resolved and resolved.casefold() != "none":
+                return resolved
+    except Exception:
+        pass
+
+    try:
+        pyproject_path = Path(__file__).resolve().parents[1] / "pyproject.toml"
+        project = tomllib.loads(pyproject_path.read_text(encoding="utf-8"))
+        resolved = str(project.get("project", {}).get("version") or "").strip()
+        if resolved:
+            return resolved
+    except Exception:
+        pass
+
+    return default
+
+
+__version__ = _resolve_plugin_version()
 
 
 _IMG_TAG_RE = re.compile(r"<img[^>]+>", flags=re.IGNORECASE)
