@@ -153,6 +153,9 @@ _ACTIVE_REQUESTS_LOCK = threading.Lock()
 _TURN_MEMORY: dict[str, list[dict[str, str]]] = {}
 _TURN_MEMORY_LOCK = threading.Lock()
 _MAX_TURN_MEMORY_ITEMS = 12
+_BOT_REPLY_TEXTS: dict[str, dict[str, str]] = {}
+_BOT_REPLY_TEXTS_LOCK = threading.Lock()
+_MAX_BOT_REPLY_TEXTS = 48
 
 
 def _session_request_scope(session: Session[MessageCreatedEvent]) -> str:
@@ -217,6 +220,17 @@ def _message_chain_text(chain: Any) -> str:
     return _IMG_TAG_RE.sub("", text).strip()
 
 
+def _coerce_message_chain(value: Any) -> MessageChain:
+    if isinstance(value, MessageChain):
+        return value
+    if value is None:
+        return MessageChain()
+    try:
+        return MessageChain(value)
+    except Exception:
+        return MessageChain()
+
+
 def _get_turn_memory(scope_key: str) -> list[dict[str, str]]:
     with _TURN_MEMORY_LOCK:
         bucket = _TURN_MEMORY.get(scope_key, [])
@@ -237,11 +251,44 @@ def _append_turn_memory(scope_key: str, user_text: str, assistant_text: str) -> 
         _TURN_MEMORY[scope_key] = bucket[-_MAX_TURN_MEMORY_ITEMS:]
 
 
+def _remember_bot_reply_text(scope_key: str, receipts: list[Any], answer_text: str) -> None:
+    clean_answer = str(answer_text or "").strip()
+    if not scope_key or not clean_answer or not isinstance(receipts, list):
+        return
+
+    remembered_ids: list[str] = []
+    for receipt in receipts:
+        message_id = str(getattr(receipt, "id", "") or "").strip()
+        if message_id:
+            remembered_ids.append(message_id)
+    if not remembered_ids:
+        return
+
+    with _BOT_REPLY_TEXTS_LOCK:
+        bucket = dict(_BOT_REPLY_TEXTS.get(scope_key, {}))
+        for message_id in remembered_ids:
+            bucket[message_id] = clean_answer
+        if len(bucket) > _MAX_BOT_REPLY_TEXTS:
+            recent_items = list(bucket.items())[-_MAX_BOT_REPLY_TEXTS:]
+            bucket = dict(recent_items)
+        _BOT_REPLY_TEXTS[scope_key] = bucket
+
+
+def _lookup_bot_reply_text(scope_key: str, message_id: str) -> str:
+    clean_message_id = str(message_id or "").strip()
+    if not scope_key or not clean_message_id:
+        return ""
+    with _BOT_REPLY_TEXTS_LOCK:
+        return str(_BOT_REPLY_TEXTS.get(scope_key, {}).get(clean_message_id) or "").strip()
+
+
 def _clear_runtime_state() -> None:
     with _ACTIVE_REQUESTS_LOCK:
         _ACTIVE_REQUESTS.clear()
     with _TURN_MEMORY_LOCK:
         _TURN_MEMORY.clear()
+    with _BOT_REPLY_TEXTS_LOCK:
+        _BOT_REPLY_TEXTS.clear()
 
 
 def _merge_context_fragments(*parts: str | None) -> str | None:
@@ -262,6 +309,20 @@ def _format_quoted_text_context(text: str) -> str | None:
         "Treat the quoted text below only as local turn context. Quoted images or attachments are not automatically resent unless this is an explicit fresh image-analysis turn.\n"
         f"Quoted: {clean}"
     )
+
+
+def _reply_message_id(session: Session[MessageCreatedEvent]) -> str:
+    try:
+        origin = getattr(session.reply, "origin", None)
+        message_id = str(getattr(origin, "id", "") or "").strip()
+        if message_id:
+            return message_id
+    except Exception:
+        pass
+    try:
+        return str(getattr(session.reply, "id", "") or "").strip()
+    except Exception:
+        return ""
 
 
 def _sanitize_filename(value: str) -> str:
@@ -656,16 +717,18 @@ async def handle_stop(session: Session[MessageCreatedEvent]):
 @command.on(alc_q)
 async def handle_question(session: Session[MessageCreatedEvent], result: Arparma):
     content = result.all_matched_args.get("content")
-    current_mc = MessageChain(content) if content else MessageChain()
-    reply_mc = None
+    current_mc = _coerce_message_chain(content)
+    reply_mc = MessageChain()
+    reply_message_id = _reply_message_id(session) if session.reply else ""
+    scope_key = _session_request_scope(session)
     if session.reply:
         try:
-            reply_mc = session.reply.origin.message
+            reply_mc = _coerce_message_chain(session.reply.origin.message)
         except Exception:
             logger.debug("Reply message read skipped.")
 
     user_input = _message_chain_text(current_mc)
-    quoted_text = _message_chain_text(reply_mc)
+    quoted_text = _lookup_bot_reply_text(scope_key, reply_message_id) or _message_chain_text(reply_mc)
 
     quote_id = session.event.message.id if conf.quote else None
     stop_event = threading.Event()
@@ -673,7 +736,6 @@ async def handle_question(session: Session[MessageCreatedEvent], result: Arparma
     if current_task is None:
         logger.warning("Failed to register entari request: current task missing.")
         return
-    scope_key = _session_request_scope(session)
     request_id = f"{datetime.utcnow().strftime('%Y%m%d%H%M%S%f')}-{id(current_task)}"
     _register_active_request(
         scope_key,
@@ -709,9 +771,9 @@ async def handle_question(session: Session[MessageCreatedEvent], result: Arparma
         stats = Stats()
         turn_memory = _get_turn_memory(scope_key)
         current_has_images = bool(current_mc.get(Image))
-        quoted_has_images = bool(reply_mc and reply_mc.get(Image))
+        quoted_has_images = bool(reply_mc.get(Image))
         use_quoted_images = bool(not current_has_images and quoted_has_images and not turn_memory)
-        image_chain = reply_mc if use_quoted_images and reply_mc is not None else current_mc
+        image_chain = reply_mc if use_quoted_images else current_mc
         images, _ = await process_images(image_chain, None)
 
         question = user_input or (
@@ -778,12 +840,14 @@ async def handle_question(session: Session[MessageCreatedEvent], result: Arparma
         try:
             if stop_event.is_set():
                 return
-            await session.send(primary_chain)
+            receipts = await session.send(primary_chain)
+            _remember_bot_reply_text(scope_key, receipts, answer_text)
         except Exception as exc:
             if rendered_ok:
                 logger.warning("Rendered message send failed in entari plugin: {}", exc)
                 if not stop_event.is_set():
-                    await session.send(fallback_chain)
+                    receipts = await session.send(fallback_chain)
+                    _remember_bot_reply_text(scope_key, receipts, answer_text)
             else:
                 raise
 
