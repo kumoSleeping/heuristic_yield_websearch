@@ -1,6 +1,6 @@
 [project]
 name = "hyw"
-version = "0.0.8"
+version = "0.0.9"
 description = "Heuristic Yield Websearch - LLM-powered web search assistant"
 readme = "README.md"
 license = { file = "LICENSE" }
