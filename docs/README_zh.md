@@ -28,7 +28,7 @@ HYW 让模型自己决定**搜什么、搜几轮、怎么交叉验证**，然后
 - **XML 标签工具调用** — 不依赖 function calling，兼容任意 LLM provider
 - **流式输出** — 边思考边显示，搜索过程实时可见
 - **工具能力可插拔** — 按 `search / page_extract / render` 能力选择 provider，而不是写死在主流程
-- **内置 websearch 服务** — 默认提供 `ddgs`、Jina AI 搜索 / 页面提取，以及非浏览器 Markdown 渲染
+- **内置检索运行时** — 默认提供 `ddgs`、可选 `jina_ddgs` 搜索渲染、Jina AI 页面提取，以及非浏览器 Markdown 渲染
 - **Rich 终端 UI** — 渐变标题、Markdown 渲染、实时 spinner
 - **多轮对话** — 上下文自动传递，左右方向键切换模式
 - **通过 LiteLLM 支持任意模型** — OpenAI / Anthropic / Google / OpenRouter / 本地模型
@@ -121,12 +121,19 @@ tools:
   index:
     ddgs:
       search: core.search_ddgs:ddgs_search
+    jina_ddgs:
+      search: core.search_ddgs:jina_ddgs_search
     jina_ai:
-      search: core.search_jina_ai:jina_ai_search
       page_extract: core.search_jina_ai:jina_ai_page_extract
     md2png_lite:
       render: md2png_lite.provider:render_md2png_lite_result
   config:
+    jina_ddgs:
+      search:
+        headers:
+          Accept: text/plain
+          X-Engine: browser
+          X-Return-Format: markdown
     jina_ai:
       page_extract:
         headers:
@@ -202,9 +209,9 @@ core/
 ├── main.py                 # 对话循环、工具调用、LLM 交互
 ├── cli.py                  # Rich 终端 UI、流式输出
 ├── __main__.py             # python -m core 入口
-├── search_ddgs.py          # DDGS 搜索 provider
-├── search_jina_ai.py       # Jina AI 搜索 / 页面提取 provider
-├── web_search.py           # WebToolSuite + 服务运行时
+├── search_ddgs.py          # DDGS / jina_ddgs 搜索 provider
+├── search_jina_ai.py       # Jina AI 页面提取 provider
+├── web_runtime.py          # WebToolSuite + 检索运行时
 └── render.py               # md2png-lite 渲染分发
 ```
 

@@ -1,5 +1,5 @@
 """
-hyw/cli.py - Rich-styled CLI for hyw (Heuristic Yield Web_search)
+hyw/cli.py - Rich-styled CLI for HYW
 
 用法:
     python -m hyw              # 交互模式
@@ -44,6 +44,7 @@ from .config import (
 )
 from .main import (
     Stats,
+    build_compact_context,
     get_runtime_prewarm_label,
     run,
     run_stream,
@@ -333,8 +334,9 @@ def _build_markdown_theme() -> Theme:
     )
 
 
-def _render_markdown(text: str):
-    blocks = _split_markdown_blocks(_normalize_markdown_for_cli(text))
+def _render_markdown(text: str, *, normalize: bool = True):
+    source = _normalize_markdown_for_cli(text) if normalize else str(text or "")
+    blocks = _split_markdown_blocks(source)
     renderables: list[object] = []
     for block in blocks:
         kind = block[0]
@@ -363,10 +365,27 @@ def _render_markdown(text: str):
     return Group(*renderables)
 
 
-def _render_stream_preview(text: str) -> Text:
-    preview = Text(style=TEXT_SOFT)
-    preview.append(_normalize_markdown_for_cli(text) or "...", style=TEXT_SOFT)
-    return preview
+def _stabilize_stream_markdown(text: str) -> str:
+    normalized = _normalize_markdown_for_cli(text)
+    if not normalized.strip():
+        return ""
+    lines = normalized.splitlines()
+    fence_count = 0
+    for line in lines:
+        if str(line).strip().startswith("```"):
+            fence_count += 1
+    if fence_count % 2 == 1:
+        if lines and lines[-1].strip():
+            lines.append("")
+        lines.append("```")
+    return "\n".join(lines)
+
+
+def _render_stream_preview(text: str):
+    stabilized = _stabilize_stream_markdown(text)
+    if not stabilized.strip():
+        return Text("...", style=TEXT_SOFT)
+    return _render_markdown(stabilized, normalize=False)
 
 
 def _render_reply_body(text: str, *, preview: bool = False):
@@ -1190,15 +1209,13 @@ def _tool_line(name: str, args: dict) -> Text:
     line.append("  " + ("  " * level) + "> ", style=f"bold {ACCENT}")
     line.append_text(_gradient_title(format_tool_view_text(name, args, max_chars=200)))
     if pending:
-        if name == "page_extract":
-            status_label = "reading"
+        if name == "navigate":
+            status_label = "navigating"
             if progress_status == "failed":
                 status_label = "failed"
             elif progress_status == "done":
                 status_label = "done"
             line.append(f" {status_label}", style=TEXT_MUTED)
-        elif name in ("web_search", "web_search_wiki"):
-            line.append(" searching", style=TEXT_MUTED)
         frame = _FRAMES[int(time.time() * 12) % len(_FRAMES)]
         line.append(f" {frame}", style=TEXT_MUTED)
     elif ok is False:
@@ -1213,7 +1230,7 @@ def _tool_line(name: str, args: dict) -> Text:
             line.append(f" {float(elapsed_s):.1f}s", style=TEXT_MUTED)
         except Exception:
             pass
-    if name == "page_extract" and args.get("_from_cache"):
+    if name == "navigate" and args.get("_from_cache"):
         line.append(" cache", style=TEXT_MUTED)
     return line
 
@@ -2575,7 +2592,7 @@ def main(argv: list[str] | None = None):
     _suppress_logs()
     ensure_config_file()
 
-    parser = argparse.ArgumentParser(description="Heuristic Yield Websearch")
+    parser = argparse.ArgumentParser(description="HYW")
     parser.add_argument("-q", "--question", help="单次提问后退出")
     args = parser.parse_args(argv)
 
@@ -2646,86 +2663,6 @@ def main(argv: list[str] | None = None):
 
     spinner = _Spinner()
     turn_memory: list[dict[str, str]] = []
-
-    def _build_compact_context(
-        memory: list[dict[str, str]],
-        *,
-        current_user_text: str = "",
-        max_pairs: int = 3,
-    ) -> str | None:
-        rows = [dict(item) for item in memory if isinstance(item, dict)]
-        if not rows:
-            return None
-
-        def _trim(text: str, limit: int) -> str:
-            raw = _clean_answer(text)
-            cap = max(1, int(limit))
-            if len(raw) <= cap:
-                return raw
-            return raw[: cap - 1].rstrip() + "…"
-
-        def _looks_like_choice_reply(text: str) -> bool:
-            raw = _clean_answer(text)
-            if not raw:
-                return False
-            compact = re.sub(r"\s+", "", raw).casefold()
-            if compact in {
-                "1", "2", "3", "4", "5", "6", "7", "8", "9",
-                "a", "b", "c", "d", "e", "f",
-                "前者", "后者", "就这个",
-                "第1个", "第2个", "第3个", "第4个", "第5个",
-                "第一", "第二", "第三", "第四", "第五",
-                "第一个", "第二个", "第三个", "第四个", "第五个",
-            }:
-                return True
-            return re.fullmatch(r"(?:第)?\d+(?:个|项|步)?", compact) is not None
-
-        def _looks_like_option_menu(text: str) -> bool:
-            raw = _clean_answer(text)
-            if not raw:
-                return False
-            patterns = (
-                r"(?m)^\s*[1-9][\.\)．、]\s+\S+",
-                r"(?m)^\s*[A-Fa-f][\.\)]\s+\S+",
-                r"(?m)^\s*\d+\s+\S+",
-                r"(?m)^\s*选\s*[1-9A-Fa-f]",
-                r"(?m)^\s*你回复.*(?:1|2|3|4|5|A|B|C)",
-            )
-            return any(re.search(pattern, raw) for pattern in patterns)
-
-        pairs: list[tuple[str, str]] = []
-        pending_user = ""
-        for item in rows:
-            role = str(item.get("role") or "").strip().lower()
-            content = _clean_answer(str(item.get("content") or "").strip())
-            if not content:
-                continue
-            if role == "user":
-                pending_user = content
-                continue
-            if role == "assistant":
-                if pending_user:
-                    pairs.append((pending_user, content))
-                    pending_user = ""
-                else:
-                    pairs.append(("", content))
-        if not pairs:
-            return None
-        lines = [
-            "Previous Turns Summary",
-            "Use the summary below only as background. This turn is still a fresh tool/runtime session, so do not reuse prior search history, cached pages, or stale assumptions unless the user repeats them.",
-        ]
-        preserve_last_menu = _looks_like_choice_reply(current_user_text)
-        last_index = len(pairs) - 1
-        for idx, (user_text, assistant_text) in enumerate(pairs[-max(1, int(max_pairs)):], start=max(0, len(pairs) - max(1, int(max_pairs)))):
-            if user_text:
-                lines.append(f"User: {_trim(user_text, 160)}")
-            if preserve_last_menu and idx == last_index and _looks_like_option_menu(assistant_text):
-                lines.append("Assistant (full because current user reply looks like an option selection):")
-                lines.append(assistant_text)
-            else:
-                lines.append(f"Assistant: {_trim(assistant_text, 220)}")
-        return "\n".join(lines).strip()
 
     if config_issue:
         console.print(f"  [{TEXT_MUTED}]{config_issue}[/{TEXT_MUTED}]")
@@ -2801,7 +2738,7 @@ def main(argv: list[str] | None = None):
                 continue
 
             multi = mode_state["multi_turn"]
-            ctx = _build_compact_context(turn_memory, current_user_text=question) if multi else None
+            ctx = build_compact_context(turn_memory, current_user_text=question) if multi else None
 
             try:
                 answer = ""

@@ -7,7 +7,7 @@ from .render import (
     render_markdown_base64,
     render_markdown_result,
 )
-from .web_search import WebToolSuite, on_shutdown, on_startup, page_extract, wait_until_ready, web_search
+from .web_runtime import WebToolSuite, on_shutdown, on_startup, page_extract, search_web, wait_until_ready
 
 __all__ = [
     "RenderCallable",
@@ -23,5 +23,5 @@ __all__ = [
     "render_markdown_base64",
     "render_markdown_result",
     "wait_until_ready",
-    "web_search",
+    "search_web",
 ]

@@ -45,7 +45,7 @@ from arclet.entari.event.command import CommandReceive
 from arclet.entari.event.lifespan import Cleanup, Startup
 
 from .config import DEFAULT_TOOL_SELECTIONS, cfg_get, load_config, normalize_tool_provider_name
-from .main import Stats, StopRequestedError, run, run_stream, shutdown_tools, startup_tools
+from .main import Stats, StopRequestedError, build_compact_context, run, run_stream, shutdown_tools, startup_tools
 from .render import render_markdown_result
 from .tool_view import format_tool_view_argument, format_tool_view_text
 
@@ -102,17 +102,6 @@ def _as_dict(value: Any) -> dict[str, Any]:
     return {}
 
 
-def _format_web_search_query(arguments: Any) -> str:
-    payload = _as_dict(arguments)
-    data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
-    query_list = data.get("queries") if isinstance(data.get("queries"), list) else []
-    if query_list:
-        query = " || ".join(str(item or "").strip() for item in query_list if str(item or "").strip())
-    else:
-        query = str(data.get("query") or data.get("user_message") or data.get("description") or "").strip()
-    return query
-
-
 def _format_search_progress_lines(queries: list[str]) -> str:
     if not queries:
         return ""
@@ -145,6 +134,9 @@ class _ActiveRequest:
 
 _ACTIVE_REQUESTS: dict[str, list[_ActiveRequest]] = {}
 _ACTIVE_REQUESTS_LOCK = threading.Lock()
+_TURN_MEMORY: dict[str, list[dict[str, str]]] = {}
+_TURN_MEMORY_LOCK = threading.Lock()
+_MAX_TURN_MEMORY_ITEMS = 12
 
 
 def _session_request_scope(session: Session[MessageCreatedEvent]) -> str:
@@ -196,6 +188,64 @@ def _stop_latest_active_request(scope_key: str) -> bool:
     active.stop_event.set()
     active.task.cancel()
     return True
+
+
+def _message_chain_text(chain: Any) -> str:
+    if chain is None:
+        return ""
+    try:
+        text_value = chain.get(Text)
+    except Exception:
+        text_value = None
+    text = str(text_value).strip() if text_value else ""
+    return _IMG_TAG_RE.sub("", text).strip()
+
+
+def _get_turn_memory(scope_key: str) -> list[dict[str, str]]:
+    with _TURN_MEMORY_LOCK:
+        bucket = _TURN_MEMORY.get(scope_key, [])
+        return [dict(item) for item in bucket if isinstance(item, dict)]
+
+
+def _append_turn_memory(scope_key: str, user_text: str, assistant_text: str) -> None:
+    clean_user = str(user_text or "").strip()
+    clean_assistant = str(assistant_text or "").strip()
+    if not clean_user and not clean_assistant:
+        return
+    with _TURN_MEMORY_LOCK:
+        bucket = [dict(item) for item in _TURN_MEMORY.get(scope_key, []) if isinstance(item, dict)]
+        if clean_user:
+            bucket.append({"role": "user", "content": clean_user})
+        if clean_assistant:
+            bucket.append({"role": "assistant", "content": clean_assistant})
+        _TURN_MEMORY[scope_key] = bucket[-_MAX_TURN_MEMORY_ITEMS:]
+
+
+def _clear_runtime_state() -> None:
+    with _ACTIVE_REQUESTS_LOCK:
+        _ACTIVE_REQUESTS.clear()
+    with _TURN_MEMORY_LOCK:
+        _TURN_MEMORY.clear()
+
+
+def _merge_context_fragments(*parts: str | None) -> str | None:
+    rows = [str(item or "").strip() for item in parts if str(item or "").strip()]
+    if not rows:
+        return None
+    return "\n\n".join(rows)
+
+
+def _format_quoted_text_context(text: str) -> str | None:
+    clean = str(text or "").strip()
+    if not clean:
+        return None
+    if len(clean) > 480:
+        clean = clean[:479].rstrip() + "…"
+    return (
+        "Quoted Message Summary\n"
+        "Treat the quoted text below only as local turn context. Quoted images or attachments are not automatically resent unless this is an explicit fresh image-analysis turn.\n"
+        f"Quoted: {clean}"
+    )
 
 
 def _sanitize_filename(value: str) -> str:
@@ -583,29 +633,23 @@ alc_stop = Alconna(conf.stop_command)
 async def handle_stop(session: Session[MessageCreatedEvent]):
     scope_key = _session_request_scope(session)
     quote_id = session.event.message.id if conf.quote else None
-    notice = "已停止你最近一次提问。" if _stop_latest_active_request(scope_key) else "没有正在处理的最近一次提问。"
+    notice = "Stopped your most recent request." if _stop_latest_active_request(scope_key) else "No active recent request."
     await session.send(_build_notice_chain(notice, quote_id))
 
 
 @command.on(alc_q)
 async def handle_question(session: Session[MessageCreatedEvent], result: Arparma):
     content = result.all_matched_args.get("content")
-    mc = MessageChain(content) if content else MessageChain()
-
+    current_mc = MessageChain(content) if content else MessageChain()
+    reply_mc = None
     if session.reply:
         try:
-            mc.extend(MessageChain(" ") + session.reply.origin.message)
+            reply_mc = session.reply.origin.message
         except Exception:
-            try:
-                mc.extend(session.reply.origin.message)
-            except Exception:
-                logger.debug("Reply message append skipped.")
+            logger.debug("Reply message read skipped.")
 
-    user_input = str(mc.get(Text)).strip() if mc.get(Text) else ""
-    user_input = _IMG_TAG_RE.sub("", user_input).strip()
-
-    if not user_input and not mc.get(Image):
-        return
+    user_input = _message_chain_text(current_mc)
+    quoted_text = _message_chain_text(reply_mc)
 
     quote_id = session.event.message.id if conf.quote else None
     stop_event = threading.Event()
@@ -642,13 +686,31 @@ async def handle_question(session: Session[MessageCreatedEvent], result: Arparma
             except Exception as exc:
                 logger.warning("Thinking notice send failed in entari plugin: {}", exc)
 
-        images, _ = await process_images(mc, None)
-        question = user_input or "请根据图片内容进行分析并回答。"
         loop = asyncio.get_running_loop()
         sent_round_messages: set[str] = set()
         sent_round_lock = threading.Lock()
         config = load_config()
         stats = Stats()
+        turn_memory = _get_turn_memory(scope_key)
+        current_has_images = bool(current_mc.get(Image))
+        quoted_has_images = bool(reply_mc and reply_mc.get(Image))
+        use_quoted_images = bool(not current_has_images and quoted_has_images and not turn_memory)
+        image_chain = reply_mc if use_quoted_images and reply_mc is not None else current_mc
+        images, _ = await process_images(image_chain, None)
+
+        question = user_input or (
+            "请根据图片内容进行分析并回答。"
+            if images
+            else ""
+        )
+        if not question and not images:
+            return
+
+        memory_context = build_compact_context(turn_memory, current_user_text=question or quoted_text)
+        quoted_context = None
+        if quoted_text and (not memory_context or quoted_text not in memory_context):
+            quoted_context = _format_quoted_text_context(quoted_text)
+        context = _merge_context_fragments(memory_context, quoted_context)
 
         def _on_rewind(thinking: str, tools: list[tuple[str, dict[str, Any]]] | None = None) -> None:
             if not conf.verbose or stop_event.is_set():
@@ -674,6 +736,7 @@ async def handle_question(session: Session[MessageCreatedEvent], result: Arparma
             "config": config,
             "stats": stats,
             "images": images,
+            "context": context,
             "stop_checker": stop_event.is_set,
         }
         if runner is run_stream and conf.verbose:
@@ -689,6 +752,7 @@ async def handle_question(session: Session[MessageCreatedEvent], result: Arparma
         answer_text = str(final_content or "").strip()
         if not answer_text:
             return
+        _append_turn_memory(scope_key, question, answer_text)
 
         primary_chain, fallback_chain, rendered_ok = await _build_answer_chain(
             answer_text,
@@ -725,6 +789,7 @@ async def handle_question(session: Session[MessageCreatedEvent], result: Arparma
 @listen(Startup)
 async def on_startup():
     logger.info("HYW plugin startup: loading configuration...")
+    _clear_runtime_state()
 
     try:
         cfg = load_config()
@@ -749,6 +814,7 @@ async def on_startup():
 @listen(Cleanup)
 async def cleanup_resources():
     logger.info("Cleaning up hyw resources (tools)...")
+    _clear_runtime_state()
     shutdown_tools()
 
 

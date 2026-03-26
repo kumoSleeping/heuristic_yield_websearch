@@ -1,7 +1,7 @@
 """
 hyw/main.py - 极简 LLM 对话循环 + LiteLLM 原生工具调用 + 统计 + 调用日志
 
-依赖: litellm, hyw/web_search (自带)
+依赖: litellm, hyw/web runtime (自带)
 配置: ~/.hyw/config.yml, 兼容单模型与多模型写法
 
 工具调用方式: 使用 LiteLLM 原生 tools/function calling.
@@ -43,6 +43,7 @@ from .config import (
     resolve_tool_handlers,
 )
 from .prompt import (
+    ACTIVE_PAGE_STATE_PROMPT,
     BASE_SYSTEM_PROMPT,
     DEFAULT_NO_RESULTS_TEXT,
     DEFAULT_NO_TITLE_TEXT,
@@ -50,6 +51,7 @@ from .prompt import (
     DEFAULT_PAGE_NO_MATCHING_TEXT,
     DUPLICATE_QUERY_SKIPPED_TEXT,
     FIRST_SEARCH_PROMPT,
+    LATE_ROUND_FINAL_REPLY_PROMPT,
     LATEST_RAW_EMPTY_TEXT,
     LATEST_RAW_HEADING,
     PAGE_MARKDOWN_CACHE_HIT_TEXT,
@@ -60,7 +62,17 @@ from .prompt import (
     PAGE_MARKDOWN_MATCHED_LINES_TEXT,
     PAGE_MARKDOWN_TITLE_PREFIX,
     POST_SEARCH_PROMPT,
+    SEARCH_RESULT_REMINDER,
     litellm_tool_config_for_phase,
+)
+from .search_document import (
+    build_search_document_markdown,
+    build_search_open_lines,
+    build_search_result_lines,
+    coerce_search_filters as _coerce_search_filters,
+    format_search_filters as _format_search_filters,
+    format_search_request_label as _format_search_request_label,
+    normalize_search_request_key,
 )
 
 
@@ -375,62 +387,24 @@ def _tool_markdown_for_model(name: str, args: dict[str, Any], payload: dict[str,
     if direct:
         return direct
 
-    if name in ("web_search", "web_search_wiki"):
-        query = str(args.get("query") or payload.get("query") or "").strip()
-        results = payload.get("results")
-        lines: list[str] = []
-        if query:
-            lines.append(f"# Search: {query}")
-            lines.append("")
-
-        if not payload.get("ok", True):
-            error = str(payload.get("error") or "search failed").strip()
-            lines.append(error)
-            return "\n".join(lines).strip()
-
-        rows = results if isinstance(results, list) else []
-        if not rows:
-            lines.append(DEFAULT_NO_RESULTS_TEXT)
-            return "\n".join(lines).strip()
-
-        for idx, row in enumerate(rows, start=1):
-            if not isinstance(row, dict):
-                continue
-            title = str(row.get("title") or DEFAULT_NO_TITLE_TEXT).strip() or DEFAULT_NO_TITLE_TEXT
-            url = str(row.get("url") or "").strip()
-            snippet = str(row.get("snippet") or row.get("intro") or "").strip()
-            if url:
-                lines.append(f"{idx}. [{title}]({url})")
-            else:
-                lines.append(f"{idx}. {title}")
-            if snippet:
-                lines.append(f"   {snippet}")
-            lines.append("")
-        return "\n".join(lines).strip()
-
-    if name == "page_extract":
+    if name == "navigate":
         title = str(payload.get("title") or "").strip()
         url = str(payload.get("url") or args.get("url") or "").strip()
-        content = str(payload.get("content") or "").strip()
         if not payload.get("ok", True):
-            error = str(payload.get("error") or "page extract failed").strip()
-            lines = [f"# Page: {url}" if url else "# Page Extract", "", error]
+            error = str(payload.get("error") or "navigate failed").strip()
+            lines = [f"# Navigate: {url}" if url else "# Navigate", "", error]
             return "\n".join(lines).strip()
 
         lines = []
         if title:
-            lines.append(f"# {title}")
+            lines.append(f"# Navigate: {title}")
         elif url:
-            lines.append(f"# Page: {url}")
+            lines.append(f"# Navigate: {url}")
         if url:
             if lines:
                 lines.append("")
             lines.append(f"Source: {url}")
-        if content:
-            if lines:
-                lines.append("")
-            lines.append(content)
-        return "\n".join(lines).strip() or "No content."
+        return "\n".join(lines).strip() or "Navigated."
 
     public = _tool_payload_for_model(payload)
     return json.dumps(public, ensure_ascii=False, indent=2)
@@ -473,12 +447,153 @@ def _make_log_id(question: str) -> str:
     return f"{ts}_{_safe_name(question)}.md"
 
 
+def _log_title_from_messages(messages: list[dict[str, Any]] | None) -> str:
+    for message in messages or []:
+        if not isinstance(message, dict):
+            continue
+        if str(message.get("role") or "").strip().lower() != "user":
+            continue
+        content = _format_log_message_content(message.get("content"))
+        text = re.sub(r"\s+", " ", str(content or "").strip()).strip()
+        if text:
+            return text[:200]
+    return "unknown"
+
+
+def _log_turn_label(label: str, *, turn: int | None = None) -> str:
+    if turn is not None:
+        return str(max(1, int(turn)))
+    match = re.search(r"\bround\s+(\d+)\b", str(label or "").strip(), re.IGNORECASE)
+    if match is not None:
+        return match.group(1)
+    text = str(label or "").strip()
+    return text or "unknown"
+
+
+def _format_log_input_messages(messages: list[dict[str, Any]] | None) -> list[str]:
+    lines: list[str] = []
+    for message in messages or []:
+        if not isinstance(message, dict):
+            continue
+        role = str(message.get("role") or "?").strip() or "?"
+        content = _format_log_message_content(message.get("content"))
+        lines.append(f"**[{role}]**")
+        lines.append(f"```\n{content}\n```")
+    if not lines:
+        lines.append("无")
+    return lines
+
+
+def _format_log_tool_calls(tool_calls: list[dict[str, Any]] | None) -> list[str]:
+    rows = [dict(item) for item in (tool_calls or []) if isinstance(item, dict)]
+    if not rows:
+        return ["无"]
+    return [
+        "```json",
+        json.dumps(rows, ensure_ascii=False, indent=2, default=str),
+        "```",
+    ]
+
+
+def _extract_raw_tool_calls(payload: dict[str, Any] | None) -> list[dict[str, Any]]:
+    if not isinstance(payload, dict):
+        return []
+    raw_tool_calls = payload.get("tool_calls")
+    if not isinstance(raw_tool_calls, list):
+        return []
+
+    calls: list[dict[str, Any]] = []
+    for raw_call in raw_tool_calls:
+        call_payload = _to_dict(raw_call)
+        if not isinstance(call_payload, dict):
+            continue
+        function_payload = call_payload.get("function")
+        if function_payload is None and isinstance(call_payload.get("function_call"), dict):
+            function_payload = call_payload.get("function_call")
+        function_payload = _to_dict(function_payload) if function_payload is not None else {}
+        if not isinstance(function_payload, dict):
+            function_payload = {}
+
+        call_id = str(call_payload.get("id") or "").strip()
+        name = str(function_payload.get("name") or call_payload.get("name") or "").strip()
+        raw_arguments = function_payload.get("arguments")
+        if raw_arguments in (None, ""):
+            raw_arguments = call_payload.get("arguments")
+        arguments = _tool_arguments_to_dict(raw_arguments)
+
+        row: dict[str, Any] = {}
+        if call_id:
+            row["id"] = call_id
+        if name:
+            row["name"] = name
+        if isinstance(arguments, dict) and arguments:
+            row["args"] = arguments
+        elif isinstance(raw_arguments, str) and raw_arguments.strip():
+            row["args_raw"] = raw_arguments.strip()
+        if row:
+            calls.append(row)
+    return calls
+
+
+def _append_log_lines(path: Path, lines: list[str]) -> None:
+    if not lines:
+        return
+    with open(path, "a", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+
+
+def _tool_payload_log_summary(
+    *,
+    name: str,
+    args: dict[str, Any],
+    payload: dict[str, Any],
+    duration_ms: float | None = None,
+) -> dict[str, Any]:
+    row: dict[str, Any] = {"tool": str(name or "").strip()}
+    if duration_ms is not None:
+        row["duration_ms"] = int(max(0.0, float(duration_ms)))
+
+    if name == "navigate":
+        search = str(args.get("search") or "").strip()
+        ref = str(args.get("ref") or "").strip()
+        url = str(args.get("url") or "").strip()
+        keep = args.get("keep")
+        if search:
+            row["search"] = search
+        if ref:
+            row["ref"] = ref
+        if url:
+            row["url"] = url
+        if isinstance(keep, str) and keep.strip():
+            row["keep"] = keep.strip()
+        elif isinstance(keep, list):
+            rendered = [str(item or "").strip() for item in keep if str(item or "").strip()]
+            if rendered:
+                row["keep"] = rendered
+        for key in ("ok", "provider", "title", "count", "error"):
+            value = payload.get(key)
+            if value not in (None, "", []):
+                row[key] = value
+        replaced_count = payload.get("_replaced_count")
+        if replaced_count not in (None, "", []):
+            row["replaced"] = replaced_count
+        created_count = payload.get("_created_count")
+        if created_count not in (None, "", []):
+            row["kept"] = created_count
+        return row
+
+    return row
+
+
 def log_model_call(
     *,
     label: str,
     model: str,
     messages: list[dict],
     output: str,
+    tool_calls: list[dict[str, Any]] | None = None,
+    turn: int | None = None,
+    title: str | None = None,
     usage: dict[str, Any] | None = None,
     cost: float | None = None,
     duration_ms: float | None = None,
@@ -494,39 +609,52 @@ def log_model_call(
 
         ts = datetime.now().strftime("%H:%M:%S")
         u = usage or {}
-        lines = [
-            f"## [{ts}] {label}",
-            f"- model: `{model}`",
-        ]
-        if duration_ms is not None:
-            lines.append(f"- duration: {duration_ms:.0f}ms")
-        if u:
-            lines.append(f"- tokens: prompt={u.get('prompt_tokens',0)} completion={u.get('completion_tokens',0)} total={u.get('total_tokens',0)}")
-        if cost is not None:
-            lines.append(f"- cost: ${cost:.6f}")
-        if error:
-            lines.append(f"- **error**: {error}")
-
-        # input
-        lines.append("")
-        lines.append("### Input")
-        for m in messages:
-            role = m.get("role", "?")
-            content = _format_log_message_content(m.get("content"))
-            lines.append(f"**[{role}]**")
-            lines.append(f"```\n{content}\n```")
-
-        # output
-        lines.append("")
-        lines.append("### Output")
-        if output:
-            lines.append(f"```\n{output}\n```")
-
-        lines.append("")
-        lines.append("---")
-        lines.append("")
+        log_title = re.sub(r"\s+", " ", str(title or "").strip()) or _log_title_from_messages(messages)
+        turn_label = _log_turn_label(label, turn=turn)
+        lines: list[str] = []
 
         with _log_lock:
+            need_header = (not path.exists()) or path.stat().st_size <= 0
+            if need_header:
+                lines.extend([f"# {log_title}", ""])
+
+            lines.extend(
+                [
+                    f"## Turn: {turn_label}",
+                    "",
+                    "### 模型Input",
+                    *_format_log_input_messages(messages),
+                    "",
+                    "### 模型Output",
+                ]
+            )
+            if output:
+                lines.append(f"```\n{output}\n```")
+            else:
+                lines.append("无")
+            lines.extend(
+                [
+                    "",
+                    "### 模型工具Output",
+                    *_format_log_tool_calls(tool_calls),
+                    "",
+                    "### 模型时间、开销",
+                    f"- time: {ts}",
+                    f"- model: `{model}`",
+                ]
+            )
+            if duration_ms is not None:
+                lines.append(f"- duration: {duration_ms:.0f}ms")
+            if u:
+                lines.append(
+                    f"- tokens: prompt={u.get('prompt_tokens',0)} completion={u.get('completion_tokens',0)} total={u.get('total_tokens',0)}"
+                )
+            if cost is not None:
+                lines.append(f"- cost: ${cost:.6f}")
+            if error:
+                lines.append(f"- error: {error}")
+            lines.extend(["", "---", ""])
+
             with open(path, "a", encoding="utf-8") as f:
                 f.write("\n".join(lines))
     except Exception:
@@ -539,35 +667,35 @@ def log_tool_call(
     args: dict[str, Any],
     payload: dict[str, Any],
     duration_ms: float | None = None,
+    turn: int | None = None,
     config: dict[str, Any] | None = None,
     log_id: str | None = None,
 ):
-    """记录真实工具执行，不写模型预演结果。"""
+    if str(name or "").strip() not in {"navigate"}:
+        return
     try:
         d = _log_dir(config)
         fname = log_id or _make_log_id("unknown")
         path = d / fname
-
-        ts = datetime.now().strftime("%H:%M:%S")
-        lines = [
-            f"## [{ts}] tool `{name}`",
-        ]
-        if duration_ms is not None:
-            lines.append(f"- duration: {duration_ms:.0f}ms")
-
-        lines.append("")
-        lines.append("### Args")
-        lines.append(f"```json\n{json.dumps(args or {}, ensure_ascii=False, indent=2, default=str)}\n```")
-        lines.append("")
-        lines.append("### Result")
-        lines.append(f"```json\n{json.dumps(payload or {}, ensure_ascii=False, indent=2, default=str)}\n```")
-        lines.append("")
-        lines.append("---")
-        lines.append("")
-
+        summary = _tool_payload_log_summary(
+            name=str(name or "").strip(),
+            args=dict(args or {}),
+            payload=dict(payload or {}),
+            duration_ms=duration_ms,
+        )
+        lines = ["", "### 工具执行摘要"]
+        if turn is not None:
+            lines.append(f"- turn: {int(turn)}")
+        lines.extend(
+            [
+                "```json",
+                json.dumps(summary, ensure_ascii=False, indent=2, default=str),
+                "```",
+                "",
+            ]
+        )
         with _log_lock:
-            with open(path, "a", encoding="utf-8") as f:
-                f.write("\n".join(lines))
+            _append_log_lines(path, lines)
     except Exception:
         pass
 
@@ -579,40 +707,8 @@ def log_tool_selection(
     config: dict[str, Any] | None = None,
     log_id: str | None = None,
 ):
-    try:
-        if not calls:
-            return
-        d = _log_dir(config)
-        fname = log_id or _make_log_id("unknown")
-        path = d / fname
-
-        ts = datetime.now().strftime("%H:%M:%S")
-        lines = [
-            f"## [{ts}] round {int(round_i) + 1} selected tools",
-            "",
-            "### Calls",
-            "```json",
-            json.dumps(calls, ensure_ascii=False, indent=2, default=str),
-            "```",
-            "",
-            "---",
-            "",
-        ]
-        with _log_lock:
-            with open(path, "a", encoding="utf-8") as f:
-                f.write("\n".join(lines))
-    except Exception:
-        pass
-
-
-# ── 工具: web_search (hyw 内置) ──────────────────────────
-
-
-def get_web_search_backend(config: dict[str, Any] | None = None) -> str:
-    handlers = resolve_tool_handlers(config, "search")
-    if not handlers:
-        return "search:none"
-    return "search:" + ",".join(handler.provider for handler in handlers)
+    del round_i, calls, config, log_id
+    return
 
 
 _DIRECT_SEARCH_TIMEOUT_S = 12.0
@@ -640,22 +736,26 @@ def _run_async(coro):
 
 
 def startup_tools(headless: bool = True, config: dict[str, Any] | None = None):
-    """Warm up the built-in websearch service."""
-    from .web_search import on_startup
+    """Warm up the built-in retrieval runtime."""
+    from .web_runtime import on_startup
 
     return on_startup(headless=headless, config=config)
 
 
 def shutdown_tools(config: dict[str, Any] | None = None):
     del config
-    from .web_search import on_shutdown
+    from .web_runtime import on_shutdown
 
     on_shutdown()
 
 
-def _web_search(
+def _search_backend(
     query: str,
     *,
+    kl: str = "",
+    df: str = "",
+    t: str = "",
+    ia: str = "",
     config: dict[str, Any] | None = None,
     progress_callback: Any | None = None,
     **_,
@@ -664,8 +764,12 @@ def _web_search(
     try:
         return _run_async(
             asyncio.wait_for(
-                _web_search_async(
+                _search_backend_async(
                     query=query,
+                    kl=kl,
+                    df=df,
+                    t=t,
+                    ia=ia,
                     config=config,
                     progress_callback=progress_callback,
                 ),
@@ -681,30 +785,38 @@ def _web_search(
         return {"ok": False, "error": f"search timed out after {timeout_text}s", "query": query, "results": []}
 
 
-async def _web_search_async(
+async def _search_backend_async(
     query: str,
     *,
+    kl: str = "",
+    df: str = "",
+    t: str = "",
+    ia: str = "",
     config: dict[str, Any] | None = None,
     progress_callback: Any | None = None,
     **_,
 ) -> dict[str, Any]:
     """异步调用 WebToolSuite 执行搜索."""
-    from .web_search import web_search
+    from .web_runtime import search_web
 
     cfg = build_model_config(config or load_config())
     try:
-        payload = await web_search(
+        payload = await search_web(
             query=query, mode="text",
+            kl=kl,
+            df=df,
+            t=t,
+            ia=ia,
             max_results=5,
             config=cfg,
             headless=bool(cfg.get("headless") not in (False, "false", "0", 0)),
             progress_callback=progress_callback,
         )
     except Exception as e:
-        return {"ok": False, "error": f"web_search provider failed: {str(e).strip() or type(e).__name__}", "query": query, "results": []}
+        return {"ok": False, "error": f"search provider failed: {str(e).strip() or type(e).__name__}", "query": query, "results": []}
 
     if not isinstance(payload, dict):
-        return {"ok": False, "error": "web_search provider failed: invalid payload type", "query": query, "results": []}
+        return {"ok": False, "error": "search provider failed: invalid payload type", "query": query, "results": []}
     if not bool(payload.get("ok", True)):
         provider = str(payload.get("provider") or "").strip()
         raw_error = str(payload.get("error") or "").strip() or "unknown provider error"
@@ -733,7 +845,7 @@ def _page_extract(
     progress_callback: Any | None = None,
     **_,
 ) -> dict[str, Any]:
-    from .web_search import page_extract
+    from .web_runtime import page_extract
 
     cfg = build_model_config(config or load_config())
     try:
@@ -795,6 +907,16 @@ def _public_search_results(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return public_rows
 
 
+def _provider_for_capability(capability: str, config: dict[str, Any] | None = None) -> str:
+    try:
+        handlers = resolve_tool_handlers(config, capability)
+    except Exception:
+        return ""
+    if not handlers:
+        return ""
+    return str(handlers[0].provider or "").strip()
+
+
 def execute_tool_payload(
     name: str,
     args: dict[str, Any],
@@ -807,25 +929,13 @@ def execute_tool_payload(
     progress_callback: Any | None = None,
 ) -> dict[str, Any]:
     cfg = build_model_config(config or load_config())
-    if name in ("web_search", "web_search_wiki"):
-        r = _run_direct_web_search(
-            query=args.get("query", ""),
-            cfg=cfg,
-            stats=stats,
-            log_id=log_id,
-            runtime_state=runtime_state,
-            progress_callback=progress_callback,
-        )
-    elif name == "page_extract":
-        r = _run_page_probe(
+    if name == "navigate":
+        r = _run_navigate(
             url=args.get("url", ""),
-            mode=str(args.get("mode") or "sample").strip().lower() or "sample",
-            start_line=_coerce_page_extract_line_number(args.get("start_line")),
-            end_line=_coerce_page_extract_line_number(args.get("end_line")),
-            question=user_question,
+            ref=args.get("ref", ""),
+            search=args.get("search", ""),
+            search_filters=args,
             cfg=cfg,
-            stats=stats,
-            log_id=log_id,
             runtime_state=runtime_state,
             progress_callback=progress_callback,
         )
@@ -841,9 +951,7 @@ def execute_tool(name: str, args: dict[str, Any]) -> str:
 
 
 def _tool_capability(name: str) -> str:
-    if name in ("web_search", "web_search_wiki"):
-        return "search"
-    if name == "page_extract":
+    if name == "navigate":
         return "page_extract"
     return ""
 
@@ -851,9 +959,7 @@ def _tool_capability(name: str) -> str:
 def _tool_display_name(name: str, *, provider: str = "") -> str:
     del provider
     return {
-        "web_search": "Web Search",
-        "web_search_wiki": "Web Search",
-        "page_extract": "Read",
+        "navigate": "Navigate",
     }.get(name, str(name or "").strip())
 
 
@@ -885,15 +991,9 @@ def _tool_provider_from_config(name: str, config: dict[str, Any] | None = None) 
     capability = _tool_capability(name)
     if not capability:
         return ""
-    if capability not in {"search", "page_extract", "render"}:
+    if capability not in {"page_extract", "render"}:
         return ""
-    try:
-        handlers = resolve_tool_handlers(config, capability)
-    except Exception:
-        return ""
-    if not handlers:
-        return ""
-    return str(handlers[0].provider or "").strip()
+    return _provider_for_capability(capability, config)
 
 
 def _tool_callback_args(
@@ -910,23 +1010,31 @@ def _tool_callback_args(
         provider = _tool_provider_from_payload(payload)
         if "count" in payload:
             merged["_count"] = payload.get("count")
+            merged["count"] = payload.get("count")
         if "ok" in payload:
             merged["_ok"] = payload.get("ok")
         if payload.get("from_cache"):
             merged["_from_cache"] = True
+        if name == "navigate":
+            for key in ("title", "url", "total_lines", "total_chars"):
+                if payload.get(key) not in (None, ""):
+                    merged[key] = payload.get(key)
         meta = _tool_meta(payload)
         usage = meta.get("usage")
         if isinstance(usage, dict) and usage.get("tokens") not in (None, ""):
             merged["_jina_tokens"] = usage.get("tokens")
-            if name == "page_extract":
+            if name == "navigate":
                 merged["_page_usage_tokens"] = usage.get("tokens")
                 merged["_page_usage_requests"] = usage.get("requests")
         billing = meta.get("billing")
-        if name == "page_extract" and isinstance(billing, dict):
+        if name == "navigate" and isinstance(billing, dict):
             merged["_page_billing_mode"] = billing.get("mode")
             merged["_page_cost_usd"] = billing.get("cost_usd")
     if not provider:
-        provider = _tool_provider_from_config(name, config)
+        if name == "navigate" and str(args.get("search") or "").strip():
+            provider = _provider_for_capability("search", config)
+        else:
+            provider = _tool_provider_from_config(name, config)
     if provider:
         merged["_provider"] = provider
     merged["_display_name"] = _tool_display_name(name, provider=provider)
@@ -938,8 +1046,10 @@ def _tool_callback_args(
 def _normalize_native_tool_name(name: str) -> str:
     normalized = str(name or "").strip()
     aliases = {
-        "search": "web_search",
-        "page": "page_extract",
+        "page": "navigate",
+        "page_extract": "navigate",
+        "read": "navigate",
+        "navigate_page": "navigate",
     }
     return aliases.get(normalized, normalized)
 
@@ -988,41 +1098,68 @@ def _coerce_page_extract_line_number(value: Any) -> int:
     return max(0, parsed)
 
 
+def _normalize_keep_argument(value: Any) -> str | list[str] | None:
+    if value is None:
+        return None
+
+    raw_parts: list[str] = []
+    input_is_list = isinstance(value, list)
+    if isinstance(value, str):
+        raw_parts.extend(segment.strip() for segment in value.split(","))
+    elif isinstance(value, list):
+        for item in value:
+            text = str(item or "").strip()
+            if not text:
+                continue
+            raw_parts.extend(segment.strip() for segment in text.split(","))
+    else:
+        return None
+
+    normalized_parts: list[str] = []
+    saw_any = False
+    for part in raw_parts:
+        if not part:
+            continue
+        saw_any = True
+        match = _LINE_REF_RE.fullmatch(part)
+        if match is None:
+            return None
+        start = int(match.group("start"))
+        end = int(match.group("end") or start)
+        if end < start:
+            start, end = end, start
+        normalized_parts.append(f"L{start}" if start == end else f"L{start}-L{end}")
+
+    if not saw_any or not normalized_parts:
+        return None
+    if input_is_list or len(normalized_parts) > 1:
+        return normalized_parts
+    return normalized_parts[0]
+
+
 def _sanitize_native_tool_call(name: str, args: dict[str, Any], *, call_id: str = "") -> dict[str, Any] | None:
     normalized_name = _normalize_native_tool_name(name)
     payload = dict(args or {})
-    if normalized_name == "web_search":
-        query = str(payload.get("query") or payload.get("q") or "").strip()
-        if not query:
-            return None
-        clean_args: dict[str, Any] = {"query": query}
-    elif normalized_name == "page_extract":
+    if normalized_name == "navigate":
         url = str(payload.get("url") or payload.get("target") or "").strip()
         ref = _normalize_context_ref(str(payload.get("ref") or "").strip())
-        if any(str(payload.get(key) or "").strip() for key in ("task", "lines", "line_ranges")):
+        search = str(payload.get("search") or payload.get("query") or "").strip()
+        keep = payload.get("keep")
+        normalized_keep = _normalize_keep_argument(keep)
+        if not url and not ref and not search:
             return None
-        if "stride" in payload and payload.get("stride") not in (None, ""):
+        if keep is None or normalized_keep is None:
             return None
-        if "search" in payload and payload.get("search") not in (None, [], ""):
-            return None
-        if not url and not ref:
-            return None
-        mode = _coerce_page_extract_mode(payload)
         clean_args = {}
         if url:
             clean_args["url"] = url
         if ref:
             clean_args["ref"] = ref
-        clean_args["mode"] = mode
-        if mode == "range":
-            start_line = _coerce_page_extract_line_number(payload.get("start_line"))
-            end_line = _coerce_page_extract_line_number(payload.get("end_line"))
-            if not start_line or not end_line:
-                return None
-            if end_line < start_line:
-                start_line, end_line = end_line, start_line
-            clean_args["start_line"] = start_line
-            clean_args["end_line"] = end_line
+        if search:
+            clean_args["search"] = search
+            clean_args.update(_coerce_search_filters(payload))
+        if normalized_keep is not None:
+            clean_args["keep"] = normalized_keep
     else:
         return None
 
@@ -1034,26 +1171,23 @@ def _sanitize_native_tool_call(name: str, args: dict[str, Any], *, call_id: str 
 def _invalid_tool_call_reason(name: str, args: dict[str, Any]) -> str:
     normalized_name = _normalize_native_tool_name(name)
     payload = dict(args or {})
-    if normalized_name == "web_search":
-        return "web_search requires a non-empty `query` string."
-    if normalized_name == "page_extract":
-        if any(str(payload.get(key) or "").strip() for key in ("task", "lines", "line_ranges")):
-            return "page_extract accepts `url` or `ref`, plus `mode=sample|range`; do not pass `task`, `lines`, or `line_ranges`."
-        if "stride" in payload and payload.get("stride") not in (None, ""):
-            return "page_extract sampling is automatic now; do not pass `stride`."
+    if normalized_name == "navigate":
         url = str(payload.get("url") or payload.get("target") or "").strip()
         ref = _normalize_context_ref(str(payload.get("ref") or "").strip())
-        if not url and not ref:
-            return "page_extract requires `url` or `ref`."
-        if "search" in payload and payload.get("search") not in (None, [], ""):
-            return "page_extract no longer supports `search`; use `mode=sample` preview, then `mode=range` with exact lines."
-        mode = _coerce_page_extract_mode(payload)
-        if mode == "range":
-            start_line = _coerce_page_extract_line_number(payload.get("start_line"))
-            end_line = _coerce_page_extract_line_number(payload.get("end_line"))
-            if not start_line or not end_line:
-                return "page_extract `mode=range` requires `start_line` and `end_line`."
-        return "page_extract arguments are invalid."
+        search = str(payload.get("search") or payload.get("query") or "").strip()
+        keep = payload.get("keep")
+        normalized_keep = _normalize_keep_argument(keep)
+        if not url and not ref and not search:
+            return "navigate requires `url`, `ref`, or `search`."
+        if keep is None:
+            return "navigate requires `keep`; use `L0` when nothing should be preserved."
+        if normalized_keep is None:
+            return "navigate `keep` must use exact visible line refs such as `L0`, `L12`, `L12-L23`, or a list of them."
+        return "navigate arguments are invalid."
+    if normalized_name == "open":
+        return "open is no longer available. Use `navigate(..., keep=[...])` instead."
+    if normalized_name == "close":
+        return "close is no longer available. Use `navigate(..., keep=[...])` instead."
     return f"unknown tool `{str(name or '').strip() or '<empty>'}`."
 
 
@@ -1169,9 +1303,25 @@ def _normalize_context_ref(value: str) -> str:
     if not text:
         return ""
     text = re.sub(r"\s+", "", text)
-    if re.fullmatch(r"\d+", text):
+    if re.fullmatch(r"\d+(?::\d+)?", text):
         return text
     return ""
+
+
+def _parse_context_ref(value: str) -> tuple[int, int | None]:
+    text = _normalize_context_ref(value)
+    if not text:
+        return 0, None
+    if ":" not in text:
+        try:
+            return int(text), None
+        except Exception:
+            return 0, None
+    head, _, tail = text.partition(":")
+    try:
+        return int(head), int(tail)
+    except Exception:
+        return 0, None
 
 
 def _resolve_page_call_refs(calls: list[dict[str, Any]], phase_state: "_PhaseRuntimeState") -> None:
@@ -1180,7 +1330,7 @@ def _resolve_page_call_refs(calls: list[dict[str, Any]], phase_state: "_PhaseRun
     for call in calls:
         if not isinstance(call, dict):
             continue
-        if str(call.get("name") or "").strip() != "page_extract":
+        if str(call.get("name") or "").strip() not in {"navigate"}:
             continue
         args = call.get("args") if isinstance(call.get("args"), dict) else None
         if not isinstance(args, dict):
@@ -1190,14 +1340,24 @@ def _resolve_page_call_refs(calls: list[dict[str, Any]], phase_state: "_PhaseRun
         ref = _normalize_context_ref(str(args.get("ref") or "").strip())
         if not ref:
             continue
-        try:
-            item_id = int(ref)
-        except Exception:
+        item_id, link_index = _parse_context_ref(ref)
+        if item_id < 0:
             continue
         item = _find_context_item(phase_state, item_id)
         if item is None:
             continue
-        resolved_url = _normalize_state_url(str(item.data.get("url") or "").strip()) or str(item.data.get("url") or "").strip()
+        resolved_url = ""
+        if link_index is not None:
+            link_rows = _context_item_link_rows(item)
+            for row in link_rows:
+                if not isinstance(row, dict):
+                    continue
+                if int(row.get("index") or 0) != int(link_index):
+                    continue
+                resolved_url = _normalize_state_url(str(row.get("url") or "").strip()) or str(row.get("url") or "").strip()
+                break
+        if not resolved_url:
+            resolved_url = _normalize_state_url(str(item.data.get("url") or "").strip()) or str(item.data.get("url") or "").strip()
         if resolved_url:
             args["url"] = resolved_url
 _TOOL_LIMIT = 8
@@ -1250,54 +1410,106 @@ def _append_context_messages(msgs: list[dict[str, Any]], context: Any) -> None:
             continue
         msgs.append({"role": role, "content": content})
 
-def _append_search_memory_items(
-    call: dict[str, Any],
-    payload: dict[str, Any],
-    state: _PhaseRuntimeState,
-    *,
-    round_no: int,
-) -> list[int]:
-    args = call.get("args") if isinstance(call.get("args"), dict) else {}
-    query = str(args.get("query") or payload.get("query") or "").strip()
-    call_id = str(args.get("_call_id") or "").strip()
-    rows = payload.get("results") if isinstance(payload.get("results"), list) else []
-    created_ids: list[int] = []
-    if not rows:
-        item = _add_context_item(
-            state,
-            "memory.search",
-            {
-                "query": query,
-                "text": str(payload.get("error") or DEFAULT_NO_RESULTS_TEXT).strip() or DEFAULT_NO_RESULTS_TEXT,
-                "snippet": str(payload.get("error") or DEFAULT_NO_RESULTS_TEXT).strip() or DEFAULT_NO_RESULTS_TEXT,
-                "round": round_no,
-                "call_id": call_id,
-            },
-            pending=True,
-        )
-        created_ids.append(item.item_id)
-        return created_ids
 
-    for row in rows:
-        if not isinstance(row, dict):
+def _context_has_prior_turns_summary(context: Any) -> bool:
+    marker = "Previous Turns Summary"
+    if not context:
+        return False
+    if isinstance(context, str):
+        return marker in context
+    if not isinstance(context, list):
+        return False
+    for item in context:
+        if not isinstance(item, dict):
             continue
-        snippet = re.sub(r"\s+", " ", str(row.get("snippet") or row.get("intro") or "").strip())
-        item = _add_context_item(
-            state,
-            "memory.search",
-            {
-                "query": query,
-                "title": str(row.get("title") or DEFAULT_NO_TITLE_TEXT).strip() or DEFAULT_NO_TITLE_TEXT,
-                "url": str(row.get("url") or "").strip(),
-                "snippet": snippet,
-                "text": snippet,
-                "round": round_no,
-                "call_id": call_id,
-            },
-            pending=True,
+        content = item.get("content")
+        if marker in _message_content_text(content):
+            return True
+    return False
+
+
+def build_compact_context(
+    memory: list[dict[str, Any]] | None,
+    *,
+    current_user_text: str = "",
+    max_pairs: int = 3,
+) -> str | None:
+    rows = [dict(item) for item in (memory or []) if isinstance(item, dict)]
+    if not rows:
+        return None
+
+    def _trim(text: str, limit: int) -> str:
+        raw = _clean_model_text(text)
+        cap = max(1, int(limit))
+        if len(raw) <= cap:
+            return raw
+        return raw[: cap - 1].rstrip() + "…"
+
+    def _looks_like_choice_reply(text: str) -> bool:
+        raw = _clean_model_text(text)
+        if not raw:
+            return False
+        compact = re.sub(r"\s+", "", raw).casefold()
+        if compact in {
+            "1", "2", "3", "4", "5", "6", "7", "8", "9",
+            "a", "b", "c", "d", "e", "f",
+            "前者", "后者", "就这个",
+            "第1个", "第2个", "第3个", "第4个", "第5个",
+            "第一", "第二", "第三", "第四", "第五",
+            "第一个", "第二个", "第三个", "第四个", "第五个",
+        }:
+            return True
+        return re.fullmatch(r"(?:第)?\d+(?:个|项|步)?", compact) is not None
+
+    def _looks_like_option_menu(text: str) -> bool:
+        raw = _clean_model_text(text)
+        if not raw:
+            return False
+        patterns = (
+            r"(?m)^\s*[1-9][\.\)．、]\s+\S+",
+            r"(?m)^\s*[A-Fa-f][\.\)]\s+\S+",
+            r"(?m)^\s*\d+\s+\S+",
+            r"(?m)^\s*选\s*[1-9A-Fa-f]",
+            r"(?m)^\s*你回复.*(?:1|2|3|4|5|A|B|C)",
         )
-        created_ids.append(item.item_id)
-    return created_ids
+        return any(re.search(pattern, raw) for pattern in patterns)
+
+    pairs: list[tuple[str, str]] = []
+    pending_user = ""
+    for item in rows:
+        role = str(item.get("role") or "").strip().lower()
+        content = _clean_model_text(str(item.get("content") or "").strip())
+        if not content:
+            continue
+        if role == "user":
+            pending_user = content
+            continue
+        if role == "assistant":
+            if pending_user:
+                pairs.append((pending_user, content))
+                pending_user = ""
+            else:
+                pairs.append(("", content))
+    if not pairs:
+        return None
+
+    lines = [
+        "Previous Turns Summary",
+        "Use the summary below only as background. This turn is still a fresh tool/runtime session, so do not reuse prior search history, cached pages, or stale assumptions unless the user repeats them.",
+    ]
+    preserve_last_menu = _looks_like_choice_reply(current_user_text)
+    last_index = len(pairs) - 1
+    pair_limit = max(1, int(max_pairs))
+    start_index = max(0, len(pairs) - pair_limit)
+    for idx, (user_text, assistant_text) in enumerate(pairs[start_index:], start=start_index):
+        if user_text:
+            lines.append(f"User: {_trim(user_text, 160)}")
+        if preserve_last_menu and idx == last_index and _looks_like_option_menu(assistant_text):
+            lines.append("Assistant (full because current user reply looks like an option selection):")
+            lines.append(assistant_text)
+        else:
+            lines.append(f"Assistant: {_trim(assistant_text, 220)}")
+    return "\n".join(lines).strip()
 
 
 def _group_page_matches(matches: list[dict[str, Any]]) -> list[tuple[str, str]]:
@@ -1342,6 +1554,115 @@ def _normalize_sample_preview_text(value: str) -> str:
 
 def _extract_markdown_link_texts(value: str) -> list[str]:
     return [match.group(1).strip() for match in re.finditer(r"\[([^\]]+)\]\([^)]+\)", str(value or ""))]
+
+
+_CONTEXT_MARKDOWN_LINK_RE = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
+_CONTEXT_ENUMERATED_LINK_PREFIX_RE = re.compile(r"^\s*(?:L\d+\s*\|\s*)?\[(\d+)\]\s+")
+
+
+def _extract_context_link_rows(value: Any) -> list[dict[str, Any]]:
+    text = str(value or "")
+    if not text.strip():
+        return []
+
+    rows: list[dict[str, Any]] = []
+    used_indexes: set[int] = set()
+    next_index = 1
+
+    for raw_line in text.splitlines():
+        line = str(raw_line or "").strip()
+        if not line:
+            continue
+        prefix_match = _CONTEXT_ENUMERATED_LINK_PREFIX_RE.match(line)
+        explicit_index = int(prefix_match.group(1)) if prefix_match is not None else 0
+        link_matches = list(_CONTEXT_MARKDOWN_LINK_RE.finditer(line))
+        if not link_matches:
+            continue
+        for match_no, match in enumerate(link_matches, start=1):
+            label = re.sub(r"\s+", " ", str(match.group(1) or "").strip()) or "link"
+            raw_url = str(match.group(2) or "").strip()
+            normalized_url = _normalize_state_url(raw_url) or raw_url
+            if not normalized_url:
+                continue
+
+            if match_no == 1 and explicit_index > 0 and explicit_index not in used_indexes:
+                index = explicit_index
+                if index >= next_index:
+                    next_index = index + 1
+            else:
+                while next_index in used_indexes:
+                    next_index += 1
+                index = next_index
+                next_index += 1
+
+            used_indexes.add(index)
+            rows.append({"index": index, "url": normalized_url, "text": label})
+    return rows
+
+
+def _context_item_link_rows(item: "_ContextItem | None") -> list[dict[str, Any]]:
+    if item is None:
+        return []
+
+    existing = item.data.get("links")
+    if isinstance(existing, list):
+        normalized_rows: list[dict[str, Any]] = []
+        seen_indexes: set[int] = set()
+        for row in existing:
+            if not isinstance(row, dict):
+                continue
+            try:
+                index = int(row.get("index") or 0)
+            except Exception:
+                index = 0
+            raw_url = str(row.get("url") or "").strip()
+            normalized_url = _normalize_state_url(raw_url) or raw_url
+            if index <= 0 or not normalized_url or index in seen_indexes:
+                continue
+            seen_indexes.add(index)
+            normalized_rows.append(
+                {
+                    "index": index,
+                    "url": normalized_url,
+                    "text": str(row.get("text") or "").strip(),
+                    "line": int(row.get("line") or 0),
+                }
+            )
+        if normalized_rows:
+            normalized_rows.sort(key=lambda row: (int(row.get("index") or 0), int(row.get("line") or 0)))
+            return normalized_rows
+
+    text = _context_value_text(item.data.get("text") or item.data.get("snippet"))
+    return _extract_context_link_rows(text)
+
+
+def _remember_context_item_ref_targets(
+    runtime_state: "_SessionRuntimeState | None",
+    item: "_ContextItem | None",
+) -> None:
+    if runtime_state is None or item is None:
+        return
+
+    remembered: dict[str, str] = {}
+    item_url = _normalize_state_url(str(item.data.get("url") or "").strip()) or str(item.data.get("url") or "").strip()
+    if item_url:
+        remembered[str(item.item_id)] = item_url
+
+    for row in _context_item_link_rows(item):
+        try:
+            index = int(row.get("index") or 0)
+        except Exception:
+            index = 0
+        raw_url = str(row.get("url") or "").strip()
+        normalized_url = _normalize_state_url(raw_url) or raw_url
+        if index <= 0 or not normalized_url:
+            continue
+        remembered[f"{item.item_id}:{index}"] = normalized_url
+
+    if not remembered:
+        return
+    with runtime_state.lock:
+        runtime_state.ref_targets.update(remembered)
 
 
 def _looks_like_sample_noise_line(text: str, *, line_no: int = 0, total_lines: int = 0) -> bool:
@@ -1445,6 +1766,183 @@ def _append_page_memory_items(
     return created_ids
 
 
+def _set_active_page_item(
+    state: _PhaseRuntimeState,
+    payload: dict[str, Any],
+    *,
+    round_no: int,
+    call_id: str = "",
+) -> int:
+    raw_lines = [str(line or "") for line in payload.get("_raw_lines", [])] if isinstance(payload.get("_raw_lines"), list) else []
+    item = _add_context_item(
+        state,
+        "page.active",
+        {
+            "title": str(payload.get("title") or "").strip(),
+            "url": str(payload.get("url") or "").strip(),
+            "round": round_no,
+            "call_id": call_id,
+            "raw_lines": raw_lines,
+            "from_cache": bool(payload.get("from_cache")),
+        },
+    )
+    markdown, link_rows, total_lines, total_chars = _render_active_page_markdown(
+        page_item_id=item.item_id,
+        url=str(payload.get("url") or "").strip(),
+        title=str(payload.get("title") or "").strip(),
+        raw_lines=raw_lines,
+        from_cache=bool(payload.get("from_cache")),
+    )
+    item.data["markdown"] = markdown
+    item.data["links"] = link_rows
+    item.data["count"] = int(payload.get("count") or 0)
+    item.data["total_lines"] = total_lines
+    item.data["total_chars"] = total_chars
+    state.active_page_ids.append(int(item.item_id))
+    return item.item_id
+
+
+def _build_active_page_message(state: _PhaseRuntimeState) -> str:
+    items = _active_page_items(state)
+    if not items:
+        return ""
+    return "\n\n".join(
+        str(item.data.get("markdown") or "").strip()
+        for item in items
+        if str(item.data.get("markdown") or "").strip()
+    ).strip()
+
+
+_LINE_REF_RE = re.compile(r"^L?(?P<start>\d+)(?:\s*-\s*L?(?P<end>\d+))?$", re.IGNORECASE)
+
+
+def _parse_keep_specs(value: Any) -> list[tuple[int, int]]:
+    parts: list[str] = []
+    if isinstance(value, str):
+        parts.extend(segment.strip() for segment in value.split(","))
+    elif isinstance(value, list):
+        for item in value:
+            text = str(item or "").strip()
+            if not text:
+                continue
+            parts.extend(segment.strip() for segment in text.split(","))
+
+    ranges: list[tuple[int, int]] = []
+    for part in parts:
+        if not part:
+            continue
+        match = _LINE_REF_RE.fullmatch(part)
+        if match is None:
+            continue
+        start = int(match.group("start"))
+        end = int(match.group("end") or start)
+        if end < start:
+            start, end = end, start
+        ranges.append((start, end))
+    return ranges
+
+
+def _keep_and_clear_active_page(
+    *,
+    args: dict[str, Any],
+    state: _PhaseRuntimeState,
+    round_no: int,
+) -> tuple[dict[str, Any], list[int]]:
+    ref = _normalize_context_ref(str(args.get("ref") or "").strip())
+    item_id, link_index = _parse_context_ref(ref)
+    item = _find_context_item(state, int(item_id)) if ref and item_id >= 0 and link_index is None else None
+    if item is not None and str(item.item_type or "").strip() != "page.active":
+        item = None
+    if item is not None and int(item.item_id) not in {int(page_id) for page_id in state.active_page_ids}:
+        item = None
+    if item is None:
+        payload = {
+            "ok": False,
+            "error": "no matching active page for keep",
+            "count": 0,
+            "_model_markdown": "# Keep\n\nNo matching active page for keep.",
+        }
+        return payload, []
+
+    keep_ranges = _parse_keep_specs(args.get("keep"))
+    raw_lines = [str(line or "") for line in item.data.get("raw_lines", [])] if isinstance(item.data.get("raw_lines"), list) else []
+    source_url = str(item.data.get("url") or "").strip()
+    title = str(item.data.get("title") or "").strip()
+    created_ids: list[int] = []
+    matches: list[dict[str, Any]] = []
+    if keep_ranges and raw_lines:
+        for start, end in keep_ranges:
+            for line_no in range(max(1, start), min(len(raw_lines), end) + 1):
+                text = str(raw_lines[line_no - 1] or "").rstrip()
+                if not text.strip():
+                    continue
+                matches.append({"line": line_no, "text": text})
+        grouped = _group_page_matches(matches)
+        for source_lines, text in grouped:
+            memory_item = _add_context_item(
+                state,
+                "memory.page",
+                {
+                    "title": title,
+                    "url": source_url,
+                    "window": source_lines,
+                    "text": text,
+                    "links": _extract_context_link_rows(text),
+                    "round": round_no,
+                    "call_id": str(args.get("_call_id") or "").strip(),
+                },
+            )
+            created_ids.append(memory_item.item_id)
+    state.items = [entry for entry in state.items if int(entry.item_id) != int(item.item_id)]
+    state.active_page_ids = [page_id for page_id in state.active_page_ids if int(page_id) != int(item.item_id)]
+    payload = {
+        "ok": True,
+        "ref": str(item.item_id),
+        "url": source_url,
+        "title": title,
+        "count": len(created_ids),
+        "_created_ids": created_ids,
+        "_model_markdown": (
+            f"# Keep [{item.item_id}]\n\n"
+            + (f"Kept {len(created_ids)} compact evidence block(s)." if created_ids else "Cleared active page without keeping lines.")
+        ),
+    }
+    return payload, created_ids
+
+
+def _replace_active_pages(
+    *,
+    args: dict[str, Any],
+    state: _PhaseRuntimeState,
+    round_no: int,
+) -> tuple[list[int], list[int]]:
+    active_items = list(_active_page_items(state))
+    if not active_items:
+        return [], []
+
+    replace_args: dict[str, Any] = {}
+    normalized_keep = _normalize_keep_argument(args.get("keep"))
+    if normalized_keep is not None:
+        replace_args["keep"] = normalized_keep
+    call_id = str(args.get("_call_id") or "").strip()
+    if call_id:
+        replace_args["_call_id"] = call_id
+
+    replaced_ids: list[int] = []
+    created_ids: list[int] = []
+    for item in active_items:
+        payload, new_ids = _keep_and_clear_active_page(
+            args={**replace_args, "ref": str(item.item_id)},
+            state=state,
+            round_no=round_no,
+        )
+        if not payload.get("ok"):
+            continue
+        replaced_ids.append(int(item.item_id))
+        created_ids.extend(int(item_id) for item_id in new_ids)
+    return replaced_ids, created_ids
+
+
 def _build_latest_raw_message(state: "_PhaseRuntimeState") -> str:
     return _build_context_items_message(
         heading=LATEST_RAW_HEADING,
@@ -1453,12 +1951,31 @@ def _build_latest_raw_message(state: "_PhaseRuntimeState") -> str:
     )
 
 
-def _build_round_brief_message(state: "_PhaseRuntimeState") -> str:
+def _late_round_warning_message(*, round_i: int) -> str:
+    if int(round_i) >= 15:
+        return LATE_ROUND_FINAL_REPLY_PROMPT
+    return ""
+
+
+def _build_round_brief_message(
+    state: "_PhaseRuntimeState",
+    *,
+    round_i: int,
+    user_message: str = "",
+    has_prior_turns_summary: bool = False,
+) -> str:
     prompts: list[str] = []
-    if state.disclosure_step <= 0:
-        prompts.append(FIRST_SEARCH_PROMPT.strip())
+    if state.disclosure_step <= 0 and not has_prior_turns_summary:
+        prompts.append(FIRST_SEARCH_PROMPT.format(user_message=user_message).strip())
     elif state.disclosure_step == 1 and not state.disclosure_refine_consumed:
         prompts.append(POST_SEARCH_PROMPT.strip())
+    active_items = _active_page_items(state)
+    if active_items:
+        active_ids = ", ".join(str(item.item_id) for item in active_items)
+        prompts.append(ACTIVE_PAGE_STATE_PROMPT.format(count=len(active_items), ids=active_ids))
+    late_round_warning = _late_round_warning_message(round_i=round_i)
+    if late_round_warning:
+        prompts.append(late_round_warning)
     return "\n\n".join(part for part in prompts if str(part).strip()).strip()
 
 
@@ -1467,9 +1984,13 @@ def _build_loop_system_prompt(
     user_message: str = "",
     *,
     disclosure_step: int = 0,
+    round_i: int = 0,
 ) -> str:
     del disclosure_step
     custom = str(cfg.get("system_prompt") or "").strip()
+    late_round_warning = _late_round_warning_message(round_i=round_i)
+    if late_round_warning:
+        custom = f"{custom}\n{late_round_warning}".strip() if custom else late_round_warning
     name = str(cfg.get("name") or DEFAULT_NAME).strip()
     return BASE_SYSTEM_PROMPT.format(
         name=name,
@@ -1486,8 +2007,10 @@ def _build_loop_messages(
     prompt_text: str,
     history: list[dict[str, Any]],
     state: _PhaseRuntimeState,
+    round_i: int,
     context: Any = None,
 ) -> list[dict[str, Any]]:
+    has_prior_turns_summary = _context_has_prior_turns_summary(context)
     msgs: list[dict[str, Any]] = [
         {
             "role": "system",
@@ -1495,6 +2018,7 @@ def _build_loop_messages(
                 cfg,
                 prompt_text,
                 disclosure_step=state.disclosure_step,
+                round_i=round_i,
             ),
         }
     ]
@@ -1509,7 +2033,12 @@ def _build_loop_messages(
         if not _message_content_text(content):
             continue
         msgs.append({"role": role, "content": deepcopy(content)})
-    round_brief = _build_round_brief_message(state)
+    round_brief = _build_round_brief_message(
+        state,
+        round_i=round_i,
+        user_message=prompt_text,
+        has_prior_turns_summary=has_prior_turns_summary,
+    )
     if round_brief:
         msgs.append({"role": "user", "content": round_brief})
         if state.disclosure_step == 1:
@@ -1517,6 +2046,9 @@ def _build_loop_messages(
     latest_raw_message = _build_latest_raw_message(state)
     if latest_raw_message:
         msgs.append({"role": "user", "content": latest_raw_message})
+    active_page_message = _build_active_page_message(state)
+    if active_page_message:
+        msgs.append({"role": "user", "content": active_page_message})
     if state.pending_user_note:
         msgs.append({"role": "user", "content": state.pending_user_note})
     return msgs
@@ -1772,8 +2304,8 @@ def _resolve_max_rounds(cfg: dict[str, Any]) -> int:
     try:
         value = int(str(cfg.get("max_rounds") or "").strip())
     except Exception:
-        value = 15
-    return max(2, min(value or 15, 32))
+        value = 20
+    return max(2, min(value or 20, 32))
 
 
 def _resolve_external_tool_timeout_s(cfg: dict[str, Any]) -> float:
@@ -1901,6 +2433,7 @@ class _SessionRuntimeState:
     search_history_normalized: list[str] = field(default_factory=list)
     search_results_deduped: list[dict[str, Any]] = field(default_factory=list)
     visited_page_urls: set[str] = field(default_factory=set)
+    ref_targets: dict[str, str] = field(default_factory=dict)
     page_cache: dict[str, dict[str, Any]] = field(default_factory=dict)
     lock: Any = field(default_factory=threading.RLock, repr=False)
 
@@ -1918,6 +2451,7 @@ class _PhaseRuntimeState:
     next_item_id: int = 0
     latest_raw_ids: list[int] = field(default_factory=list)
     latest_raw_round: int = 0
+    active_page_ids: list[int] = field(default_factory=list)
     pending_user_note: str = ""
     input_has_images: bool = False
     disclosure_step: int = 0
@@ -1998,6 +2532,25 @@ def _find_context_item(state: _PhaseRuntimeState, item_id: int) -> _ContextItem 
     return None
 
 
+def _active_page_items(state: _PhaseRuntimeState) -> list[_ContextItem]:
+    items: list[_ContextItem] = []
+    alive_ids: list[int] = []
+    for raw_item_id in list(state.active_page_ids):
+        item = _find_context_item(state, int(raw_item_id))
+        if item is None or str(item.item_type or "").strip() != "page.active":
+            continue
+        alive_ids.append(int(item.item_id))
+        items.append(item)
+    if alive_ids != state.active_page_ids:
+        state.active_page_ids = alive_ids
+    return items
+
+
+def _current_active_page_item(state: _PhaseRuntimeState) -> _ContextItem | None:
+    items = _active_page_items(state)
+    return items[-1] if items else None
+
+
 def _iter_context_items(
     state: _PhaseRuntimeState,
     prefix: str = "",
@@ -2056,7 +2609,8 @@ def _append_context_item_lines(
 ) -> None:
     data = dict(item.data)
     lines.append(f"[{item.item_id}] {_context_item_label(item)}")
-    for key in ("query", "question", "title", "url", "search"):
+    visible_keys = ("query", "question", "title", "url", "search")
+    for key in visible_keys:
         value = _context_value_text(data.get(key))
         if value:
             lines.append(f"{key}: {value}")
@@ -2152,23 +2706,56 @@ def _merge_search_results(
     return ordered
 
 
-def _search_history_contains(state: "_SessionRuntimeState | None", query: str) -> bool:
-    normalized = _normalize_search_query(query)
+def _search_history_contains(
+    state: "_SessionRuntimeState | None",
+    query: str,
+    *,
+    filters: dict[str, Any] | None = None,
+) -> bool:
+    normalized = normalize_search_request_key(query, filters)
     if not normalized or state is None:
         return False
     with state.lock:
         if normalized in state.search_history_normalized:
             return True
-        state.search_history_raw.append(str(query or "").strip())
+        state.search_history_raw.append(_format_search_request_label(query, filters))
         state.search_history_normalized.append(normalized)
         state.search_history_raw[:] = state.search_history_raw[-96:]
         state.search_history_normalized[:] = state.search_history_normalized[-96:]
     return False
 
 
+def _search_results_for_request(
+    runtime_state: "_SessionRuntimeState | None",
+    *,
+    query: str,
+    filters: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    if runtime_state is None:
+        return []
+    search_label = _format_search_request_label(query, filters)
+    if not search_label:
+        return []
+    with runtime_state.lock:
+        rows = runtime_state.search_results_deduped[:]
+    selected: list[dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        matched_queries = [
+            str(item or "").strip()
+            for item in row.get("matched_queries", [])
+            if str(item or "").strip()
+        ]
+        if search_label in matched_queries:
+            selected.append(dict(row))
+    return _public_search_results(selected)
+
+
 def _build_search_payload_markdown(
     *,
     query: str,
+    search_filters: dict[str, Any] | None = None,
     public_results: list[dict[str, Any]],
     skipped_duplicate: bool,
     direction_brief: str = "",
@@ -2177,135 +2764,21 @@ def _build_search_payload_markdown(
     summary_text: str = "",
     error: str = "",
 ) -> str:
-    reminder = "- `web_search` 摘要与 `page_extract` 具有同等可信度, 若需阅读摘要中不存在的内容,才使用 `page_extract` 工具."
-
-    def _finalize(lines: list[str]) -> str:
-        if lines and str(lines[-1]).strip():
-            lines.append("")
-        lines.append(reminder)
-        return "\n".join(lines).strip()
-
-    lines = [
-        f"# Search: {query}",
-        "",
-    ]
-    clean_direction = str(direction_brief or "").strip()
-    clean_queries = [str(item or "").strip() for item in expanded_queries or [] if str(item or "").strip()]
-    clean_duplicates = [str(item or "").strip() for item in duplicate_queries or [] if str(item or "").strip()]
-    clean_summary = str(summary_text or "").strip()
-
-    if clean_direction:
-        lines.extend(["## Direction", clean_direction, ""])
-    if clean_queries:
-        lines.extend(["## Executed Queries", ", ".join(clean_queries), ""])
-    if clean_duplicates:
-        lines.extend(["## Skipped Duplicate Queries", ", ".join(clean_duplicates), ""])
-    if clean_summary:
-        lines.extend(["## Search Summary", clean_summary, ""])
-
-    if skipped_duplicate and not public_results and not error:
-        lines.append(DUPLICATE_QUERY_SKIPPED_TEXT)
-        return _finalize(lines)
-    if error:
-        lines.append(error)
-        return _finalize(lines)
-    if not public_results:
-        lines.append(DEFAULT_NO_RESULTS_TEXT)
-        return _finalize(lines)
-    if clean_direction or clean_queries or clean_duplicates or clean_summary:
-        lines.extend(["## Results", ""])
-    for index, item in enumerate(public_results, start=1):
-        title = str(item.get("title") or DEFAULT_NO_TITLE_TEXT).strip() or DEFAULT_NO_TITLE_TEXT
-        url = str(item.get("url") or "").strip()
-        snippet = _truncate_text(item.get("snippet") or "", 180)
-        matched_queries = [
-            str(matched or "").strip()
-            for matched in item.get("matched_queries", [])
-            if str(matched or "").strip()
-        ]
-        if url:
-            lines.append(f"{index}. [{title}]({url})")
-        else:
-            lines.append(f"{index}. {title}")
-        if matched_queries:
-            lines.append(f"   Matched queries: {' | '.join(matched_queries)}")
-        if snippet:
-            lines.append(f"   {snippet}")
-        lines.append("")
-    return _finalize(lines)
-
-
-def _run_direct_web_search(
-    *,
-    query: str,
-    cfg: dict[str, Any],
-    stats: Stats | None = None,
-    log_id: str | None = None,
-    runtime_state: "_SessionRuntimeState | None",
-    progress_callback: Any | None = None,
-) -> dict[str, Any]:
-    query_text = str(query or "").strip()
-    if not query_text:
-        return {"ok": False, "error": "search query is empty", "query": ""}
-
-    skipped_duplicate = _search_history_contains(runtime_state, query_text)
-    if skipped_duplicate:
-        return {
-            "ok": False,
-            "provider": _tool_provider_from_config("web_search", cfg),
-            "query": query_text,
-            "count": 0,
-            "results": [],
-            "skipped_duplicate": True,
-            "error": "duplicate query skipped in this session",
-            "_model_markdown": _build_search_payload_markdown(
-                query=query_text,
-                public_results=[],
-                skipped_duplicate=True,
-            ),
-        }
-
-    del stats, log_id
-    payload = _web_search(
-        query_text,
-        config=cfg,
-        progress_callback=progress_callback,
+    return build_search_document_markdown(
+        query=query,
+        search_filters=search_filters,
+        public_results=public_results,
+        skipped_duplicate=skipped_duplicate,
+        reminder=SEARCH_RESULT_REMINDER,
+        error=error,
+        direction_brief=direction_brief,
+        expanded_queries=expanded_queries,
+        duplicate_queries=duplicate_queries,
+        summary_text=summary_text,
+        default_no_results_text=DEFAULT_NO_RESULTS_TEXT,
+        duplicate_query_skipped_text=DUPLICATE_QUERY_SKIPPED_TEXT,
+        default_no_title_text=DEFAULT_NO_TITLE_TEXT,
     )
-    if not isinstance(payload, dict):
-        payload = {"ok": False, "error": "invalid search payload", "results": []}
-
-    rows = payload.get("results")
-    deduped_rows = _merge_search_results([], rows if isinstance(rows, list) else [], query=query_text)
-    public_results = _public_search_results(deduped_rows)
-    if runtime_state is not None and public_results:
-        with runtime_state.lock:
-            runtime_state.search_results_deduped = _merge_search_results(
-                runtime_state.search_results_deduped,
-                public_results,
-                query=query_text,
-            )
-
-    error = str(payload.get("error") or "").strip()
-    result = {
-        "ok": bool(payload.get("ok", True)),
-        "provider": _tool_provider_from_payload(payload) or _tool_provider_from_config("web_search", cfg),
-        "query": query_text,
-        "count": len(public_results),
-        "results": public_results,
-        "skipped_duplicate": False,
-        "_model_markdown": _build_search_payload_markdown(
-            query=query_text,
-            public_results=public_results,
-            skipped_duplicate=False,
-            error=error if not payload.get("ok", True) else "",
-        ),
-    }
-    meta = _tool_meta(payload)
-    if meta:
-        result["_meta"] = meta
-    if error and not result["ok"]:
-        result["error"] = error
-    return result
 
 
 def _normalize_page_window(value: Any, default: int = 20) -> int | str:
@@ -2722,6 +3195,96 @@ def _extract_page_line_range(
     return matched
 
 
+def _rewrite_open_page_line(
+    text: str,
+    *,
+    page_item_id: int,
+    next_link_index: int,
+) -> tuple[str, list[dict[str, Any]], int]:
+    value = str(text or "").rstrip()
+    links: list[dict[str, Any]] = []
+    current_index = max(1, int(next_link_index))
+
+    def _img_link_repl(match: re.Match[str]) -> str:
+        nonlocal current_index
+        alt = re.sub(r"\s+", " ", str(match.group(1) or "").strip()) or "image"
+        url = str(match.group(2) or "").strip()
+        ref = f"{page_item_id}:{current_index}"
+        links.append({"index": current_index, "url": url, "text": f"IMG:{alt}"})
+        current_index += 1
+        return f"IMG:{alt} [{ref}]"
+
+    def _img_repl(match: re.Match[str]) -> str:
+        alt = re.sub(r"\s+", " ", str(match.group(1) or "").strip()) or "image"
+        return f"IMG:{alt}"
+
+    def _link_repl(match: re.Match[str]) -> str:
+        nonlocal current_index
+        label = re.sub(r"\s+", " ", str(match.group(1) or "").strip())
+        url = str(match.group(2) or "").strip()
+        rendered = label or "link"
+        ref = f"{page_item_id}:{current_index}"
+        links.append({"index": current_index, "url": url, "text": rendered})
+        current_index += 1
+        return f"{rendered} [{ref}]"
+
+    value = re.sub(r"\[!\[([^\]]*)\]\([^)]+\)\]\(([^)]+)\)", _img_link_repl, value)
+    value = re.sub(r"!\[([^\]]*)\]\([^)]+\)", _img_repl, value)
+    value = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", _link_repl, value)
+    value = re.sub(r"<https?://[^>]+>", "", value)
+    value = re.sub(r"\s+", " ", value).strip()
+    return value, links, current_index
+
+
+def _render_active_page_markdown(
+    *,
+    page_item_id: int,
+    url: str,
+    title: str,
+    raw_lines: list[str],
+    from_cache: bool,
+) -> tuple[str, list[dict[str, Any]], int, int]:
+    total_lines = len(raw_lines)
+    total_chars = len("\n".join(raw_lines))
+    width = max(2, len(str(max(total_lines, 1))))
+    lines = [f"# Page [{page_item_id}]", ""]
+    if title:
+        lines.append(f"{PAGE_MARKDOWN_TITLE_PREFIX}{title}")
+    if url:
+        lines.append(f"Source: {url}")
+    lines.append(f"Ref usage: use `navigate(ref=\"{page_item_id}:2\")` to follow page [{page_item_id}] link #2.")
+    lines.append(
+        f"{PAGE_MARKDOWN_CACHE_PREFIX}{PAGE_MARKDOWN_CACHE_HIT_TEXT if from_cache else PAGE_MARKDOWN_CACHE_MISS_TEXT}"
+    )
+    lines.append(f"Preview: chars={total_chars} lines={total_lines} opened=all")
+    lines.extend(["", PAGE_MARKDOWN_MATCHED_LINES_TEXT])
+
+    link_index = 1
+    link_rows: list[dict[str, Any]] = []
+    for line_no, raw_line in enumerate(raw_lines, start=1):
+        clean = str(raw_line or "").rstrip()
+        if not clean.strip():
+            continue
+        rewritten, discovered, link_index = _rewrite_open_page_line(
+            clean,
+            page_item_id=page_item_id,
+            next_link_index=link_index,
+        )
+        if not rewritten:
+            continue
+        for row in discovered:
+            link_rows.append(
+                {
+                    "index": int(row.get("index") or 0),
+                    "url": str(row.get("url") or "").strip(),
+                    "text": str(row.get("text") or "").strip(),
+                    "line": line_no,
+                }
+            )
+        lines.append(f"L{line_no:0{width}d} | {rewritten}")
+    return "\n".join(lines).strip(), link_rows, total_lines, total_chars
+
+
 def _build_page_probe_markdown(
     *,
     url: str,
@@ -2881,6 +3444,212 @@ def _run_page_probe(
     return payload
 
 
+def _navigate_url(
+    *,
+    url: str,
+    cfg: dict[str, Any],
+    runtime_state: "_SessionRuntimeState | None",
+    progress_callback: Any | None = None,
+) -> dict[str, Any]:
+    source_url = str(url or "").strip()
+    if not source_url:
+        return {"ok": False, "error": "navigate url is empty", "url": ""}
+
+    normalized_url = _normalize_state_url(source_url) or source_url
+    if runtime_state is not None and normalized_url:
+        with runtime_state.lock:
+            runtime_state.visited_page_urls.add(normalized_url)
+
+    page_payload, from_cache = _load_page_payload(
+        url=source_url,
+        cfg=cfg,
+        runtime_state=runtime_state,
+        progress_callback=progress_callback,
+    )
+    title = str(page_payload.get("title") or "").strip()
+    content = str(page_payload.get("content") or "").strip()
+    page_error = str(page_payload.get("error") or "").strip()
+    raw_lines = str(content or "").splitlines()
+    count = sum(1 for line in raw_lines if str(line or "").strip())
+    payload = {
+        "ok": bool(page_payload.get("ok")) and not page_error and bool(count),
+        "provider": str(page_payload.get("provider") or _tool_provider_from_config("navigate", cfg)).strip(),
+        "url": str(page_payload.get("url") or normalized_url).strip(),
+        "title": title,
+        "count": count,
+        "total_lines": len(raw_lines),
+        "total_chars": len(content),
+        "from_cache": from_cache,
+        "page_error": page_error,
+        "error": page_error,
+        "_raw_lines": raw_lines,
+    }
+    if page_error:
+        payload["_model_markdown"] = _build_page_probe_markdown(
+            url=str(page_payload.get("url") or normalized_url).strip(),
+            title=title,
+            scope="",
+            matches=[],
+            page_error=page_error,
+            from_cache=from_cache,
+        )
+    meta = _tool_meta(page_payload)
+    if meta:
+        payload["_meta"] = meta
+    return payload
+
+
+def _run_navigate(
+    *,
+    url: str,
+    ref: str = "",
+    search: str = "",
+    search_filters: dict[str, Any] | None = None,
+    cfg: dict[str, Any],
+    runtime_state: "_SessionRuntimeState | None",
+    progress_callback: Any | None = None,
+) -> dict[str, Any]:
+    search_text = str(search or "").strip()
+    ref_text = _normalize_context_ref(str(ref or "").strip())
+    normalized_search_filters = _coerce_search_filters(search_filters)
+    if search_text:
+        search_label = _format_search_request_label(search_text, normalized_search_filters)
+        cached_results = _search_results_for_request(
+            runtime_state,
+            query=search_text,
+            filters=normalized_search_filters,
+        )
+        provider = ""
+        meta: dict[str, Any] = {}
+        page_error = ""
+        from_cache = bool(cached_results)
+        public_results = cached_results
+        if not public_results:
+            _search_history_contains(runtime_state, search_text, filters=normalized_search_filters)
+            search_payload = _search_backend(
+                search_text,
+                kl=normalized_search_filters.get("kl", ""),
+                df=normalized_search_filters.get("df", ""),
+                t=normalized_search_filters.get("t", ""),
+                ia=normalized_search_filters.get("ia", ""),
+                config=cfg,
+                progress_callback=progress_callback,
+            )
+            if not isinstance(search_payload, dict):
+                search_payload = {"ok": False, "error": "invalid search payload", "results": []}
+            rows = search_payload.get("results")
+            deduped_rows = _merge_search_results(
+                [],
+                rows if isinstance(rows, list) else [],
+                query=search_label,
+            )
+            public_results = _public_search_results(deduped_rows)
+            if runtime_state is not None and public_results:
+                with runtime_state.lock:
+                    runtime_state.search_results_deduped = _merge_search_results(
+                        runtime_state.search_results_deduped,
+                        public_results,
+                        query=search_label,
+                    )
+            provider = _tool_provider_from_payload(search_payload) or _provider_for_capability("search", cfg)
+            meta = _tool_meta(search_payload)
+            page_error = str(search_payload.get("error") or "").strip()
+        else:
+            provider = str(public_results[0].get("provider") or _provider_for_capability("search", cfg)).strip()
+
+        raw_lines = build_search_open_lines(
+            public_results,
+            default_no_title_text=DEFAULT_NO_TITLE_TEXT,
+        )
+        filter_text = _format_search_filters(normalized_search_filters)
+        title = f"Search: {search_text}"
+        if filter_text:
+            title += f" [{filter_text}]"
+        payload = {
+            "ok": bool(raw_lines) and not page_error,
+            "provider": provider,
+            "url": "",
+            "title": title,
+            "search": search_label,
+            "filters": normalized_search_filters,
+            "results": public_results,
+            "count": len(raw_lines),
+            "total_lines": len(raw_lines),
+            "total_chars": len("\n".join(raw_lines)),
+            "page_error": page_error,
+            "error": page_error or (DEFAULT_NO_RESULTS_TEXT if not raw_lines else ""),
+            "from_cache": from_cache,
+            "_raw_lines": raw_lines,
+            "_model_markdown": _build_search_payload_markdown(
+                query=search_text,
+                search_filters=normalized_search_filters,
+                public_results=public_results,
+                skipped_duplicate=False,
+                error=page_error if page_error else (DEFAULT_NO_RESULTS_TEXT if not raw_lines else ""),
+            ),
+        }
+        if meta:
+            payload["_meta"] = meta
+        return payload
+
+    source_url = str(url or "").strip()
+    if not source_url and ref_text and runtime_state is not None:
+        with runtime_state.lock:
+            source_url = str(runtime_state.ref_targets.get(ref_text) or "").strip()
+    if not source_url:
+        return {
+            "ok": False,
+            "error": f"navigate ref `{ref_text}` could not be resolved" if ref_text else "navigate requires `url`, `ref`, or `search`",
+            "url": "",
+        }
+
+    normalized_url = _normalize_state_url(source_url) or source_url
+    if runtime_state is not None and normalized_url:
+        with runtime_state.lock:
+            runtime_state.visited_page_urls.add(normalized_url)
+
+    page_payload, from_cache = _load_page_payload(
+        url=source_url,
+        cfg=cfg,
+        runtime_state=runtime_state,
+        progress_callback=progress_callback,
+    )
+    title = str(page_payload.get("title") or "").strip()
+    content = str(page_payload.get("content") or "")
+    page_error = str(page_payload.get("error") or "").strip()
+    raw_lines = str(content or "").splitlines()
+    total_lines = len(raw_lines)
+    total_chars = len(content)
+
+    payload = {
+        "ok": bool(page_payload.get("ok")) and not page_error and bool(raw_lines),
+        "provider": str(page_payload.get("provider") or _tool_provider_from_config("navigate", cfg)).strip(),
+        "url": str(page_payload.get("url") or normalized_url).strip(),
+        "title": title,
+        "count": sum(1 for line in raw_lines if str(line or "").strip()),
+        "total_lines": total_lines,
+        "total_chars": total_chars,
+        "page_error": page_error,
+        "error": page_error,
+        "from_cache": from_cache,
+        "_raw_lines": raw_lines,
+    }
+    meta = _tool_meta(page_payload)
+    if meta:
+        payload["_meta"] = meta
+    if page_error and not page_payload.get("ok"):
+        payload["_model_markdown"] = _build_page_probe_markdown(
+            url=str(page_payload.get("url") or normalized_url).strip(),
+            title=title,
+            scope="opened=all",
+            matches=[],
+            preview_meta={"total_lines": total_lines, "total_chars": total_chars, "shown_lines": 0, "sample_step": 0},
+            page_error=page_error,
+            from_cache=from_cache,
+        )
+    return payload
+
+
 def _tool_timeout_payload(
     *,
     name: str,
@@ -2891,49 +3660,47 @@ def _tool_timeout_payload(
     timeout_text = _format_timeout_seconds(elapsed_s)
     provider = _tool_provider_from_config(name, cfg)
     error = f"{name} batch timed out after {timeout_text}s"
-    if name in ("web_search", "web_search_wiki"):
-        query = str(args.get("query") or "").strip()
-        return {
-            "ok": False,
-            "provider": provider,
-            "query": query,
-            "count": 0,
-            "results": [],
-            "error": error,
-            "timed_out": True,
-            "_model_markdown": _build_search_payload_markdown(
-                query=query,
-                public_results=[],
-                skipped_duplicate=False,
-                error=error,
-            ),
-        }
-    if name == "page_extract":
+    if name == "navigate":
         url = str(args.get("url") or "").strip()
-        mode = str(args.get("mode") or "sample").strip().lower() or "sample"
-        start_line = _coerce_page_extract_line_number(args.get("start_line"))
-        end_line = _coerce_page_extract_line_number(args.get("end_line"))
-        normalized_scope = "" if mode != "range" else f"lines={start_line}-{end_line}"
+        search = str(args.get("search") or "").strip()
+        if search:
+            search_filters = _coerce_search_filters(args)
+            return {
+                "ok": False,
+                "provider": _provider_for_capability("search", cfg),
+                "url": "",
+                "title": f"Search: {search}",
+                "search": _format_search_request_label(search, search_filters),
+                "filters": search_filters,
+                "count": 0,
+                "total_lines": 0,
+                "total_chars": 0,
+                "page_error": error,
+                "error": error,
+                "timed_out": True,
+                "_raw_lines": [],
+                "_model_markdown": _build_search_payload_markdown(
+                    query=search,
+                    search_filters=search_filters,
+                    public_results=[],
+                    skipped_duplicate=False,
+                    error=error,
+                ),
+            }
         return {
             "ok": False,
             "provider": provider,
             "url": url,
-            "mode": mode,
-            "sample_step": 0,
-            "start_line": start_line if mode == "range" else 0,
-            "end_line": end_line if mode == "range" else 0,
-            "search": normalized_scope,
-            "question": "",
             "title": "",
-            "_matched_lines": [],
             "count": 0,
+            "total_lines": 0,
+            "total_chars": 0,
             "page_error": error,
             "error": error,
             "timed_out": True,
             "_model_markdown": _build_page_probe_markdown(
                 url=url,
                 title="",
-                scope=normalized_scope,
                 matches=[],
                 page_error=error,
                 from_cache=False,
@@ -3271,6 +4038,8 @@ def llm_call(
     log_id=None,
     phase: str = "loop",
     disclosure_step: int | None = None,
+    log_turn: int | None = None,
+    log_title: str | None = None,
     on_status: Any | None = None,
 ):
     cfg = build_model_config(config)
@@ -3292,7 +4061,7 @@ def llm_call(
     t0 = time.perf_counter()
     if should_use_codex_mirror_transport(cfg):
         def _invoke() -> Any:
-            resp = codex_transport_model_response(
+            return codex_transport_model_response(
                 codex_transport_stream_response(
                     cfg=cfg,
                     messages=messages,
@@ -3339,12 +4108,15 @@ def llm_call(
     choices = getattr(resp, "choices", None) or []
     msg = choices[0].message if choices else None
     output_text = _text(msg) if msg else ""
-    native_calls = _parse_native_tool_calls(_to_dict(msg) if msg is not None else {})
+    raw_tool_calls = _extract_raw_tool_calls(_to_dict(msg) if msg is not None else {})
 
     # 写日志
     log_model_call(
         label=trace_label, model=model, messages=messages,
         output=output_text,
+        tool_calls=raw_tool_calls,
+        turn=log_turn,
+        title=log_title,
         usage=usage, cost=cost, duration_ms=duration_ms, config=cfg,
         log_id=log_id,
     )
@@ -3381,7 +4153,7 @@ def llm_text_call(
     t0 = time.perf_counter()
     if should_use_codex_mirror_transport(cfg):
         def _invoke() -> Any:
-            resp = codex_transport_model_response(
+            return codex_transport_model_response(
                 codex_transport_stream_response(
                     cfg=cfg,
                     messages=messages,
@@ -3476,7 +4248,7 @@ def llm_custom_tool_call(
     t0 = time.perf_counter()
     if should_use_codex_mirror_transport(cfg):
         def _invoke() -> Any:
-            resp = codex_transport_model_response(
+            return codex_transport_model_response(
                 codex_transport_stream_response(
                     cfg=cfg,
                     messages=messages,
@@ -3547,9 +4319,8 @@ def _text(msg) -> str:
 
 def _select_loop_calls(calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
     selected: list[dict[str, Any]] = []
-    seen_search_queries: set[str] = set()
-    seen_page_keys: set[tuple[str, str]] = set()
-    allowed_tools = {"web_search", "page_extract"}
+    seen_open_targets: set[str] = set()
+    allowed_tools = {"navigate"}
 
     for call in calls:
         if not isinstance(call, dict):
@@ -3559,42 +4330,44 @@ def _select_loop_calls(calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if name not in allowed_tools or not isinstance(args, dict):
             continue
 
-        if name == "web_search":
-            query = str(args.get("query") or "").strip()
-            normalized_query = _normalize_search_query(query)
-            if not normalized_query or normalized_query in seen_search_queries:
+        search = str(args.get("search") or "").strip()
+        ref = _normalize_context_ref(str(args.get("ref") or "").strip())
+        normalized_url = _normalize_state_url(str(args.get("url") or "").strip())
+        normalized_keep = _normalize_keep_argument(args.get("keep"))
+        target_key = ""
+        payload: dict[str, Any] = {}
+
+        if search:
+            search_filters = _coerce_search_filters(args)
+            target_key = "search::" + normalize_search_request_key(search, search_filters)
+            if not target_key or target_key in seen_open_targets:
                 continue
-            seen_search_queries.add(normalized_query)
-            selected.append({"name": "web_search", "args": {"query": query}})
-            if len(selected) >= _TOOL_LIMIT:
-                break
+            payload["search"] = search
+            payload.update(search_filters)
+        elif normalized_url:
+            target_key = "url::" + normalized_url
+            if target_key in seen_open_targets:
+                continue
+            payload["url"] = normalized_url
+            if ref:
+                payload["ref"] = ref
+        elif ref:
+            target_key = "ref::" + ref
+            if target_key in seen_open_targets:
+                continue
+            payload["ref"] = ref
+        else:
             continue
 
-        if name == "page_extract":
-            normalized_url = _normalize_state_url(str(args.get("url") or "").strip())
-            mode = str(args.get("mode") or "sample").strip().lower() or "sample"
-            if mode == "range":
-                page_key = (
-                    normalized_url,
-                    f"range:{_coerce_page_extract_line_number(args.get('start_line'))}:{_coerce_page_extract_line_number(args.get('end_line'))}",
-                )
-            else:
-                page_key = (normalized_url, "sample")
-            if not normalized_url or page_key in seen_page_keys:
-                continue
-            seen_page_keys.add(page_key)
-            payload = {
-                "url": normalized_url,
-                "mode": mode,
-            }
-            if mode == "range":
-                payload["start_line"] = _coerce_page_extract_line_number(args.get("start_line"))
-                payload["end_line"] = _coerce_page_extract_line_number(args.get("end_line"))
-            if str(args.get("_call_id") or "").strip():
-                payload["_call_id"] = str(args.get("_call_id") or "").strip()
-            selected.append({"name": "page_extract", "args": payload})
-            if len(selected) >= _TOOL_LIMIT:
-                break
+        if normalized_keep is not None:
+            payload["keep"] = normalized_keep
+
+        seen_open_targets.add(target_key)
+        if str(args.get("_call_id") or "").strip():
+            payload["_call_id"] = str(args.get("_call_id") or "").strip()
+        selected.append({"name": "navigate", "args": payload})
+        if len(selected) >= _TOOL_LIMIT:
+            break
 
     return selected
 
@@ -3763,23 +4536,28 @@ def _execute_loop_calls(
             args = original_call.get("args") if isinstance(original_call.get("args"), dict) else {}
             if not isinstance(args, dict):
                 args = {}
-            if name == "web_search":
-                created_ids = _append_search_memory_items(
-                    original_call,
-                    payload,
-                    context_state,
+            if name == "navigate" and payload.get("ok"):
+                replaced_ids, created_ids = _replace_active_pages(
+                    args=args,
+                    state=context_state,
                     round_no=round_i + 1,
                 )
-                batch_created_ids.extend(created_ids)
-            elif name == "page_extract":
-                created_ids = _append_page_memory_items(
-                    original_call,
-                    payload,
+                if replaced_ids:
+                    payload["_replaced_ids"] = replaced_ids
+                    payload["_replaced_count"] = len(replaced_ids)
+                if created_ids:
+                    payload["_created_ids"] = created_ids
+                    payload["_created_count"] = len(created_ids)
+                    batch_created_ids.extend(created_ids)
+                    for created_id in created_ids:
+                        _remember_context_item_ref_targets(runtime_state, _find_context_item(context_state, int(created_id)))
+                active_page_id = _set_active_page_item(
                     context_state,
+                    payload,
                     round_no=round_i + 1,
-                    question_text=prompt_text,
+                    call_id=str(args.get("_call_id") or "").strip(),
                 )
-                batch_created_ids.extend(created_ids)
+                _remember_context_item_ref_targets(runtime_state, _find_context_item(context_state, int(active_page_id)))
             _record_tool_stats(stats, payload)
             payload_map[index] = payload
             log_tool_call(
@@ -3787,6 +4565,7 @@ def _execute_loop_calls(
                 args=args,
                 payload=payload,
                 duration_ms=completed_elapsed_s * 1000.0,
+                turn=round_i + 1,
                 config=cfg,
                 log_id=log_id,
             )
@@ -3804,8 +4583,8 @@ def _execute_loop_calls(
                     )
                 except Exception:
                     pass
-        context_state.latest_raw_ids = list(batch_created_ids)
-        context_state.latest_raw_round = int(round_i + 1) if batch_created_ids else 0
+    context_state.latest_raw_ids = list(batch_created_ids)
+    context_state.latest_raw_round = int(round_i + 1) if batch_created_ids else 0
     context_state.pending_user_note = "\n\n".join(part for part in note_parts if part).strip()
     return payload_map
 
@@ -3814,7 +4593,10 @@ def _validate_progressive_tool_requirements(
     state: _PhaseRuntimeState,
     calls: list[dict[str, Any]],
 ) -> str:
+    # Intentionally disabled for now: rely on prompt-level control rather than
+    # hard rejection at the tool-validation layer.
     del state, calls
+    return ""
     return ""
 
 
@@ -3823,7 +4605,7 @@ def _advance_progressive_disclosure(
     calls: list[dict[str, Any]],
 ) -> None:
     tool_names = {str(call.get("name") or "").strip() for call in calls if isinstance(call, dict)}
-    if state.disclosure_step <= 0 and tool_names.intersection({"web_search", "page_extract"}):
+    if state.disclosure_step <= 0 and "navigate" in tool_names:
         state.disclosure_step = 1
         state.disclosure_refine_consumed = False
         state.pending_user_note = ""
@@ -3878,6 +4660,7 @@ def run(
             prompt_text=prompt_text,
             history=history,
             state=loop_state,
+            round_i=round_i,
             context=context,
         )
         loop_state.pending_user_note = ""
@@ -3890,6 +4673,8 @@ def run(
                 log_id=lid,
                 phase="loop",
                 disclosure_step=loop_state.disclosure_step,
+                log_turn=round_i + 1,
+                log_title=prompt_text,
             )
         except Exception as e:
             return _prepend_runtime_warnings(_format_model_error_message(e), warning_messages)
@@ -3909,6 +4694,12 @@ def run(
         if text:
             last = text
 
+        calls, invalid_tool_errors = _collect_loop_calls(
+            text=text,
+            message_payload=msg_payload,
+            state=loop_state,
+            round_i=round_i,
+        )
         reasoning_text, reasoning_meta = _render_reasoning_display(
             payload=msg_payload,
             usage=usage,
@@ -3918,13 +4709,6 @@ def run(
                 on_reasoning(reasoning_text, reasoning_meta)
             except Exception:
                 pass
-
-        calls, invalid_tool_errors = _collect_loop_calls(
-            text=text,
-            message_payload=msg_payload,
-            state=loop_state,
-            round_i=round_i,
-        )
         assistant_content = _normalize_tool_turn_message(text, calls) if calls else _clean_model_text(text)
         invalid_tool_message = _format_invalid_tool_call_message(invalid_tool_errors)
         if invalid_tool_message:
@@ -4023,6 +4807,7 @@ def run_stream(
             prompt_text=prompt_text,
             history=history,
             state=loop_state,
+            round_i=round_i,
             context=context,
         )
         loop_state.pending_user_note = ""
@@ -4147,6 +4932,9 @@ def run_stream(
                     model=model,
                     messages=msgs,
                     output=partial,
+                    tool_calls=_extract_raw_tool_calls({"tool_calls": [stream_tool_calls[index] for index in sorted(stream_tool_calls)]}),
+                    turn=round_i + 1,
+                    title=prompt_text,
                     error=str(e)[:300],
                     duration_ms=duration_ms,
                     config=cfg,
@@ -4187,9 +4975,11 @@ def run_stream(
         if st:
             st.record(usage, cost)
 
-        native_calls = _finalize_stream_tool_calls(stream_tool_calls)
-        if not native_calls and isinstance(msg_payload, dict):
-            native_calls = _parse_native_tool_calls(msg_payload)
+        raw_tool_calls = _extract_raw_tool_calls(
+            {"tool_calls": [stream_tool_calls[index] for index in sorted(stream_tool_calls)]}
+            if stream_tool_calls
+            else msg_payload
+        )
         logged_text = effective_text
         log_output = logged_text
 
@@ -4197,6 +4987,9 @@ def run_stream(
         log_model_call(
             label=f"round {round_i + 1}", model=model, messages=msgs,
             output=log_output,
+            tool_calls=raw_tool_calls,
+            turn=round_i + 1,
+            title=prompt_text,
             usage=usage, cost=cost, duration_ms=duration_ms, config=cfg,
             log_id=lid,
         )

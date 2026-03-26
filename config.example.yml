@@ -71,18 +71,20 @@ tools:
   index:
     ddgs:
       search: core.search_ddgs:ddgs_search
+    jina_ddgs:
+      search: core.search_ddgs:jina_ddgs_search
     jina_ai:
-      search: core.search_jina_ai:jina_ai_search
       page_extract: core.search_jina_ai:jina_ai_page_extract
     md2png_lite:
       render: md2png_lite.provider:render_md2png_lite_result
   config:
-    jina_ai:
+    jina_ddgs:
       search:
         headers:
-          # Authorization: Bearer jina_xxx
-          Accept: application/json
-          X-Respond-With: no-content
+          Accept: text/plain
+          X-Engine: browser
+          X-Return-Format: markdown
+    jina_ai:
       page_extract:
         headers:
           Accept: text/plain

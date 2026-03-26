@@ -7,17 +7,11 @@ dist/
 build/
 .venv/
 node_modules/
-<<<<<<< HEAD
 __rubbish/
 env.entari/
-
-
 entari.yml
 entari.schema.json
 .python-version
 .env.local
 .entari_cli.toml
-=======
 dev.entari/
-__rubbish/
->>>>>>> 4ddbcac (chore: snapshot current worktree)

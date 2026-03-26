@@ -9,8 +9,8 @@ from loguru import logger
 
 from .config import resolve_tool_handlers
 from .render import RenderCallable, RenderResult, render_markdown_result
-from .search_ddgs import ddgs_search
-from .search_jina_ai import jina_ai_page_extract, jina_ai_search
+from .search_ddgs import ddgs_search, jina_ddgs_search
+from .search_jina_ai import jina_ai_page_extract
 
 _VALID_SEARCH_MODES = {"text"}
 _DEFAULT_SEARCH_HANDLER_TIMEOUT_S = 4.0
@@ -26,7 +26,7 @@ def _normalize_query(query: str) -> str:
 def _normalize_mode(mode: str) -> str:
     raw = str(mode or "text").strip().lower() or "text"
     if raw not in _VALID_SEARCH_MODES:
-        raise ValueError(f"unsupported mode for web_search: {mode}")
+        raise ValueError(f"unsupported search mode: {mode}")
     return raw
 
 
@@ -188,6 +188,9 @@ class WebToolSuite:
         *,
         query: str,
         kl: Optional[str],
+        df: Optional[str],
+        t: Optional[str],
+        ia: Optional[str],
         max_results: int,
         errors: list[str],
     ) -> tuple[List[Dict[str, Any]], dict[str, Any]] | None:
@@ -199,6 +202,9 @@ class WebToolSuite:
                         handler,
                         query=query,
                         kl=kl,
+                        df=df,
+                        t=t,
+                        ia=ia,
                         max_results=max_results,
                         headless=self._headless,
                         config=self._config,
@@ -243,6 +249,9 @@ class WebToolSuite:
         self,
         query: str,
         kl: Optional[str],
+        df: Optional[str],
+        t: Optional[str],
+        ia: Optional[str],
         max_results: int,
     ) -> tuple[List[Dict[str, Any]], dict[str, Any]]:
         errors: list[str] = []
@@ -250,6 +259,9 @@ class WebToolSuite:
             self._search_handlers,
             query=query,
             kl=kl,
+            df=df,
+            t=t,
+            ia=ia,
             max_results=max_results,
             errors=errors,
         )
@@ -266,6 +278,9 @@ class WebToolSuite:
                 self._emergency_search_handlers,
                 query=query,
                 kl=kl,
+                df=df,
+                t=t,
+                ia=ia,
                 max_results=max_results,
                 errors=errors,
             )
@@ -431,11 +446,14 @@ class WebToolSuite:
             "error": error_text,
         }
 
-    async def web_search(
+    async def search(
         self,
         query: str,
         mode: str = "text",
         kl: str = "",
+        df: str = "",
+        t: str = "",
+        ia: str = "",
         max_results: int = 5,
         progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
     ) -> Dict[str, Any]:
@@ -445,6 +463,9 @@ class WebToolSuite:
 
         normalized_mode = _normalize_mode(mode)
         region = str(kl or "").strip() or None
+        date_filter = str(df or "").strip() or None
+        source_tag = str(t or "").strip() or None
+        interface = str(ia or "").strip() or None
         limit = max(1, min(int(max_results), 10))
 
         self._notify_progress(
@@ -457,7 +478,14 @@ class WebToolSuite:
             },
         )
 
-        rows, meta = await self._search_text(normalized_query, region, limit)
+        rows, meta = await self._search_text(
+            normalized_query,
+            region,
+            date_filter,
+            source_tag,
+            interface,
+            limit,
+        )
         results = [
             {
                 "index": self._next_search_index(),
@@ -491,6 +519,9 @@ class WebToolSuite:
             "mode": normalized_mode,
             "filters": {
                 "kl": region,
+                "df": date_filter,
+                "t": source_tag,
+                "ia": interface,
             },
             "count": len(results),
             "results": results,
@@ -534,20 +565,26 @@ async def wait_until_ready(timeout: float | None = None) -> bool:
     return True
 
 
-async def web_search(
+async def search_web(
     query: str,
     mode: str = "text",
     kl: str = "",
+    df: str = "",
+    t: str = "",
+    ia: str = "",
     max_results: int = 5,
     progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
     config: dict[str, Any] | None = None,
     headless: bool = False,
 ) -> Dict[str, Any]:
     suite = _get_suite(headless=headless, config=config)
-    return await suite.web_search(
+    return await suite.search(
         query=query,
         mode=mode,
         kl=kl,
+        df=df,
+        t=t,
+        ia=ia,
         max_results=max_results,
         progress_callback=progress_callback,
     )
@@ -573,11 +610,11 @@ __all__ = [
     "RenderResult",
     "WebToolSuite",
     "ddgs_search",
+    "jina_ddgs_search",
     "jina_ai_page_extract",
-    "jina_ai_search",
     "on_shutdown",
     "on_startup",
     "page_extract",
+    "search_web",
     "wait_until_ready",
-    "web_search",
 ]

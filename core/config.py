@@ -39,8 +39,8 @@ models:
 language: zh-CN
 stream: true
 headless: false
-# Maximum main-loop rounds. Default is 15.
-max_rounds: 15
+# Maximum main-loop rounds. Default is 20.
+max_rounds: 20
 # Optional provider hint, for example Codex mirror accepts `fast`.
 # service_tier: fast
 # Model-call retries only. Tool providers are not retried here.
@@ -55,8 +55,9 @@ tools:
   index:
     ddgs:
       search: core.search_ddgs:ddgs_search
+    jina_ddgs:
+      search: core.search_ddgs:jina_ddgs_search
     jina_ai:
-      search: core.search_jina_ai:jina_ai_search
       page_extract: core.search_jina_ai:jina_ai_page_extract
     md2png_lite:
       render: md2png_lite.provider:render_md2png_lite_result
@@ -71,6 +72,10 @@ _TOOL_CAPABILITIES = {"search", "page_extract", "render"}
 _TOOL_PROVIDER_ALIASES = {
     "ddg": "ddgs",
     "duckduckgo": "ddgs",
+    "jina-ddgs": "jina_ddgs",
+    "jina_ddg": "jina_ddgs",
+    "jina-render": "jina_ddgs",
+    "jina_render": "jina_ddgs",
     "jina": "jina_ai",
     "jina-ai": "jina_ai",
     "jinaai": "jina_ai",
@@ -90,8 +95,10 @@ BUILTIN_TOOL_PROVIDER_INDEX: dict[str, dict[str, str]] = {
     "ddgs": {
         "search": "core.search_ddgs:ddgs_search",
     },
+    "jina_ddgs": {
+        "search": "core.search_ddgs:jina_ddgs_search",
+    },
     "jina_ai": {
-        "search": "core.search_jina_ai:jina_ai_search",
         "page_extract": "core.search_jina_ai:jina_ai_page_extract",
     },
     "md2png_lite": {

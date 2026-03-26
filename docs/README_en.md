@@ -28,7 +28,7 @@ HYW lets the model decide **what to search, how many rounds, and how to cross-va
 - **XML tag tool calling** — No function calling dependency; works with any LLM provider
 - **Streaming output** — Think and display in real-time; search progress visible as it happens
 - **Capability-based tool registry** — `search / page_extract / render` are selected by capability instead of hard-coded branches
-- **Built-in websearch service** — Ships with `ddgs`, Jina AI search/page extraction, and non-browser Markdown render
+- **Built-in retrieval runtime** — Ships with `ddgs`, optional `jina_ddgs` search rendering, Jina AI page extraction, and non-browser Markdown render
 - **Rich terminal UI** — Gradient titles, Markdown rendering, live spinners
 - **Multi-turn conversation** — Context auto-carried; toggle mode with arrow keys
 - **Any model via LiteLLM** — OpenAI / Anthropic / Google / OpenRouter / local models
@@ -197,7 +197,7 @@ core/
 ├── __main__.py             # python -m core entry point
 ├── search_ddgs.py          # DDGS search provider
 ├── search_jina_ai.py       # Jina AI search + page extract provider
-├── web_search.py           # WebToolSuite + service runtime
+├── web_runtime.py          # WebToolSuite + retrieval runtime
 └── render.py               # md2png-lite render dispatch
 ```
 

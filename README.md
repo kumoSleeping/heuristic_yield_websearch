@@ -28,7 +28,7 @@ HYW lets the model decide **what to search, how many rounds, and how to cross-va
 - **XML tag tool calling** — No function calling dependency; works with any LLM provider
 - **Streaming output** — Think and display in real-time; search progress visible as it happens
 - **Pluggable tool backends** — Search / page extract / render are selected by capability, not hard-coded per module
-- **Built-in websearch service** — Ships with `ddgs`, Jina AI search/page extraction, and non-browser Markdown render
+- **Built-in retrieval runtime** — Ships with `ddgs`, optional `jina_ddgs` search rendering, Jina AI page extraction, and non-browser Markdown render
 - **Rich terminal UI** — Gradient titles, Markdown rendering, live spinners
 - **Multi-turn conversation** — Context auto-carried; toggle mode with arrow keys
 - **Any model via LiteLLM** — OpenAI / Anthropic / Google / OpenRouter / local models
@@ -125,12 +125,19 @@ tools:
   index:
     ddgs:
       search: core.search_ddgs:ddgs_search
+    jina_ddgs:
+      search: core.search_ddgs:jina_ddgs_search
     jina_ai:
-      search: core.search_jina_ai:jina_ai_search
       page_extract: core.search_jina_ai:jina_ai_page_extract
     md2png_lite:
       render: md2png_lite.provider:render_md2png_lite_result
   config:
+    jina_ddgs:
+      search:
+        headers:
+          Accept: text/plain
+          X-Engine: browser
+          X-Return-Format: markdown
     jina_ai:
       page_extract:
         headers:
@@ -212,9 +219,9 @@ core/
 ├── main.py                 # Conversation loop, tool calls, LLM interaction
 ├── cli.py                  # Rich terminal UI, streaming output
 ├── __main__.py             # python -m core entry point
-├── search_ddgs.py          # DDGS search provider
-├── search_jina_ai.py       # Jina AI search + page extract provider
-├── web_search.py           # WebToolSuite + service runtime
+├── search_ddgs.py          # DDGS + jina_ddgs search providers
+├── search_jina_ai.py       # Jina AI page extract provider
+├── web_runtime.py          # WebToolSuite + retrieval runtime
 └── render.py               # md2png-lite render dispatch
 ```
 

@@ -5,6 +5,8 @@ import re
 from typing import Any
 from urllib.parse import urlparse
 
+from .search_document import format_search_filters
+
 
 def sanitize_tool_view_args(value: Any) -> Any:
     if isinstance(value, dict):
@@ -117,7 +119,7 @@ def _list_count(value: Any) -> int:
     return len(value) if isinstance(value, list) else 0
 
 
-def _page_extract_mode_label(payload: dict[str, Any]) -> str:
+def _navigate_mode_label(payload: dict[str, Any]) -> str:
     mode = str(payload.get("mode") or "").strip().lower()
     if mode == "range":
         start_line = _numeric_value(payload.get("start_line"))
@@ -130,27 +132,27 @@ def _page_extract_mode_label(payload: dict[str, Any]) -> str:
     return ""
 
 
-def _page_extract_sample_stats(payload: dict[str, Any]) -> str:
-    if str(payload.get("mode") or "").strip().lower() != "sample":
-        return ""
+def _navigate_sample_stats(payload: dict[str, Any]) -> str:
     shown = _numeric_value(payload.get("count"))
-    if shown is None:
-        shown = _list_count(payload.get("_matched_lines"))
-    total_lines = _numeric_value(payload.get("total_lines"))
-    if shown is not None and shown > 0 and total_lines is not None and total_lines > 0:
-        return f"{shown}/{total_lines} lines"
     if shown is not None and shown > 0:
         return f"{shown} lines"
-    if total_lines is not None and total_lines > 0:
-        return f"{total_lines} lines"
     return ""
 
 
-def _page_extract_title(payload: dict[str, Any], *, max_chars: int = 72) -> str:
+def _navigate_title(payload: dict[str, Any], *, max_chars: int = 72) -> str:
     title = _clean_inline_text(payload.get("title"))
     if not title:
         return ""
     return _truncate_line(title, max_chars)
+
+
+def _keep_text(value: Any) -> str:
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    if isinstance(value, list):
+        rendered = ", ".join(_clean_inline_text(item) for item in value if _clean_inline_text(item))
+        return rendered.strip()
+    return ""
 
 
 def _plan_counts(payload: dict[str, Any]) -> tuple[int, int]:
@@ -168,18 +170,21 @@ def format_tool_view_argument(name: str, arguments: Any, *, max_items: int = 12,
     if not isinstance(payload, dict):
         return ""
 
-    if name in ("web_search", "web_search_wiki"):
-        query = _clean_inline_text(payload.get("query"))
-        return f"\"{query}\"" if query else ""
-
-    if name == "page_extract":
+    if name == "navigate":
+        search = _clean_inline_text(payload.get("search"))
+        keep_text = _keep_text(payload.get("keep"))
+        if search:
+            filter_text = format_search_filters(payload)
+            target = search if not filter_text else f"{search} [{filter_text}]"
+            if keep_text:
+                target += f" keep {keep_text}"
+            return f"\"{target}\""
         host = _short_host(str(payload.get("url") or "").strip())
         ref = str(payload.get("ref") or "").strip()
-        search = _pattern_summary(payload.get("search"))
         target = host or ref
-        if target and search:
-            return f"\"{search}\" in \"{target}\""
-        return f"\"{target}\"" if target else (f"\"{search}\"" if search else "")
+        if keep_text:
+            target = f"{target} keep {keep_text}".strip() if target else f"keep {keep_text}"
+        return f"\"{target}\"" if target else ""
 
     if name == "context_delete":
         ids = payload.get("ids")
@@ -199,36 +204,35 @@ def format_tool_view_text(name: str, arguments: Any, *, max_chars: int = 160) ->
     payload = arguments if isinstance(arguments, dict) else {}
     tool_name = str(name or "").strip()
 
-    if tool_name in ("web_search", "web_search_wiki"):
-        query = _clean_inline_text(payload.get("query"))
-        line = f"Web Search \"{query}\"" if query else "Web Search"
-        count = _numeric_value(payload.get("_count"), payload.get("count"))
-        if count is not None:
-            line += f" · {count}"
-        return _truncate_line(line, max_chars)
-
-    if tool_name == "page_extract":
+    if tool_name == "navigate":
+        search = _clean_inline_text(payload.get("search"))
+        keep_text = _keep_text(payload.get("keep"))
+        if search:
+            filter_text = format_search_filters(payload)
+            line = f"Navigate Search \"{search}\""
+            if filter_text:
+                line += f" [{filter_text}]"
+            if keep_text:
+                line += f" keep {keep_text}"
+            sample_stats = _navigate_sample_stats(payload)
+            if sample_stats:
+                line += f" · {sample_stats}"
+            return _truncate_line(line, max_chars)
         target = _short_page_target(str(payload.get("url") or "").strip())
         ref = str(payload.get("ref") or "").strip()
         if not target and ref:
             target = f"#{ref}"
-        mode_label = _page_extract_mode_label(payload)
-        sample_stats = _page_extract_sample_stats(payload)
-        title = _page_extract_title(payload)
-        line = "Read"
-        if mode_label:
-            line += f" {mode_label}"
-        if target:
-            if sample_stats:
-                line += f" {sample_stats}"
-            if title:
-                line += f" \"{title}\""
+        sample_stats = _navigate_sample_stats(payload)
+        title = _navigate_title(payload)
+        line = "Navigate"
+        if sample_stats:
+            line += f" {sample_stats}"
+        if title:
+            line += f" \"{title}\""
+        elif target:
             line += f" in \"{target}\""
-        else:
-            if sample_stats:
-                line += f" {sample_stats}"
-            if title:
-                line += f" \"{title}\""
+        if keep_text:
+            line += f" keep {keep_text}"
         return _truncate_line(line, max_chars)
 
     if tool_name == "context_delete":
